@@ -2,6 +2,16 @@
 ![](https://img.shields.io/badge/platform-linux%20%7C%20osx-lightgrey.svg)
 ![](https://img.shields.io/badge/python-3.x-blue.svg)
 
+## Installation
+PINTS is available on PyPI, which means you can install it with the following command:
+```shell
+pip install pyPINTS
+```
+Alternatively, you can clone this repo to a local directory, then in the directory, run the following command:
+```shell
+python setup.py install
+```
+
 ## Prerequisite
 Python packages
 * matplotlib
@@ -28,15 +38,15 @@ If reads represent the reverse complement of original RNAs, like PROseq, then yo
 
 One example for calling peaks from BAM file:
 ```shell
-pints_caller.py --bam-file input.bam --save-to output_dir --file-prefix output_prefix --thread 16 --exp-type PROcap
+pints_caller --bam-file input.bam --save-to output_dir --file-prefix output_prefix --thread 16 --exp-type PROcap
 ```
 Or you can call peaks from BigWig files:
 ```shell
-pints_caller.py --save-to output_dir --file-prefix output_prefix --bw-pl path_to_pl.bw --bw-mn path_to_mn.bw --thread 16
+pints_caller --save-to output_dir --file-prefix output_prefix --bw-pl path_to_pl.bw --bw-mn path_to_mn.bw --thread 16
 ```
 If you want to call peaks from experiments with replicates:
 ```shell
-pints_caller.py --bam-file input1.bam input2.bam --save-to output_dir --file-prefix output_prefix --thread 16 --exp-type PROcap
+pints_caller --bam-file input1.bam input2.bam --save-to output_dir --file-prefix output_prefix --thread 16 --exp-type PROcap
 ```
 
 ## Outputs
@@ -93,12 +103,12 @@ For single TREs, there will be 6 columns in the output:
 * `--borrow-info-reps`: Borrow information from reps to refine calling of divergent elements;
 * `--output-diagnostic-plot`: Save diagnostic plots (independent filtering and pval dist) to local folder
 
-More parameters can be seen by running `./caller.py -h`.
+More parameters can be seen by running `pints_caller -h`.
 
 ## Other tools
-* `element_boundary.py`: Extend peaks from summits.
-* `visualizer.py`: Generate bigwig files for the inputs.
-* `normalizer.py`: Normalize inputs.
+* `pints_boundary_extender`: Extend peaks from summits.
+* `pints_visualizer`: Generate bigwig files for the inputs.
+* `pints_normalizery`: Normalize inputs.
 
 ## Tips
 1. Be cautious to reads mapped to scaffolds instead of main chromosome (for example the notorious `chrUn_gl000220` in `hg19`, they maybe rRNA contamination)!
