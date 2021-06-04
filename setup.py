@@ -5,7 +5,7 @@ with open("Readme.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
 setup(
-    name="PINTS",
+    name="pyPINTS",
     version=versioneer.get_version(),
     cmdclass=versioneer.get_cmdclass(),
     long_description=long_description,
@@ -17,6 +17,6 @@ setup(
     url="https://pints.yulab.org",
     license="GPL",
     author="Li Yao",
-    author_email="ly349@cornell.edu",
+    author_email="regulatorygenome@gmail.com",
     description="Peak Identifier for Nascent Transcripts Sequencing (PINTS)"
 )
