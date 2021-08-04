@@ -1,6 +1,7 @@
 # PINTS: Peak Identifier for Nascent Transcripts Sequencing
 ![](https://img.shields.io/badge/platform-linux%20%7C%20osx-lightgrey.svg)
 ![](https://img.shields.io/badge/python-3.x-blue.svg)
+[![PyPI](https://github.com/liyao001/PINTS/actions/workflows/python-publish.yml/badge.svg)](https://github.com/liyao001/PINTS/actions/workflows/python-publish.yml)
 
 ## Installation
 PINTS is available on PyPI, which means you can install it with the following command:
