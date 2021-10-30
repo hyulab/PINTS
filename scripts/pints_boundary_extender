@@ -28,7 +28,7 @@ try:
     import scipy
     import pysam
     from pybedtools import BedTool
-    from pints.io_engine import get_coverage
+    from pints.io_engine import get_read_signal, get_coverage_bw, log_assert
     from collections import namedtuple
 except ImportError as e:
     missing_package = str(e).replace("No module named '", "").replace("'", "")
@@ -46,14 +46,14 @@ logging.basicConfig(format="%(name)s - %(asctime)s - %(levelname)s: %(message)s"
 logger = logging.getLogger("PINTS - BoundaryExtender")
 
 
-def main(bam_file, layout, div_file, bid_file, single_file, divergent_extension=(60, 60),
-         unidirectional_extension=(300, 60), promoter_bed=None):
+def main(input_file, layout, div_file, bid_file, single_file, divergent_extension=(60, 60),
+         unidirectional_extension=(60, 60), promoter_bed=None, **kwargs):
     """
     Extend boundaries
 
     Parameters
     ----------
-    bam_file : str
+    input_file : str
         Path to a bam file
     layout : str
         Layout out the bam file
@@ -77,11 +77,26 @@ def main(bam_file, layout, div_file, bid_file, single_file, divergent_extension=
 
     de_tag = "_".join(set(map(str, divergent_extension)))
     parent_path = os.path.dirname(div_file)
-    pl, mn = get_coverage(bam_file, library_type=layout, chromosome_startswith="chr",
-                          output_dir=parent_path, output_prefix=str(os.getpid()))
+    if isinstance(input_file, str):
+        log_assert(layout is not None,
+                   "Please specify which type of experiment this data was generated from with --exp-type", logger)
+        pl, mn, _ = get_read_signal(input_file, loc_prime=layout, chromosome_startswith="chr",
+                                    output_dir=parent_path, output_prefix=str(os.getpid()))
+    else:
+        log_assert(len(input_file[0]) == len(input_file[1]),
+                   "Must provide the same amount of bigwig files for both strands", logger)
+
+        pl, mn, _ = get_coverage_bw(bw_pl=input_file[0], bw_mn=input_file[1],
+                                    chromosome_startswith="chr",
+                                    output_dir=parent_path,
+                                    output_prefix=str(os.getpid()))
+
     div = pd.read_csv(div_file, sep="\t", header=None)
+    div = div.loc[np.logical_or(div[0].isin(pl), div[0].isin(mn)), :]
     bid = pd.read_csv(bid_file, sep="\t", header=None)
+    bid = bid.loc[np.logical_or(bid[0].isin(pl), bid[0].isin(mn)), :]
     single = pd.read_csv(single_file, sep="\t", header=None)
+    single = single.loc[np.logical_or(single[0].isin(pl), single[0].isin(mn)), :]
     div["pl_summit"] = 0
     div["mn_summit"] = 0
     div["element_start"] = 0
@@ -96,10 +111,12 @@ def main(bam_file, layout, div_file, bid_file, single_file, divergent_extension=
         for nr, row in div_sub.iterrows():
             pcov = pl_cov[row[1]:row[2]]
             mcov = mn_cov[row[1]:row[2]]
-            cpl = np.argmax(pcov) + row[1]
-            cmn = np.argmax(mcov) + row[1]
-            div.loc[nr, "pl_summit"] = cpl
-            div.loc[nr, "mn_summit"] = cmn
+            # cpl = np.argmax(pcov) + row[1]
+            cpls = np.where(pcov == pcov.max())[0] + row[1]
+            # cmn = np.argmax(mcov) + row[1]
+            cmns = np.where(mcov == mcov.max())[0] + row[1]
+            div.loc[nr, "pl_summit"] = ",".join([str(x) for x in cpls])
+            div.loc[nr, "mn_summit"] = ",".join([str(x) for x in cmns])
 
             # extend boundaries with the following conditions:
             # Find the prominent peaks at basepair resolution (any peaks with ⅓ of the highest peak and >5 reads)
@@ -109,9 +126,13 @@ def main(bam_file, layout, div_file, bid_file, single_file, divergent_extension=
             pl_threshold = plb * 0.3
             mn_threshold = mlb * 0.3
             if pl_threshold > 5:
-                cpl = np.where(pcov > 5)[0][-1] + row[1]
+                cpl = max(np.where(pcov > 5)[0][-1] + row[1], row[2])
+            else:
+                cpl = cpls[-1]
             if mn_threshold > 5:
-                cmn = np.where(mcov > 5)[0][0] + row[1]
+                cmn = min(np.where(mcov > 5)[0][0] + row[1], row[1])
+            else:
+                cmn = cmns[0]
 
             f = min(cpl, cmn) - divergent_extension[0]
             r = max(cpl, cmn) + divergent_extension[1]
@@ -122,19 +143,25 @@ def main(bam_file, layout, div_file, bid_file, single_file, divergent_extension=
         for nr, row in bid_sub.iterrows():
             pcov = pl_cov[row[1]:row[2]]
             mcov = mn_cov[row[1]:row[2]]
-            cpl = np.argmax(pcov) + row[1]
-            cmn = np.argmax(mcov) + row[1]
-            bid.loc[nr, "pl_summit"] = cpl
-            bid.loc[nr, "mn_summit"] = cmn
+            # cpl = np.argmax(pcov) + row[1]
+            cpls = np.where(pcov == pcov.max())[0] + row[1]
+            # cmn = np.argmax(mcov) + row[1]
+            cmns = np.where(mcov == mcov.max())[0] + row[1]
+            bid.loc[nr, "pl_summit"] = ",".join([str(x) for x in cpls])
+            bid.loc[nr, "mn_summit"] = ",".join([str(x) for x in cmns])
 
             plb = np.nanmax(pcov)
             mlb = np.nanmax(mcov)
             pl_threshold = plb * 0.3
             mn_threshold = mlb * 0.3
             if pl_threshold > 5:
-                cpl = np.where(pcov > 5)[0][-1] + row[1]
+                cpl = max(np.where(pcov > 5)[0][-1] + row[1], row[2])
+            else:
+                cpl = cpls[-1]
             if mn_threshold > 5:
-                cmn = np.where(mcov > 5)[0][0] + row[1]
+                cmn = min(np.where(mcov > 5)[0][0] + row[1], row[1])
+            else:
+                cmn = cmns[0]
 
             f = min(cpl, cmn) - divergent_extension[0]
             r = max(cpl, cmn) + divergent_extension[1]
@@ -167,7 +194,7 @@ def main(bam_file, layout, div_file, bid_file, single_file, divergent_extension=
     bid.loc[bid.element_start < 0, "element_start"] = 0
     bid["ID"] = ["Bidirectional" + str(i) for i in list(bid.index)]
 
-    single = single.loc[:, (0, "element_start", "element_end", 3, 4, 5)]
+    single = single.loc[:, (0, "element_start", "element_end", 3, 4, 5, 15)]
     single.element_start = single.element_start.astype(int)
     single.element_end = single.element_end.astype(int)
     single.loc[single.element_start < 0, "element_start"] = 0
@@ -205,13 +232,24 @@ def main(bam_file, layout, div_file, bid_file, single_file, divergent_extension=
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Element boundary refinement")
-    parser.add_argument("--bam-files", help="input bam file(s)", nargs="+")
-    parser.add_argument("--exp-type", action="store", default="CoPRO", dest="bam_parser",
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--bam-files", action="store", dest="bam_files", nargs="*",
+                       type=str, required=False,
+                       help="input bam file, if you want to use bigwig files, please use --bw-pl and --bw-mn")
+    group.add_argument("--bw-pl", action="store", dest="bw_pl", nargs="*",
+                       type=str, required=False,
+                       help="Bigwig for plus strand. If you want to use bigwig instead of BAM, "
+                            "please set bam_file to bigwig")
+    parser.add_argument("--bw-mn", action="store", dest="bw_mn", nargs="*",
+                        type=str, required=False,
+                        help="Bigwig for minus strand. If you want to use bigwig instead of BAM, "
+                             "please set bam_file to bigwig")
+    parser.add_argument("--exp-type", action="store", default=("CoPRO", ), dest="bam_parser",
                         choices=("CoPRO", "GROcap", "PROcap", "CAGE", "NETCAGE", "csRNAseq", "PROseq", "GROseq",
                                  "R_5", "R_3", "R1_5", "R1_3", "R2_5", "R2_3"),
                         help="Type of experiment, acceptable values are: CoPRO/GROcap/GROseq/PROcap/PROseq, or if you "
                              "know the position of RNA ends which you're interested on the reads, you can specify "
-                             "R_5, R_3, R1_5, R1_3, R2_5 or R2_3", nargs="+")
+                             "R_5, R_3, R1_5, R1_3, R2_5 or R2_3", nargs="+", required=False)
     parser.add_argument("--divergent-files", help="Divergent peak call(s)", nargs="+")
     parser.add_argument("--bidirectional-files", help="Divergent peak call(s)", nargs="+")
     parser.add_argument("--unidirectional-files", help="Unidirectional peak call(s)", nargs="+")
@@ -222,19 +260,33 @@ if __name__ == "__main__":
                         type=int, required=False, default=(60,), help="divergent extension left")
     parser.add_argument("--div-ext-right", action="store", dest="div_ext_right", nargs="+",
                         type=int, required=False, default=(60,), help="divergent extension right")
-    parser.add_argument("--single-ext-left", action="store", dest="single_ext_left",
-                        type=int, required=False, default=300, help="single extension left")
-    parser.add_argument("--single-ext-right", action="store", dest="single_ext_right",
-                        type=int, required=False, default=60, help="single extension right")
+    parser.add_argument("--single-ext-left", action="store", dest="single_ext_left", nargs="+",
+                        type=int, required=False, default=(60, ), help="single extension left")
+    parser.add_argument("--single-ext-right", action="store", dest="single_ext_right", nargs="+",
+                        type=int, required=False, default=(60, ), help="single extension right")
 
     args = parser.parse_args()
-    assert len(args.bam_files) == len(args.divergent_files) == len(args.bidirectional_files) == len(
-        args.unidirectional_files), "Number of peak calls from different categories should match"
+    if sum((args.bw_pl is None, args.bw_mn is None)) == 1:
+        raise argparse.ArgumentError("both of the two arguments --bw-pl --bw-mn are required")
+
+    if args.bam_files is not None:
+        if not len(args.bam_files) == len(args.divergent_files) == len(args.bidirectional_files) == len(
+                args.unidirectional_files):
+            raise argparse.ArgumentError("Number of peak calls from different categories should match")
+        # if not (len(args.bam_parser) == 1 or len(args.bam_parser) == len(args.bam_files)):
+        #     raise argparse.ArgumentError("You need to provide one or paired exp-type for bam-files")
+
+    if args.bw_pl is not None:
+        if not len(args.bw_pl) == len(args.bw_mn) == len(args.divergent_files) == len(args.bidirectional_files) == len(
+                args.unidirectional_files):
+            raise argparse.ArgumentError("Number of peak calls from different categories should match")
+
     assert len(args.div_ext_left) == len(args.div_ext_right)
-    assert len(args.bam_parser) == 1 or len(args.bam_parser) == len(args.bam_files), "You need to provide one or paired exp-type for bam-files"
+    assert len(args.single_ext_left) == len(args.single_ext_right)
+
     groups = dict()
     Group = namedtuple("Group", ("bam_file", "divergent_calls", "bidirectional_calls", "single_calls"))
-    for i in range(1, len(args.bam_files) + 1):
+    for i in range(1, (len(args.bam_files) if args.bam_files is not None else len(args.bw_pl)) + 1):
         groups = {
             "divergent_calls": None,
             "bidirectional_calls": None,
@@ -257,8 +309,15 @@ if __name__ == "__main__":
                 if sf.find(k) != -1:
                     groups["unidirectional_calls"] = sf
         for j in range(len(args.div_ext_left)):
-            main(args.bam_files[i - 1], args.bam_parser[0] if len(args.bam_parser) else args.bam_parser[i-1],
-                 groups["divergent_calls"], groups["bidirectional_calls"], groups["unidirectional_calls"],
-                 divergent_extension=(args.div_ext_left[j], args.div_ext_right[j]),
-                 unidirectional_extension=(args.single_ext_left, args.single_ext_right),
-                 promoter_bed=args.promoter_bed)
+            if args.bam_files is not None:
+                main(args.bam_files[i - 1], args.bam_parser[i - 1] if len(args.bam_parser) > 1 else args.bam_parser[0],
+                     groups["divergent_calls"], groups["bidirectional_calls"], groups["unidirectional_calls"],
+                     divergent_extension=(args.div_ext_left[j], args.div_ext_right[j]),
+                     unidirectional_extension=(args.single_ext_left[j], args.single_ext_right[j]),
+                     promoter_bed=args.promoter_bed)
+            else:
+                main((args.bw_pl[i - 1], args.bw_mn[i - 1]), None,
+                     groups["divergent_calls"], groups["bidirectional_calls"], groups["unidirectional_calls"],
+                     divergent_extension=(args.div_ext_left[j], args.div_ext_right[j]),
+                     unidirectional_extension=(args.single_ext_left[j], args.single_ext_right[j]),
+                     promoter_bed=args.promoter_bed)
