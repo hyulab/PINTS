@@ -2,7 +2,7 @@
 # coding=utf-8
 #
 # PINTS: Peak Identifier for Nascent Transcripts Sequencing
-# Copyright (C) 2019 Li Yao at the Yu Lab
+# Copyright (C) 2019-2021 Li Yao at the Yu Lab
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -152,6 +152,8 @@ def get_coverage_bw(bw_pl, bw_mn, chromosome_startswith, output_dir, output_pref
         Dictionary of per base coverage per chromosome (positive strand)
     mn : dict
         Dictionary of per base coverage per chromosome (negative strand)
+    rc : int
+        Number of total read counts
     """
     logger = logging.getLogger("IO engine")
     pl, pc = _get_coverage_bw(bw_pl, chromosome_startswith, output_dir, output_prefix + "_pl")
@@ -431,7 +433,7 @@ def get_read_signal(input_bam, loc_prime, chromosome_startswith, output_dir, out
         loc_prime = "%s_%s" % (read_num, read_end)
         reverse_complement = False if fw_rv == "f" else True
     log_assert(loc_prime in ("R_5", "R_3", "R1_5", "R1_3", "R2_5", "R2_3"),
-               "library_type must be R1_5, R1_3, R2_5 or R2_3", logger)
+               "library_type must be R1_5, R1_3, R2_5 or R2_3. Current value: {0}".format(loc_prime), logger)
     library_layout, interested_end = loc_prime.split("_")
     mapq_threshold = kwargs["mapq_threshold"] if "mapq_threshold" in kwargs.keys() else 30
     chromosome_coverage_pl = dict()
@@ -762,6 +764,10 @@ def parse_gtf(filename, cache=1, cache_suffix="_pd_cache.csv"):
     df = pd.DataFrame(result)
     if cache:
         df.to_csv(filename + cache_suffix, index=False)
+    if not pd.api.types.is_numeric_dtype(df["start"]):
+        df["start"] = df["start"].astype(int)
+    if not pd.api.types.is_numeric_dtype(df["end"]):
+        df["end"] = df["end"].astype(int)
     return df
 
 
@@ -906,3 +912,4 @@ def peak_bed_to_gtf(pl_df, mn_df, save_to, version=""):
                                                  sep="\t",
                                                  index=False,
                                                  header=False)
+    index_bed_file(save_to)
