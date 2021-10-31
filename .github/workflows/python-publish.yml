@@ -1,0 +1,38 @@
+name: Build and publish pyPINTS to PyPI
+
+on:
+  push:
+    branches: main
+  release:
+    types: [published]
+
+jobs:
+  deploy:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v2
+      with:
+            fetch-depth: 0
+    - name: "Extract data from tag: version, message, body"
+      id: tag
+      run: |
+        git fetch --tags --force # Retrieve annotated tags. THIS TRICK REALLY HELPS
+        echo ::set-output name=subject::$(git for-each-ref $GITHUB_REF --format='%(contents:subject)')
+    - name: Set up Python
+      uses: actions/setup-python@v2
+      with:
+        python-version: '3.x'
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install wheel
+    - name: Build package
+      run: |
+        python setup.py bdist_wheel
+    - name: Publish package
+      uses: pypa/gh-action-pypi-publish@27b31702a0e7fc50959f5ad993c78deac1bdfc29
+      with:
+        user: __token__
+        password: ${{ secrets.PYPI_API_TOKEN }}

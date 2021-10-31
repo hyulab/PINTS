@@ -221,6 +221,13 @@ class ZIP(StatModel):
         convergence : bool
 
         """
+        zero_elements = window == 0
+        zs = zero_elements.sum()
+
+        # if there's no non-zero observation
+        if zs == window.shape[0]:
+            return 0, 0, 0, 0, True
+        
         if self.init_mu is None or self.init_pi is None:
             init_lamb, init_pi = ZIP.zip_moment_estimators(windows=window)
         else:
@@ -231,10 +238,9 @@ class ZIP(StatModel):
         pi = init_pi
         n_iter = 0
         hat_z = np.zeros(len(window))
-        zero_elements = window == 0
         smallest = np.finfo(float).eps
 
-        if zero_elements.sum() == 0:
+        if zs == 0:
             m = window.mean()
             return m, m, 0, np.nan, True
 
@@ -284,7 +290,7 @@ class ZIP(StatModel):
         -------
 
         """
-        assert x >= 0, "zip_cdf, x should > 0"
+        assert x >= 0, "zip_cdf, x should > 0 (x=%f)" % x
         p = pi + (1 - pi) * poisson.cdf(x, lambda_)
         if p > 1:
             p = 1
@@ -584,8 +590,8 @@ class IQR(ABC):
                 sp_start = query_start
             if sp_end > query_end:
                 sp_end = query_end
-            if sp_end - sp_start < small_window_threshold:
-                continue
+            # if sp_end - sp_start < small_window_threshold:
+            #     continue
             peak_dens = float(sub_peak[4])
             queried_peaks[k] += 1
 
@@ -602,7 +608,7 @@ class IQR(ABC):
     @abstractmethod
     def remove_peaks_in_local_env(stat_tester, bed_handler, chromosome, query_start_left, query_end_left,
                                   query_start_right, query_end_right, small_window_threshold, peak_in_bg_threshold,
-                                  coverage_info, fdr_target, cache, disable_ler=False):
+                                  coverage_info, fdr_target, cache, disable_ler=False, peak_threshold=None):
         """
         LER-based local environment refinement
 
@@ -634,6 +640,9 @@ class IQR(ABC):
             Cache for LER
         disable_ler : bool
             Set it to True to disable LER
+        peak_threshold : None or numeric
+            Only applicable to pkIQR, the `min(outlier_t, peak_threshold)`
+            will be used as the final `outlier_t`
 
         Returns
         -------
@@ -649,7 +658,7 @@ class bgIQR(IQR):
     @staticmethod
     def remove_peaks_in_local_env(stat_tester, bed_handler, chromosome, query_start_left, query_end_left,
                                   query_start_right, query_end_right, small_window_threshold, peak_in_bg_threshold,
-                                  coverage_info, fdr_target, cache, disable_ler=False):
+                                  coverage_info, fdr_target, cache, disable_ler=False, peak_threshold=None):
         ler_count = 0
         bg_mus = []
         local_env_left = coverage_info[query_start_left:query_end_left]
@@ -768,7 +777,7 @@ class pkIQR(IQR):
     @staticmethod
     def remove_peaks_in_local_env(stat_tester, bed_handler, chromosome, query_start_left, query_end_left,
                                   query_start_right, query_end_right, small_window_threshold, peak_in_bg_threshold,
-                                  coverage_info, fdr_target, cache, disable_ler=False):
+                                  coverage_info, fdr_target, cache, disable_ler=False, peak_threshold=5.):
         ler_count = 0
         local_env_left = coverage_info[query_start_left:query_end_left]
         local_env_right = coverage_info[query_start_right:query_end_right]
@@ -789,6 +798,8 @@ class pkIQR(IQR):
         all_dens = dens_l + dens_r
         if len(all_dens) >= 3:
             _, outlier_t = pkIQR.get_outlier_threshold(all_dens, 1)
+            if outlier_t > peak_threshold:
+                outlier_t = peak_threshold
             for i, se in enumerate(se_l):
                 if dens_l[i] >= outlier_t:
                     new_local_env[se[0]:se[1]] = -1
@@ -824,7 +835,7 @@ class pkIQR(IQR):
         return new_local_env[new_local_env >= 0], ler_count
 
 
-def independent_filtering(df, output_to=None, logger=None, **kwargs):
+def independent_filtering(df, fdr_target=0.1, output_to=None, logger=None, **kwargs):
     """
     Independent filtering
 
@@ -832,13 +843,14 @@ def independent_filtering(df, output_to=None, logger=None, **kwargs):
     ----------
     df : pd.DataFrame
         Dataframe of peak candidates (bed-like format)
+    fdr_target : float
+        FDR target. Default 0.1.
     output_to : str or None, optional
         Path for the output
     logger : None or a logger
         A logger to write logs
     **kwargs :
-        Keyword arguments, fdr_target (float, default 0.1),
-                           adjust_method (str, default fdr_bh),
+        Keyword arguments, adjust_method (str, default fdr_bh),
                            ind_filter_granularity (float, default 0.005)
                            and output_diagnostics (bool, default True) is effective
     Returns
@@ -869,7 +881,7 @@ def independent_filtering(df, output_to=None, logger=None, **kwargs):
         tmp_probe = df["reads"] > threshold
         filtered_df = df.loc[tmp_probe, :].copy()
         try:
-            mult_res = multipletests(filtered_df["pval"], alpha=kwargs["fdr_target"], method=kwargs["adjust_method"])
+            mult_res = multipletests(filtered_df["pval"], alpha=fdr_target, method=kwargs["adjust_method"])
             read_out = mult_res[1]
         except ZeroDivisionError:
             # if we cannot run BH, then we use Bonferroni correction
@@ -880,7 +892,7 @@ def independent_filtering(df, output_to=None, logger=None, **kwargs):
         filtered_df = filtered_df.loc[:, ("chromosome", "start", "end", "name", "padj", "strand", "reads")]
         quantiles_tested.append(quantile)
         windows_remain.append(filtered_df.shape[0])
-        windows_rejected.append(sum(read_out < kwargs["fdr_target"]))
+        windows_rejected.append(sum(read_out < fdr_target))
 
         if len(windows_rejected) > 0:
             if windows_rejected[-1] >= max(windows_rejected):
@@ -920,6 +932,43 @@ def independent_filtering(df, output_to=None, logger=None, **kwargs):
         plt.close()
         logger.info("Diagnostic plot for independent filtering was written to %s" % output_to)
     return final_df
+
+
+def get_elbow(X, Y):
+    """
+    Find the elbow points by finding the point that's the furthest
+    from the extreme line, which passes the two boundary points (edge points)
+    ref: DOI: 10.1007/BF01195985
+
+    Parameters
+    ----------
+    X : np.array
+
+    Y : np.array
+
+    Returns
+    -------
+    elbow_x : float
+
+    elbow_y : float
+
+    """
+    X = np.asarray(X)
+    Y = np.asarray(Y)
+    sort_index = X.argsort()
+    X_s = X[sort_index]
+    Y_s = Y[sort_index]
+
+    p1 = np.array([X_s[0], Y_s[0]])
+    p2 = np.array([X_s[-1], Y_s[-1]])
+    D = []
+    for x, y in zip(X_s, Y_s):
+        p3 = np.array([x, y])
+        # d = np.abs(np.cross(p2 - p1, p3 - p1)) / np.linalg.norm(p2 - p1)
+        d = np.cross(p2 - p1, p3 - p1) / np.linalg.norm(p2 - p1)
+        D.append(d)
+    midx = np.argmax(D)
+    return X_s[midx], Y_s[midx]
 
 
 if __name__ == "__main__":

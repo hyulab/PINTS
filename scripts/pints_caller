@@ -21,6 +21,7 @@ import logging
 import os
 import sys
 import warnings
+from collections import namedtuple
 from multiprocessing import Pool
 
 logging.basicConfig(format="%(name)s - %(asctime)s - %(levelname)s: %(message)s",
@@ -36,6 +37,7 @@ try:
     import pandas as pd
     import scipy
     import pysam
+    import pyBigWig
     import pybedtools
     from scipy.stats import poisson, binom_test, probplot, uniform, nbinom
     from scipy.signal import find_peaks, peak_widths
@@ -43,7 +45,7 @@ try:
     from pybedtools import BedTool
     from statsmodels.stats.multitest import multipletests
     from pints.stats_engine import Poisson, ZIP, NegativeBinomial, ZINB, pval_dist, get_rank, bgIQR, pkIQR, \
-        independent_filtering
+        independent_filtering, get_elbow
     from pints.io_engine import get_read_signal, get_coverage, get_coverage_bw, log_assert, normalize_using_input, \
         index_bed_file, peak_bed_to_gtf
     from pints import __version__
@@ -217,7 +219,7 @@ def sliding_window(chromosome_coverage, window_size, step_size):
 
 def check_window(coord_start, coord_end, mu_peak, var_peak, pi_peak, chromosome_coverage, peak_in_bg_threshold,
                  mu_bkg_minimum, sp_bed_handler, chromosome_name, fdr_target, cache, small_window_threshold=5,
-                 flanking=(10000, 5000, 1000), disable_ler=False):
+                 flanking=(10000, 5000, 1000), disable_ler=False, top_peak_mu=None):
     """
     Calculate p-value for a peak
 
@@ -291,7 +293,8 @@ def check_window(coord_start, coord_end, mu_peak, var_peak, pi_peak, chromosome_
                                                   query_end_right=qer, small_window_threshold=small_window_threshold,
                                                   peak_in_bg_threshold=peak_in_bg_threshold,
                                                   coverage_info=chromosome_coverage,
-                                                  fdr_target=fdr_target, cache=cache, disable_ler=disable_ler)
+                                                  fdr_target=fdr_target, cache=cache, 
+                                                  disable_ler=disable_ler, peak_threshold=top_peak_mu)
 
         mu_, var_, pi_, _, _ = stat_tester.fit(bg)
         mus.append(mu_)
@@ -348,7 +351,7 @@ def quasi_max_score_segment(candidates, donor_tolerance, receptor_tolerance, ce_
             if new_density >= donor_tolerance * c[3]:
                 distance_check = c[1] - c[0] < ce_trigger or candidates[k + 1][0] - c[1] > max_distance
                 if distance_check:  # or new_density < (receptor_tolerance * candidates[k + 1][3]):
-                    # fwd_search.append(c)
+                    fwd_search.append(c)
                     continue
                 merged = (c[0], candidates[k + 1][1], new_total, new_density)
                 fwd_search.append(merged)
@@ -365,6 +368,7 @@ def quasi_max_score_segment(candidates, donor_tolerance, receptor_tolerance, ce_
             if new_density >= donor_tolerance * c[3]:
                 distance_check = c[1] - c[0] < ce_trigger or c[0] - candidates[k - 1][1] > max_distance
                 if distance_check:  # or new_density < (receptor_tolerance * candidates[k - 1][3]):
+                    rev_search.append(c)
                     continue
                 merged = (candidates[k - 1][0], c[1], new_total, new_density)
                 rev_search.append(merged)
@@ -402,7 +406,7 @@ def merge_covs(covs, chromosome_of_interest):
     return merged_coverage
 
 
-def cut_peaks_dry_run(annotation_gtf, pl_cov_files, mn_cov_files, highlight_chromosome="chr1",
+def cut_peaks_dry_run(annotation_gtf, pl_cov_files, mn_cov_files, tss_extension=200, highlight_chromosome="chr1",
                       output_diagnostics=False, save_to=None):
     """
     Select optimal alpha values to join sub peaks/seeds
@@ -415,6 +419,8 @@ def cut_peaks_dry_run(annotation_gtf, pl_cov_files, mn_cov_files, highlight_chro
         List of coverage dicts for each rep (forward strand)
     mn_cov_files : list of dicts
         List of coverage dicts for each rep (reverse strand)
+    tss_extension : int
+        Number of bps to be extended from known TSSs
     highlight_chromosome : str
         Name of the chromosome/contig to be working on
     output_diagnostics : bool
@@ -438,10 +444,12 @@ def cut_peaks_dry_run(annotation_gtf, pl_cov_files, mn_cov_files, highlight_chro
     pct_tss = pct_bed.loc[:, ("seqname", "start", "end", "transcript_id", "gene_name", "strand")]
     pct_tss["start"] = pct_tss.apply(lambda x: x["start"] if x["strand"] == "+" else x["end"] - 1, axis=1)
     pct_tss["end"] = pct_tss.apply(lambda x: x["start"] + 1 if x["strand"] == "+" else x["end"], axis=1)
+    pct_tss.drop_duplicates(subset=["seqname", "start", "end"], inplace=True)
     pct_tss_bed = BedTool.from_dataframe(pct_tss)
-    pct_tss["start"] -= 200
-    pct_tss["end"] += 200
-    tss_window = BedTool.from_dataframe(pct_tss).sort().merge(s=True)
+    pct_tss["start"] -= tss_extension
+    pct_tss["end"] += tss_extension
+    tss_window = BedTool.from_dataframe(pct_tss).sort().merge(s=True, c=(4, 5, 6),
+                                                              o=("distinct", "distinct", "distinct"))
     logger.info("%d annotated TSSs loaded" % pct_tss.shape[0])
     pl_cov = merge_covs(pl_cov_files, highlight_chromosome)
     mn_cov = merge_covs(mn_cov_files, highlight_chromosome)
@@ -465,39 +473,42 @@ def cut_peaks_dry_run(annotation_gtf, pl_cov_files, mn_cov_files, highlight_chro
     for i, dt in enumerate(search_range):
         predicted_peaks_dicts = []
         for window in tss_window:
-            if np.sum(pl_cov[window.start:window.stop]) > 0:
-                ss, es = cp_atom(pl_cov, window.start, window.stop, donor_tolerance=dt)
+            if window.strand == "+":
+                cov_obj = pl_cov
+            else:
+                cov_obj = mn_cov
+            if np.sum(cov_obj[window.start:window.stop]) > 0:
+                ss, es = cp_atom(cov_obj, window.start, window.stop, donor_tolerance=dt)
                 for s, e in zip(ss, es):
                     predicted_peaks_dicts.append({"seqname": highlight_chromosome,
-                                                  "start": s, "end": e, "name": ".", "score": ".", "strand": "+"})
-            if np.sum(mn_cov[window.start:window.end]) > 0:
-                ss, es = cp_atom(mn_cov, window.start, window.stop, donor_tolerance=dt)
-                for s, e in zip(ss, es):
-                    predicted_peaks_dicts.append({"seqname": highlight_chromosome,
-                                                  "start": s, "end": e, "name": ".", "score": ".", "strand": "-"})
+                                                  "start": s, "end": e, "name": ".", 
+                                                  "score": ".", "strand": window.strand})
         predicted_peaks = BedTool.from_dataframe(pd.DataFrame(predicted_peaks_dicts))
         tmp_result = predicted_peaks.intersect(pct_tss_bed, c=True, s=True)
         tmp_df = tmp_result.to_dataframe(names=("seqname", "start", "end", "name", "score", "strand", "hits"))
-        ambiguous_rate = sum(tmp_df["hits"] > 1) / sum(tmp_df["hits"] > 0)
-        median_sizes[i] = np.median(tmp_df["end"] - tmp_df["start"])
+        lens = tmp_df["end"] - tmp_df["start"]
+        ambiguous_rate = tmp_df.loc[np.logical_and(lens > 2, tmp_df.hits > 1), :].shape[0] / \
+                         tmp_df.loc[lens > 2, :].shape[0]
+
+        median_sizes[i] = np.median(lens[lens >= 3])
         ambs[i] = ambiguous_rate
 
     smoothed_median_sizes = gaussian_filter1d(median_sizes, 1)
     smoothed_ambs = gaussian_filter1d(ambs, 1)
-    fod_size = np.gradient(smoothed_median_sizes)
-    upper_bound_from_size = np.argmax(fod_size)
-    fod_ar = np.abs(np.gradient(smoothed_ambs))[upper_bound_from_size:]
-    selected_locus = np.argmin(fod_ar) + upper_bound_from_size
-    selected_threshold = search_range[selected_locus]
+    size_knee_x, size_knee = get_elbow(search_range, smoothed_median_sizes)
+    amb_knee_x, amb_knee = get_elbow(search_range, smoothed_ambs)
+    selected_threshold = max(size_knee_x, amb_knee_x)
 
     if output_diagnostics and save_to is not None:
         import matplotlib.pyplot as plt
         fig, axs = plt.subplots(2, 1)
-        axs[0].plot(search_range, smoothed_median_sizes, label="Median size of elements")
-        axs[0].axvline(search_range[upper_bound_from_size])
+        axs[0].plot(search_range, median_sizes)
+        axs[0].axvline(size_knee_x)
+        axs[0].set_ylabel("Median size of peaks")
 
-        axs[1].plot(search_range, smoothed_ambs, label="Ambiguous rate")
-        axs[1].axvline(search_range[selected_locus])
+        axs[1].plot(search_range, ambs, label="Ambiguous rate")
+        axs[1].axvline(amb_knee_x)
+        axs[1].set_ylabel("Ambiguous rate")
         plt.tight_layout()
         plt.savefig(save_to, transparent=True, bbox_inches="tight")
         plt.close()
@@ -505,7 +516,8 @@ def cut_peaks_dry_run(annotation_gtf, pl_cov_files, mn_cov_files, highlight_chro
     return selected_threshold
 
 
-def cut_peaks(window, peak_rel_height, donor_tolerance, receptor_tolerance, ce_trigger, max_distance=30):
+def cut_peaks(window, peak_rel_height, donor_tolerance, receptor_tolerance, ce_trigger, join_distance=1, 
+              max_distance=30):
     """
     Cut peaks from the given window
 
@@ -521,6 +533,8 @@ def cut_peaks(window, peak_rel_height, donor_tolerance, receptor_tolerance, ce_t
         From sub peak seeking being merged, the new density should be larger than rt*prev_d
     ce_trigger : int
         Sub peak narrower than cet will trigger receptor tolerance check
+    join_distance : int
+        The maximum distance for two subpeaks to be joined.
     max_distance : int
         max distance between two subpeaks to be joined, by default, 20
     Returns
@@ -533,7 +547,7 @@ def cut_peaks(window, peak_rel_height, donor_tolerance, receptor_tolerance, ce_t
     intervals = []
     for k, start in enumerate(starts):
         intervals.append((int(start), int(ends[k])))
-    mi = merge_intervals(intervals=intervals, distance=1)
+    mi = merge_intervals(intervals=intervals, distance=join_distance)
     candidates = []
     for m in mi:
         events = 0
@@ -545,12 +559,13 @@ def cut_peaks(window, peak_rel_height, donor_tolerance, receptor_tolerance, ce_t
                                    receptor_tolerance=receptor_tolerance, ce_trigger=ce_trigger,
                                    max_distance=max_distance)
     f.extend(r)
-    final = merge_intervals(f, distance=1)
+    final = merge_intervals(f, distance=join_distance)
     return final
 
 
 def check_window_chromosome(rc_file, output_file, strand_sign, chromosome_name, subpeak_file, fdr_target,
-                            read_counts_threshold, small_peak_threshold=5, min_mu_percent=0.1, disable_ler=False):
+                            read_counts_threshold, small_peak_threshold=5, min_mu_percent=0.1, 
+                            disable_ler=False, top_peak_threshold=0.75):
     """
     Evaluate windows on a chromosome
 
@@ -626,9 +641,11 @@ def check_window_chromosome(rc_file, output_file, strand_sign, chromosome_name, 
             logger.warning("No non-trivial peak was detected on chromosome %s" % chromosome_name)
             peak_threshold = 1
             bkg_mu_threshold = 0
+            empirical_true_peak_threshold = 0
         else:
             peak_threshold = 1
             bkg_mu_threshold = np.quantile(all_peak_mus, min_mu_percent)
+            empirical_true_peak_threshold = np.quantile(all_peak_mus, top_peak_threshold)
             logger.info("Minimum mu in local environment %f (%s)" % (bkg_mu_threshold, chromosome_name))
         global_cache = dict()
         with gzip.open(subpeak_bed + ".gz", "rt") as peak_obj:
@@ -649,7 +666,9 @@ def check_window_chromosome(rc_file, output_file, strand_sign, chromosome_name, 
                                                             mu_bkg_minimum=bkg_mu_threshold, sp_bed_handler=bed_handler,
                                                             chromosome_name=chromosome_name,
                                                             fdr_target=fdr_target,
-                                                            cache=global_cache, disable_ler=disable_ler)
+                                                            cache=global_cache, 
+                                                            disable_ler=disable_ler,
+                                                            top_peak_mu=empirical_true_peak_threshold)
                 if wv > read_counts_threshold:
                     bins.append(
                         (chromosome_name, peak_start, peak_end, peak_id, pval, wv, mu_bg, pi_bg, peak_mu, peak_pi,
@@ -666,7 +685,7 @@ def check_window_chromosome(rc_file, output_file, strand_sign, chromosome_name, 
     return result_df
 
 
-def peaks_single_strand(per_base_cov, output_file, shared_peak_definitions, strand_sign,
+def peaks_single_strand(per_base_cov, output_file, shared_peak_definitions, strand_sign, fdr_target,
                         **kwargs):
     """
     Calling peaks on one strand
@@ -681,6 +700,8 @@ def peaks_single_strand(per_base_cov, output_file, shared_peak_definitions, stra
         Dictionary containing all subpeaks per chromosome
     strand_sign : str
         Strand sign for the data
+    fdr_target : float
+        FDR target
     **kwargs :
 
     Returns
@@ -697,9 +718,9 @@ def peaks_single_strand(per_base_cov, output_file, shared_peak_definitions, stra
             continue
         sub_peaks_name = output_file.replace(".bed", "_subpeaks_%s.bed" % chrom)
         merged_name = output_file.replace(".bed", "_%s_merged_windows.bed" % chrom)
-        args.append((pbc_npy, output_file, strand_sign, chrom, shared_peak_definitions[chrom], kwargs["fdr_target"],
+        args.append((pbc_npy, output_file, strand_sign, chrom, shared_peak_definitions[chrom], fdr_target,
                      kwargs["read_counts_threshold"], kwargs["small_peak_threshold"], kwargs["min_mu_percent"],
-                     kwargs["disable_ler"]))
+                     kwargs["disable_ler"], kwargs["top_peak_threshold"]))
         housekeeping_files.append(merged_name)
         housekeeping_files.append(sub_peaks_name + ".gz")
         housekeeping_files.append(sub_peaks_name + ".gz.tbi")
@@ -758,10 +779,11 @@ def peaks_single_strand(per_base_cov, output_file, shared_peak_definitions, stra
     else:
         tmp_df["pval"] = tmp_df.apply(cached_pois, axis=1)
 
-        corrected_small_peaks = np.sum(np.logical_and(tmp_df["pval"] < kwargs["fdr_target"],
+        corrected_small_peaks = np.sum(np.logical_and(tmp_df["pval"] < fdr_target,
                                                       small_peaks_probe))
         logger.info("Significant small peaks after correction: %d (%d)" % (corrected_small_peaks, inflated_small_peaks))
-        tmp_df_sm = independent_filtering(tmp_df.loc[small_peaks_probe, :], output_to=fn + "_idpf_sm.pdf",
+        tmp_df_sm = independent_filtering(tmp_df.loc[small_peaks_probe, :], fdr_target=fdr_target,
+                                          output_to=fn + "_idpf_sm.pdf",
                                           logger=logger, **kwargs)
     if kwargs["output_diagnostics"]:
         pval_dist(tmp_df.loc[tmp_df["end"] - tmp_df["start"] > kwargs["small_peak_threshold"], "pval"],
@@ -935,7 +957,7 @@ def merge_opposite_peaks(sig_peak_bed, peak_candidate_bed, divergent_output_bed,
     sfp_fh.close()
 
 
-def housekeeping(save_to):
+def housekeeping(pybedtools_prefix=""):
     """
     Delete intermediate files
 
@@ -948,10 +970,9 @@ def housekeeping(save_to):
         for hf in housekeeping_files:
             if os.path.exists(hf):
                 os.remove(hf)
-        pybedtools.cleanup(remove_all=True)
-        import glob
-        for f in glob.glob(os.path.join(save_to, "pybedtools.*.tmp")):
-            os.remove(f)
+        if pybedtools_prefix != "":
+            import shutil
+            shutil.rmtree(pybedtools_prefix)
     except Exception as e:
         logger.warning(str(e))
 
@@ -1014,7 +1035,8 @@ def show_parameter_info(input_bam, output_dir, output_prefix, thread_n, model, i
 
 
 def unified_element_definition(coverage_dict, chromosome_of_interest, strand_sign, output_file, peak_rel_height=1,
-                               window_size=100, step_size=100, ce_donor=1.0, ce_receptor=0.1, ce_trigger=3):
+                               window_size=100, step_size=100, join_distance=1, ce_donor=1.0, 
+                               ce_receptor=0.1, ce_trigger=3):
     """
     Unified element boundary definition
     If multiple replicates are present, then this function will merge all signal tracks together
@@ -1035,6 +1057,8 @@ def unified_element_definition(coverage_dict, chromosome_of_interest, strand_sig
         Window size, by default, 100
     step_size : int
         Step size, by default, 100 (non-overlap)
+    join_distance : int
+        Force joining sub peaks within this distance, by default 1
     ce_donor : float
         Donor tolerance in best score segments
     ce_receptor : float
@@ -1076,6 +1100,7 @@ def unified_element_definition(coverage_dict, chromosome_of_interest, strand_sig
                               donor_tolerance=ce_donor,
                               receptor_tolerance=ce_receptor,
                               ce_trigger=ce_trigger,
+                              join_distance=join_distance
                               )
         for sp in sub_peaks:
             start = sp[0] + row.start
@@ -1132,6 +1157,213 @@ def inferring_elements_from_other_reps(prefix, n_samples):
                 prefix + "_%d_%s_peaks.bed" % (i + 1, label))
 
 
+def get_epig_annotation(annotation_source, output_dir):
+    """
+    Get epigenomic annotation
+
+    Parameters
+    ----------
+    annotation_source : str
+        Biosample name or a path to a local bigBed file
+    output_dir : str
+        Download annotation to this directory, if necessary
+
+    Returns
+    -------
+    dst : str
+        "" if no annotation is not available or a path to a bigBed file
+    """
+    # figure out what's the source
+    # first assume it's from PINTS webserver
+    dst = ""
+    from urllib.request import urlretrieve
+    from urllib.error import URLError
+    import urllib.parse
+    import json
+    import socket
+    expected_url = "https://pints.yulab.org/api/ea/{annotation_source}".format(
+        annotation_source=urllib.parse.quote(annotation_source)
+    )
+
+    socket.setdefaulttimeout(30)  # if server doesn't respond in 30s, then raise error
+    try:
+        if annotation_source is None or annotation_source == "":
+            raise ValueError("annotation_source cannot be empty")
+
+        with urllib.request.urlopen(expected_url) as response:
+            json_raw = response.read()
+        parsed_json = json.loads(json_raw)
+        logger.info("Downloading epigenomic annotation")
+        socket.setdefaulttimeout(None)
+        if parsed_json["status"] == 1:
+            _, fn = os.path.split(parsed_json["msg"])
+            dst = output_dir + "_" + fn
+            if not os.path.exists(dst):
+                urlretrieve(parsed_json["msg"], dst)
+        else:
+            logger.error(parsed_json["msg"])
+
+    except URLError as e:
+        logger.error(e)
+    except json.JSONDecodeError as e:
+        logger.error("Cannot parse returned info {s} from PINTS web server.".format(s=e))
+    except Exception as e:
+        logger.error(e)
+    finally:
+        return dst
+
+
+def pair(sample_prefix, df_dict, fdr_target, stringent_only, specific_suffix="", **kwargs):
+    """
+
+    Parameters
+    ----------
+    sample_prefix : str
+
+    df_dict : dict
+        key : "pl" or "mn"
+        value: pd.DataFrame
+    fdr_target : float
+
+    stringent_only : bool
+
+    specific_suffix : str
+        If there's anything you want to add to the outputs
+
+    kwargs :
+
+    Returns
+    -------
+    bidirectional_peaks : str
+        Path to bidirectional peaks
+    divergent_peaks : str
+        Path to divergent peaks
+    unidirectional_peaks : str
+        Path to unidirectional peaks
+    intermediate_files : PairedIntermediateFiles
+        Files recorded in this obj should be deleted
+    """
+    data_structure = namedtuple("PairedIntermediateFiles", field_names=(
+        "pl_sig_peaks", "div_sig_pl", "bid_sig_pl", "single_sig_pl",
+        "mn_sig_peaks", "div_sig_mn", "bid_sig_mn", "single_sig_mn"))
+    generated_files = []
+    for label, anti_label in zip(("pl", "mn"), ("mn", "pl")):
+        peak_df = df_dict[label].copy()
+        peak_df = peak_df.loc[peak_df["end"] - peak_df["start"] < kwargs["window_size_threshold"], :]
+
+        sig_bins = peak_df.loc[peak_df["padj"] < fdr_target, :]
+        generated_files.append(sample_prefix + "%s_sig_%s.bed" % (specific_suffix, label))
+        with open(sample_prefix + "%s_sig_%s.bed" % (specific_suffix, label), "w") as f:
+            sig_bins.to_csv(f, sep="\t", index=False, header=False)
+
+        if not os.path.exists(sample_prefix + "%s_sig_%s.bed" % (specific_suffix, label)):
+            generated_files.append("")
+            generated_files.append("")
+            generated_files.append("")
+            continue
+        logger.info(f"Start to merge peaks from {specific_suffix} {label} to {anti_label}")
+        merge_opposite_peaks(sample_prefix + "%s_sig_%s.bed" % (specific_suffix, label),
+                             sample_prefix + "_%s.bed.gz" % anti_label,
+                             divergent_output_bed=sample_prefix + "%s_sig_%s_divergent_peaks.bed" % (
+                             specific_suffix, label),
+                             bidirectional_output_bed=sample_prefix + "%s_sig_%s_bidirectional_peaks.bed" % (
+                             specific_suffix, label),
+                             singleton_bed=sample_prefix + "%s_sig_%s_singletons_peaks.bed" % (specific_suffix, label),
+                             fdr_target=fdr_target, stringent_only=stringent_only,
+                             **kwargs)
+        logger.info(f"Peaks merged from {specific_suffix} {label} to {anti_label}")
+        generated_files.append(sample_prefix + "%s_sig_%s_divergent_peaks.bed" % (specific_suffix, label))
+        generated_files.append(sample_prefix + "%s_sig_%s_bidirectional_peaks.bed" % (specific_suffix, label))
+        generated_files.append(sample_prefix + "%s_sig_%s_singletons_peaks.bed" % (specific_suffix, label))
+
+    for directionality in ("bidirectional", "divergent", "singletons"):
+        exp_pl_file = sample_prefix + "%s_sig_pl_%s_peaks.bed" % (specific_suffix, directionality)
+        exp_mn_file = sample_prefix + "%s_sig_mn_%s_peaks.bed" % (specific_suffix, directionality)
+        logger.info(f"Merge elements {directionality}")
+        if os.path.exists(exp_pl_file) and os.path.exists(exp_mn_file):
+            if directionality != "singletons":
+                pri_merged_file = BedTool.cat(*[BedTool(exp_pl_file),
+                                                BedTool(exp_mn_file)],
+                                              c=(12, 13, 14, 15, 16),
+                                              o=("collapse", "collapse", "collapse", "collapse", "distinct"))
+                pri_merged_df = pri_merged_file.to_dataframe(names=("chrom", "start", "end", "tss_fwd",
+                                                                    "tss_fwd_vals", "tss_rev", "tss_rev_vals",
+                                                                    "confidence"))
+                fwd_tss_cols = pri_merged_df["tss_fwd"].str.split(",", expand=True).fillna(value=-1).astype(int)
+                fwd_tss_val_cols = pri_merged_df["tss_fwd_vals"].str.split(",", expand=True).fillna(value=-1).astype(int)
+                max_index = fwd_tss_val_cols.idxmax(axis=1)
+                pri_merged_df["tss_fwd"] = fwd_tss_cols.values[np.arange(fwd_tss_cols.shape[0]), max_index]
+                pri_merged_df["tss_fwd_val"] = fwd_tss_val_cols.values[np.arange(fwd_tss_cols.shape[0]), max_index]
+
+                rev_tss_cols = pri_merged_df["tss_rev"].str.split(",", expand=True).fillna(value=-1).astype(int)
+                rev_tss_val_cols = pri_merged_df["tss_rev_vals"].str.split(",", expand=True).fillna(value=-1).astype(int)
+                max_index = rev_tss_val_cols.idxmax(axis=1)
+                pri_merged_df["tss_rev"] = rev_tss_cols.values[np.arange(rev_tss_cols.shape[0]), max_index]
+                pri_merged_df["tss_rev_val"] = rev_tss_val_cols.values[np.arange(rev_tss_cols.shape[0]), max_index]
+                BedTool.from_dataframe(
+                    pri_merged_df.loc[:, ("chrom", "start", "end", "confidence", "tss_fwd", "tss_rev")]).saveas(
+                    sample_prefix + "%s_%s_peaks.bed" % (specific_suffix, directionality))
+            else:
+                BedTool.cat(*[BedTool(exp_pl_file),
+                              BedTool(exp_mn_file)],
+                            postmerge=False).sort().saveas(
+                    sample_prefix + "%s_unidirectional_peaks.bed" % specific_suffix)
+        logger.info(f"Elements merged {directionality}")
+    return (sample_prefix + "%s_bidirectional_peaks.bed" % specific_suffix,
+            sample_prefix + "%s_divergent_peaks.bed" % specific_suffix,
+            sample_prefix + "%s_unidirectional_peaks.bed" % specific_suffix), data_structure._make(generated_files)
+
+
+def annotate_TRE_with_epig_info(peak_file, epig_bigbed_file, only_annotated_records=False, placeholders=dict()):
+    """
+
+    Parameters
+    ----------
+    peak_file : str
+        Path to a bed file
+    epig_bigbed_file : str
+        Path to a bigbed file
+    only_annotated_records : bool
+        Set this to True if you only want rows with epigenomic annotations to be kept
+    placeholders : dict
+        key : column name
+        value: values to be put in that column
+
+    Returns
+    -------
+
+    """
+    peak_df = pd.read_csv(peak_file, sep="\t", header=None)
+    annotations = []
+    if not os.path.exists(epig_bigbed_file):
+        raise FileNotFoundError(epig_bigbed_file)
+
+    with pyBigWig.open(epig_bigbed_file) as ref_bed:
+        for nr, row in peak_df.iterrows():
+            cache = set()
+            try:
+                hits = ref_bed.entries(row[0], row[1], row[2])
+                if hits is not None:
+                    for entry in hits:
+                        ann = entry[2].split("\t")[-2]
+                        if ann.find("ELS") != -1:
+                            cache.add("DNase")
+                            cache.add("H3K27ac")
+                        if ann.find("H3K4me3") != -1:
+                            cache.add("H3K4me3")
+            except Exception as e:
+                logger.warning(e)
+            finally:
+                annotations.append(",".join(cache) if len(cache) > 0 else ".")
+    peak_df["epig_annotation"] = annotations
+
+    if only_annotated_records:
+        peak_df = peak_df.loc[peak_df.epig_annotation != ".", :]
+        for col, value in placeholders.items():
+            peak_df[col] = value
+    peak_df.to_csv(peak_file, sep="\t", index=False, header=False)
+
+
 def peak_calling(input_bam, output_dir=".", output_prefix="pints", filters=(),
                  thread_n=1, model="ZIP", iqr_strategy="bgIQR", stringent_only=False, **kwargs):
     """
@@ -1166,12 +1398,16 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", filters=(),
     global iqr_obj
     log_assert(os.path.exists(output_dir) and os.path.isdir(output_dir), "Cannot write to {0}".format(output_dir),
                logger)
-    pybedtools.set_tempdir(output_dir)
+    
     runtime_check()
     logger.info("PINTS version: {0}".format(__version__))
     show_parameter_info(input_bam, output_dir, output_prefix, thread_n, model, iqr_strategy, stringent_only, **kwargs)
 
     prefix = os.path.join(output_dir, output_prefix)
+    pybdt_tmp = os.path.join(output_dir, "pybdt_"+datetime.datetime.now().strftime("%Y_%M_%d_%H_%M_%S")+"_"+str(os.getpid()))
+    if not os.path.exists(pybdt_tmp):
+        os.mkdir(pybdt_tmp)
+    pybedtools.set_tempdir(pybdt_tmp)
 
     log_assert(model in ("Poisson", "ZIP", "NB", "ZINB"), "Unsupported model", logger)
     if model == "ZIP":
@@ -1254,7 +1490,7 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", filters=(),
         log_assert(os.path.exists(kwargs["gene_annotation"]), "Cannot find gene annotation file", logger)
         if kwargs["highlight_chromosome"] in chromosome_coverage_pl[0]:
             kwargs["donor_tolerance"] = cut_peaks_dry_run(kwargs["gene_annotation"], chromosome_coverage_pl,
-                                                          chromosome_coverage_mn,
+                                                          chromosome_coverage_mn, tss_extension=kwargs["tss_extension"],
                                                           highlight_chromosome=kwargs["highlight_chromosome"],
                                                           output_diagnostics=kwargs["output_diagnostics"],
                                                           save_to=prefix + "_alpha.pdf")
@@ -1270,6 +1506,7 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", filters=(),
                                                                  window_size=kwargs.get("window_size", 100),
                                                                  step_size=kwargs.get("step_size", 100),
                                                                  ce_donor=kwargs.get("donor_tolerance", 1),
+                                                                 join_distance=kwargs.get("peak_distance", 1),
                                                                  ce_receptor=kwargs.get("receptor_tolerance", 0.1),
                                                                  ce_trigger=kwargs.get("ce_trigger", 3))
 
@@ -1340,6 +1577,7 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", filters=(),
             housekeeping_files.extend(plc.values())
             housekeeping_files.extend(mnc.values())
 
+    fdr_target = kwargs.pop("fdr_target")
     # peak calling (IQR)
     for rep, pl_cov_dict in enumerate(chromosome_coverage_pl):
         logger.info("Working on sample %d" % (rep + 1))
@@ -1355,75 +1593,64 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", filters=(),
                                             shared_peak_definitions=spb,
                                             strand_sign=strand_sign,
                                             thread_n=thread_n,
+                                            fdr_target=fdr_target,
                                             **kwargs)
 
             peak_df = pd.read_csv(peaks_bed, sep="\t", header=None, names=COMMON_HEADER)
             peak_df = peak_df.loc[peak_df["end"] - peak_df["start"] < kwargs["window_size_threshold"], :]
             df_dict[label] = peak_df
 
-            sig_bins = peak_df.loc[peak_df["padj"] < kwargs["fdr_target"], :]
-            with open(sample_prefix + "_sig_%s.bed" % label, "w") as f:
-                sig_bins.to_csv(f, sep="\t", index=False, header=False)
+        logger.info("Pairing peaks")
+        (bid, div, unid), gc = pair(sample_prefix, df_dict=df_dict, fdr_target=fdr_target,
+                                    stringent_only=stringent_only, **kwargs)
+        logger.info("Pairing finished on sample %d" % (rep + 1))
+        for g in gc:
+            housekeeping_files.append(g)
 
-        for label, anti_label in zip(("pl", "mn"), ("mn", "pl")):
-            if not os.path.exists(sample_prefix + "_sig_%s.bed" % label):
-                continue
-            merge_opposite_peaks(sample_prefix + "_sig_%s.bed" % label, sample_prefix + "_%s.bed.gz" % anti_label,
-                                 divergent_output_bed=sample_prefix + "_sig_%s_divergent_peaks.bed" % label,
-                                 bidirectional_output_bed=sample_prefix + "_sig_%s_bidirectional_peaks.bed" % label,
-                                 singleton_bed=sample_prefix + "_sig_%s_singletons_peaks.bed" % label,
-                                 stringent_only=stringent_only,
-                                 **kwargs)
+        epig_annotation = kwargs.get("epig_annotation", "")
+        if epig_annotation is not None and epig_annotation != "":
+            logger.info(f"Calling get_epig_annotation with {epig_annotation}, {prefix}")
+            epig_annotation = get_epig_annotation(epig_annotation, prefix)
 
-        for directionality in ("bidirectional", "divergent", "singletons"):
-            exp_pl_file = sample_prefix + "_sig_pl_%s_peaks.bed" % directionality
-            exp_mn_file = sample_prefix + "_sig_mn_%s_peaks.bed" % directionality
+            # in situ update canonical peak calls
+            annotate_TRE_with_epig_info(bid, epig_annotation)
+            annotate_TRE_with_epig_info(div, epig_annotation)
+            annotate_TRE_with_epig_info(unid, epig_annotation)
 
-            if os.path.exists(exp_pl_file) and os.path.exists(exp_mn_file):
-                if directionality != "singletons":
-                    pri_merged_file = BedTool.cat(*[BedTool(exp_pl_file),
-                                                    BedTool(exp_mn_file)],
-                                                  c=(12, 13, 14, 15, 16),
-                                                  o=("collapse", "collapse", "collapse", "collapse", "distinct"))
-                    pri_merged_df = pri_merged_file.to_dataframe(names=("chrom", "start", "end", "tss_fwd",
-                                                                        "tss_fwd_vals", "tss_rev", "tss_rev_vals",
-                                                                        "confidence"))
-                    for nr, row in pri_merged_df.iterrows():
-                        if row["tss_fwd"].find(",") != -1:
-                            tsss = row["tss_fwd"].split(",")
-                            tss_vals = list(map(int, row["tss_fwd_vals"].split(",")))
-                            pri_merged_df.loc[nr, "tss_fwd"] = tsss[np.argmax(tss_vals)]
-                            pri_merged_df.loc[nr, "tss_fwd_val"] = max(tss_vals)
-                        if row["tss_rev"].find(",") != -1:
-                            tsss = row["tss_rev"].split(",")
-                            tss_vals = list(map(int, row["tss_rev_vals"].split(",")))
-                            pri_merged_df.loc[nr, "tss_rev"] = tsss[np.argmax(tss_vals)]
-                            pri_merged_df.loc[nr, "tss_rev_val"] = max(tss_vals)
-                    BedTool.from_dataframe(
-                        pri_merged_df.loc[:, ("chrom", "start", "end", "confidence", "tss_fwd", "tss_rev")]).saveas(
-                        sample_prefix + "_%s_peaks.bed" % directionality)
-                else:
-                    BedTool.cat(*[BedTool(exp_pl_file),
-                                  BedTool(exp_mn_file)],
-                                postmerge=False).sort().saveas(sample_prefix + "_unidirectional_peaks.bed")
+            relaxed_fdr = kwargs.get("relaxed_fdr_target", fdr_target * 2)
+            (r_bid, r_div, r_unid), r_gc = pair(sample_prefix, df_dict=df_dict, fdr_target=relaxed_fdr,
+                                                stringent_only=stringent_only, specific_suffix="_EA", **kwargs)
+            # in situ update relaxed peak calls
+            annotate_TRE_with_epig_info(r_bid, epig_annotation, only_annotated_records=True,
+                                        placeholders={3: "Marginal"})
+            annotate_TRE_with_epig_info(r_div, epig_annotation, only_annotated_records=True,
+                                        placeholders={3: "Marginal"})
+            annotate_TRE_with_epig_info(r_unid, epig_annotation, only_annotated_records=True)
+
+            # merge results
+            BedTool.cat(*[BedTool(bid), BedTool(r_bid).intersect(bid, v=True).saveas()], postmerge=False).sort().saveas(
+                bid)
+            BedTool.cat(*[BedTool(div), BedTool(r_div).intersect(div, v=True).saveas()], postmerge=False).sort().saveas(
+                div)
+            BedTool.cat(*[BedTool(unid), BedTool(r_unid).intersect(unid, v=True).saveas()],
+                        postmerge=False).sort().saveas(
+                unid)
+            for g in r_gc:
+                housekeeping_files.append(g)
+            housekeeping_files.append(r_bid)
+            housekeeping_files.append(r_div)
+            housekeeping_files.append(r_unid)
 
         if kwargs.get("output_diagnostics", False):
             peak_bed_to_gtf(pl_df=df_dict["pl"], mn_df=df_dict["mn"],
                             save_to=sample_prefix + "_peaks.gtf", version=__version__)
 
-        housekeeping_files.append(sample_prefix + "_pl.bed.gz")
-        housekeeping_files.append(sample_prefix + "_pl.bed.gz.tbi")
-        housekeeping_files.append(sample_prefix + "_mn.bed.gz")
-        housekeeping_files.append(sample_prefix + "_mn.bed.gz.tbi")
-        housekeeping_files.append(sample_prefix + "_sig_pl.bed")
-        housekeeping_files.append(sample_prefix + "_sig_mn.bed")
-        housekeeping_files.append(sample_prefix + "_sig_pl_singletons_peaks.bed")
-        housekeeping_files.append(sample_prefix + "_sig_mn_singletons_peaks.bed")
-        housekeeping_files.append(sample_prefix + "_sig_pl_divergent_peaks.bed")
-        housekeeping_files.append(sample_prefix + "_sig_mn_divergent_peaks.bed")
-        housekeeping_files.append(sample_prefix + "_sig_pl_bidirectional_peaks.bed")
-        housekeeping_files.append(sample_prefix + "_sig_mn_bidirectional_peaks.bed")
-
+        for rep, pl_cov_dict in enumerate(chromosome_coverage_pl):
+            housekeeping_files.append(sample_prefix + "_pl.bed.gz")
+            housekeeping_files.append(sample_prefix + "_pl.bed.gz.tbi")
+            housekeeping_files.append(sample_prefix + "_mn.bed.gz")
+            housekeeping_files.append(sample_prefix + "_mn.bed.gz.tbi")
+        
         logger.info("Finished on sample %d" % (rep + 1))
         logger.info("Divergent peaks were saved to %s" % sample_prefix + "_divergent_peaks.bed")
         logger.info("Bidirectional peaks were saved to %s" % sample_prefix + "_bidirectional_peaks.bed")
@@ -1435,7 +1662,7 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", filters=(),
     if is_borrow_info_from_reps and len(chromosome_coverage_pl) > 1:
         logger.info("Enhanced support for biological replicates is enabled.")
         inferring_elements_from_other_reps(prefix=prefix, n_samples=len(chromosome_coverage_pl))
-    housekeeping(output_dir)
+    housekeeping(pybdt_tmp)
 
 
 if __name__ == "__main__":
@@ -1522,6 +1749,9 @@ if __name__ == "__main__":
     group.add_argument("--annotation-gtf", action="store", dest="annotation_gtf", type=str, required=False,
                        help="Gene annotation file (gtf) format for learning the threshold for edge trimming. "
                             "If this is specified, other related parameters like --donor-tolerance will be ignored.")
+    group.add_argument("--tss-extension", action="store", dest="tss_extension", type=int, required=False, default=200,
+                       help="BPs to be extended from annotated TSSs, these extended regions will be used to minimize "
+                            "overlaps between called peaks.")
     group.add_argument("--focused-chrom", action="store", dest="focused_chrom", default="chr1", type=str,
                        required=False,
                        help="If --annotation-gtf is specified, you use this parameter to change which chromosome the "
@@ -1541,7 +1771,7 @@ if __name__ == "__main__":
                        type=float, required=False, default=0.1,
                        help="Local backgrounds smaller than this percentile among all peaks will be replaced.")
     group.add_argument("--peak-distance", action="store", dest="peak_distance",
-                       type=int, required=False, default=None,
+                       type=int, required=False, default=1,
                        help="Required minimal horizontal distance (>= 1) in samples between neighbouring peaks.")
     group.add_argument("--peak-width", action="store", dest="peak_width",
                        type=int, required=False, default=None,
@@ -1569,6 +1799,10 @@ if __name__ == "__main__":
                        help="Disable small peak correction")
 
     group = parser.add_argument_group("Other")
+    group.add_argument("--epig-annotation", action="store", dest="epig_annotation", type=str, required=False,
+                       help="Refine peak calls with compiled epigenomic annotation from PINTS web server.")
+    group.add_argument("--relaxed-fdr-target", action="store", dest="relaxed_fdr_target", default=0.2,
+                       type=float, required=False, help="Relaxed FDR cutoff for TREs overlap with ")
     group.add_argument("--chromosome-start-with", action="store", dest="chromosome_startswith",
                        type=str, required=False, default="chr",
                        help="Only keep reads mapped to chromosomes with this prefix")
@@ -1614,4 +1848,6 @@ if __name__ == "__main__":
                  ct_bw_mn=args.ct_bw_mn, model=args.model, iqr_strategy=args.iqr_strategy,
                  highlight_chromosome=args.focused_chrom, disable_ler=args.disable_ler,
                  stringent_only=args.stringent_pairs_only, min_len_opposite_peaks=args.min_len_opposite_peaks,
-                 disable_small=args.disable_small, borrow_info_reps=args.borrow_info_reps)
+                 disable_small=args.disable_small, borrow_info_reps=args.borrow_info_reps,
+                 tss_extension=args.tss_extension, peak_distance=args.peak_distance,
+                 epig_annotation=args.epig_annotation, relaxed_fdr_target=args.relaxed_fdr_target)
