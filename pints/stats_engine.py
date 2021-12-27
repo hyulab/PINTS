@@ -3,7 +3,7 @@
 # Created by: Li Yao (ly349@cornell.edu)
 # Created on: 2019-08-07
 #
-# PINTS: Peak Identifier for Nascent Transcripts Sequencing
+# PINTS: Peak Identifier for Nascent Transcripts Starts
 # Copyright (C) 2019 Li Yao at the Yu Lab
 #
 # This program is free software: you can redistribute it and/or modify

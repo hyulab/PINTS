@@ -19,5 +19,5 @@ setup(
     license="GPL",
     author="Li Yao",
     author_email="regulatorygenome@gmail.com",
-    description="Peak Identifier for Nascent Transcripts Sequencing (PINTS)"
+    description="Peak Identifier for Nascent Transcripts Starts (PINTS)"
 )
