@@ -1,4 +1,4 @@
-name: Build and publish pyPINTS to PyPI
+name: PyPI Builds
 
 on:
   push:

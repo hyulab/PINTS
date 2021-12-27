@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding=utf-8
 
-#  PINTS: Peak Identifier for Nascent Transcripts Sequencing
+#  PINTS: Peak Identifier for Nascent Transcripts Starts
 #  Copyright (c) 2019-2021 Li Yao at the Yu Lab.
 #
 #  This program is free software: you can redistribute it and/or modify
@@ -1666,7 +1666,7 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", filters=(),
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Peak Identifier for Nascent Transcripts Sequencing")
+    parser = argparse.ArgumentParser(description="Peak Identifier for Nascent Transcripts Starts")
     group = parser.add_argument_group("Input/Output")
     group.add_argument("--bam-file", action="store", dest="bam_file", nargs="*",
                        type=str, required=False,
