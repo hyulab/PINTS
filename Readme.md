@@ -22,6 +22,7 @@ Python packages
 * pybedtools
 * pyBigWig
 * pysam
+* requests
 * scipy
 * statsmodels
 

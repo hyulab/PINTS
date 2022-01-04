@@ -62,6 +62,44 @@ stat_tester = None
 iqr_obj = None
 
 
+def check_update():
+    """
+    Check for updates
+
+    Returns
+    -------
+
+    """
+    import requests
+    from requests.adapters import HTTPAdapter
+    from urllib3.util import Retry
+    import time
+    requests.packages.urllib3.disable_warnings()
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=3
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+
+    with requests.Session() as http:
+        http.mount("https://", adapter)
+
+        try:
+            req = http.get(url="https://pypi.org/pypi/pyPINTS/json", timeout=10)
+            rj = req.json()
+            remote_version = rj["info"]["version"]
+            import pints
+            if pints.__version__ == remote_version:
+                logger.info("You are using the latest version of PINTS")
+            else:
+                logger.warning("!!!Your PINTS version is out-dated ({cv} vs. {rv})!!!".format(cv=pints.__version__,
+                                                                                            rv=remote_version))
+                logger.warning("Please run `pip install -U pyPINTS` to update!")
+                time.sleep(10)
+        except Exception as e:
+            logger.error(e)
+
+
 def handle_exception(exc_type, exc_value, exc_traceback):
     """
     Handler for exception
@@ -117,12 +155,14 @@ def run_command(cmd, repress_log=False):
     return stdout, stderr, p.returncode
 
 
-def runtime_check():
+def runtime_check(check_updates=True):
     """
     Runtime check, make sure all dependent tools are callable
 
     Parameters
     ----------
+    check_updates : bool
+        Set this to True to check whether the PINTS instance is up-to-date
 
     Returns
     -------
@@ -137,6 +177,8 @@ def runtime_check():
         if full_path is None:
             logger.error("Required tool %s is not callable" % tool)
             exit(1)
+    if check_updates:
+        check_update()
 
 
 def merge_intervals(intervals, distance=0):
@@ -1399,7 +1441,7 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", filters=(),
     log_assert(os.path.exists(output_dir) and os.path.isdir(output_dir), "Cannot write to {0}".format(output_dir),
                logger)
     
-    runtime_check()
+    runtime_check(check_updates=kwargs.pop("check_updates", True))
     logger.info("PINTS version: {0}".format(__version__))
     show_parameter_info(input_bam, output_dir, output_prefix, thread_n, model, iqr_strategy, stringent_only, **kwargs)
 
@@ -1809,6 +1851,9 @@ if __name__ == "__main__":
     group.add_argument("--dont-output-chrom-size", action="store_false", dest="output_chrom_size",
                        required=False, default=True,
                        help="Don't write chromosome dict to local folder (not recommended)")
+    group.add_argument("--dont-check-updates", action="store_false", dest="check_updates",
+                       required=False, default=True,
+                       help="Set this switch to disable update check.")
     group.add_argument("--debug", action="store_true", dest="output_diagnostics",
                        required=False, default=False,
                        help="Save diagnostics (independent filtering and pval dist) to local folder")
@@ -1850,4 +1895,5 @@ if __name__ == "__main__":
                  stringent_only=args.stringent_pairs_only, min_len_opposite_peaks=args.min_len_opposite_peaks,
                  disable_small=args.disable_small, borrow_info_reps=args.borrow_info_reps,
                  tss_extension=args.tss_extension, peak_distance=args.peak_distance,
-                 epig_annotation=args.epig_annotation, relaxed_fdr_target=args.relaxed_fdr_target)
+                 epig_annotation=args.epig_annotation, relaxed_fdr_target=args.relaxed_fdr_target, 
+                 check_updates=args.check_updates)
