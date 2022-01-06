@@ -1869,7 +1869,7 @@ if __name__ == "__main__":
 
     warnings.filterwarnings("ignore", message="numpy.dtype size changed")
     warnings.filterwarnings("ignore", message="numpy.ufunc size changed")
-    DEFAULT_PREFIX = "peakcalling_" + datetime.datetime.now().strftime("%Y_%M_%d_%H_%M_%S")
+    DEFAULT_PREFIX = "peakcalling_" + datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
     handler = logging.FileHandler(os.path.join(args.save_to, "{0}.log".format(DEFAULT_PREFIX)))
     formatter = logging.Formatter("%(name)s - %(asctime)s - %(levelname)s: %(message)s")
     handler.setFormatter(formatter)
