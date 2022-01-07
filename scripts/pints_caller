@@ -1714,7 +1714,7 @@ if __name__ == "__main__":
                        type=str, required=False,
                        help="input bam file, if you want to use bigwig files, please use --bw-pl and --bw-mn")
     group.add_argument("--save-to", action="store", dest="save_to",
-                       type=str, required=True, default=".",
+                       type=str, required=False, default=".",
                        help="save peaks to this path (a folder), by default, current folder")
     group.add_argument("--file-prefix", action="store", dest="file_prefix",
                        type=str, required=True, default=str(os.getpid()),
