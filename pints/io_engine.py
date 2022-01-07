@@ -425,6 +425,8 @@ def get_read_signal(input_bam, loc_prime, chromosome_startswith, output_dir, out
         "CoPRO": "R2_5_f",
         "CAGE": "R_5_f",
         "NETCAGE": "R_5_f",
+        "RAMPAGE": "R1_5_f",
+        "STRIPEseq": "R1_5_f",
         "csRNAseq": "R_5_f",
         "mNETseq": "R2_5_r"
     }
