@@ -3,7 +3,7 @@
 # Created by: Li Yao (ly349@cornell.edu)
 # Created on: 2019-08-07
 #
-# PINTS: Peak Identifier for Nascent Transcripts Sequencing
+# PINTS: Peak Identifier for Nascent Transcripts Starts
 # Copyright (C) 2019 Li Yao at the Yu Lab
 #
 # This program is free software: you can redistribute it and/or modify
@@ -21,10 +21,9 @@ import warnings
 try:
     import pysam
     import numpy as np
-    from scipy.stats import poisson, binom_test, fisher_exact, nbinom
+    from scipy.stats import poisson, fisher_exact, nbinom
     from scipy.special import gamma, digamma, polygamma, gammaln, psi, factorial
     from scipy.optimize import fmin_l_bfgs_b as BFGS
-    from scipy.optimize import newton
     from abc import ABC, abstractmethod
     from collections import defaultdict
 except ImportError as e:
@@ -232,7 +231,6 @@ class ZIP(StatModel):
             init_lamb, init_pi = ZIP.zip_moment_estimators(windows=window)
         else:
             init_lamb = self.init_mu
-            # init_pi = self.init_pi
             init_pi = 0.8
         lamb = init_lamb
         pi = init_pi
@@ -351,7 +349,6 @@ class NegativeBinomial(StatModel):
             # convert mu/size parameterization to prob/size
             p0 = size / ((size + m) if size + m != 0 else 1)
             r0 = size
-            # initial_params = np.array([r0, p0])
         else:
             size = self.init_mu ** 2 / (self.init_variance - self.init_mu) if self.init_variance > self.init_mu else 10
             p0 = size / ((size + self.init_mu) if size + self.init_mu != 0 else 1)
@@ -361,7 +358,6 @@ class NegativeBinomial(StatModel):
             bounds = [(self.infinitesimal, None), (self.infinitesimal, 1)]
             optimres = BFGS(log_likelihood,
                             x0=initial_params,
-                            # fprime=log_likelihood_deriv,
                             args=(window,),
                             approx_grad=1,
                             bounds=bounds)
@@ -370,8 +366,8 @@ class NegativeBinomial(StatModel):
             convergent_flag = True if optimres[2]["warnflag"] == 0 else False
         except:
             # print("Failed to converge.")
-            return r0, p0, None, None, False
-        return params[0], params[1], None, None, convergent_flag
+            return r0, p0, 0, None, False
+        return params[0], params[1], 0, None, convergent_flag
 
     def sf(self, peak_mu, peak_var, peak_pi, le_mu, le_var, le_pi):
         return nbinom.sf(peak_mu * (1 - peak_var) / peak_var, le_mu, le_var)
@@ -394,8 +390,7 @@ class ZINB(StatModel):
             mu = mu if mu > 0 else infinitesimal
             one_minus_pi = 1 - pi
             one_minus_pi = one_minus_pi if one_minus_pi > 0 else infinitesimal
-            # log_muk = np.log(muk if muk > 0 else infinitesimal)
-            # N = len(X)
+
             is_zeros = X == 0
             is_zeros = is_zeros.astype(int)
             # incomplete log-likelihood function
@@ -435,7 +430,6 @@ class ZINB(StatModel):
         bounds = [(infinitesimal, None), (infinitesimal, None)]
         optimres = BFGS(log_likelihood,
                         x0=initial_params,
-                        # fprime=log_likelihood_deriv,
                         args=(X, Z, pi),
                         approx_grad=1,
                         bounds=bounds)
@@ -606,9 +600,11 @@ class IQR(ABC):
 
     @staticmethod
     @abstractmethod
-    def remove_peaks_in_local_env(stat_tester, bed_handler, chromosome, query_start_left, query_end_left,
-                                  query_start_right, query_end_right, small_window_threshold, peak_in_bg_threshold,
-                                  coverage_info, fdr_target, cache, disable_ler=False, peak_threshold=None):
+    def remove_peaks_in_local_env(stat_tester, bed_handler, chromosome, query_start_left, 
+                                  query_end_left, query_start_right, query_end_right, 
+                                  small_window_threshold, peak_in_bg_threshold,
+                                  coverage_info, fdr_target, cache, disable_ler=False, 
+                                  enable_eler=True, peak_threshold=None):
         """
         LER-based local environment refinement
 
@@ -640,6 +636,8 @@ class IQR(ABC):
             Cache for LER
         disable_ler : bool
             Set it to True to disable LER
+        enable_eler : bool
+            Set it to False to disable empirical LER
         peak_threshold : None or numeric
             Only applicable to pkIQR, the `min(outlier_t, peak_threshold)`
             will be used as the final `outlier_t`
@@ -656,21 +654,23 @@ class IQR(ABC):
 
 class bgIQR(IQR):
     @staticmethod
-    def remove_peaks_in_local_env(stat_tester, bed_handler, chromosome, query_start_left, query_end_left,
-                                  query_start_right, query_end_right, small_window_threshold, peak_in_bg_threshold,
-                                  coverage_info, fdr_target, cache, disable_ler=False, peak_threshold=None):
+    def remove_peaks_in_local_env(stat_tester, bed_handler, chromosome, query_start_left, 
+                                  query_end_left, query_start_right, query_end_right, 
+                                  small_window_threshold, peak_in_bg_threshold, 
+                                  coverage_info, fdr_target, cache, disable_ler=False, 
+                                  enable_eler=True, peak_threshold=None):
         ler_count = 0
         bg_mus = []
         local_env_left = coverage_info[query_start_left:query_end_left]
         local_env_right = coverage_info[query_start_right:query_end_right]
         local_cache = defaultdict(int)
-        se_l, re_l, _ = bgIQR.atom_ler(bed_handler=bed_handler, chromosome=chromosome, query_start=query_start_left,
-                                       query_end=query_end_left, queried_peaks=local_cache,
-                                       small_window_threshold=small_window_threshold,
-                                       peak_in_bg_threshold=peak_in_bg_threshold)
-        se_r, re_r, _ = bgIQR.atom_ler(bed_handler=bed_handler, chromosome=chromosome, query_start=query_start_right,
-                                       query_end=query_end_right, queried_peaks=local_cache,
-                                       small_window_threshold=small_window_threshold,
+        se_l, re_l, dens_l = bgIQR.atom_ler(bed_handler=bed_handler, chromosome=chromosome, 
+                                            query_start=query_start_left, query_end=query_end_left, 
+                                            queried_peaks=local_cache, small_window_threshold=small_window_threshold,
+                                            peak_in_bg_threshold=peak_in_bg_threshold)
+        se_r, re_r, dens_r = bgIQR.atom_ler(bed_handler=bed_handler, chromosome=chromosome, 
+                                            query_start=query_start_right, query_end=query_end_right, 
+                                            queried_peaks=local_cache, small_window_threshold=small_window_threshold,
                                        peak_in_bg_threshold=peak_in_bg_threshold)
         coord_offset = len(local_env_left)
         new_local_env = np.concatenate((local_env_left, local_env_right), axis=None)
@@ -682,6 +682,7 @@ class bgIQR(IQR):
         uncertain_re_l = []
         uncertain_se_r = []
         uncertain_re_r = []
+        all_dens = []
 
         for k, (b, s) in enumerate(re_l):
             cache_key = "%d-%d" % (b, s)
@@ -692,6 +693,7 @@ class bgIQR(IQR):
             else:
                 uncertain_re_l.append(re_l[k])
                 uncertain_se_l.append(se_l[k])
+                all_dens.append(dens_l[k])
         for k, (b, s) in enumerate(re_r):
             cache_key = "%d-%d" % (b, s)
             if cache_key in cache:
@@ -701,6 +703,7 @@ class bgIQR(IQR):
             else:
                 uncertain_re_r.append(re_r[k])
                 uncertain_se_r.append(se_r[k])
+                all_dens.append(dens_r[k])
 
         se_coords = []
         se_coords.extend(uncertain_se_l)
@@ -731,7 +734,8 @@ class bgIQR(IQR):
             outlier_t, _ = bgIQR.get_outlier_threshold(bg_mus)
             for k, v in enumerate(bg_mus):
                 cache_key = "%d-%d" % (re_coords[k][0], re_coords[k][1])
-                if v < outlier_t:
+                if v < outlier_t or (
+                        enable_eler and all_dens[k] > peak_threshold and re_coords[k][1] - re_coords[k][0] > small_window_threshold):
                     ler_count += 1
                     new_local_env[se_coords[k][0]:se_coords[k][1]] = -1
                     cache[cache_key] = 1
@@ -761,7 +765,8 @@ class bgIQR(IQR):
                 mu_bg, var_bg, pi_bg, llc_bg, _ = stat_tester.fit(background_window)
 
                 p_val_formal = stat_tester.sf(mu_pk, var_pk, pi_pk, mu_bg, var_bg, pi_bg)
-                if p_val_formal < fdr_target:
+                if p_val_formal < fdr_target or (
+                        enable_eler and mu_pk > peak_threshold and s - b > small_window_threshold):
                     new_local_env[se_coords[k][0]:se_coords[k][1]] = -1
                     ler_count += 1
                     cache[cache_key] = 1
@@ -775,9 +780,11 @@ class bgIQR(IQR):
 
 class pkIQR(IQR):
     @staticmethod
-    def remove_peaks_in_local_env(stat_tester, bed_handler, chromosome, query_start_left, query_end_left,
-                                  query_start_right, query_end_right, small_window_threshold, peak_in_bg_threshold,
-                                  coverage_info, fdr_target, cache, disable_ler=False, peak_threshold=5.):
+    def remove_peaks_in_local_env(stat_tester, bed_handler, chromosome, query_start_left, 
+                                  query_end_left, query_start_right, query_end_right, 
+                                  small_window_threshold, peak_in_bg_threshold, 
+                                  coverage_info, fdr_target, cache, disable_ler=False, 
+                                  enable_eler=True, peak_threshold=5.):
         ler_count = 0
         local_env_left = coverage_info[query_start_left:query_end_left]
         local_env_right = coverage_info[query_start_right:query_end_right]
@@ -829,7 +836,8 @@ class pkIQR(IQR):
                 mu_bg, var_bg, pi_bg, llc_bg, _ = stat_tester.fit(background_window)
 
                 p_val_formal = stat_tester.sf(mu_pk, var_pk, pi_pk, mu_bg, var_bg, pi_bg)
-                if p_val_formal < fdr_target:
+                if p_val_formal < fdr_target or (
+                        enable_eler and mu_pk > peak_threshold and s - b > small_window_threshold):
                     new_local_env[se_l[k][0]:se_l[k][1]] = -1
                     ler_count += 1
         return new_local_env[new_local_env >= 0], ler_count
@@ -850,8 +858,7 @@ def independent_filtering(df, fdr_target=0.1, output_to=None, logger=None, **kwa
     logger : None or a logger
         A logger to write logs
     **kwargs :
-        Keyword arguments, adjust_method (str, default fdr_bh),
-                           ind_filter_granularity (float, default 0.005)
+        Keyword arguments, adjust_method (str, default fdr_bh)
                            and output_diagnostics (bool, default True) is effective
     Returns
     -------
@@ -876,7 +883,11 @@ def independent_filtering(df, fdr_target=0.1, output_to=None, logger=None, **kwa
     adjusted_df = None
     select_probe = None
     read_counts_threshold = 0
-    for quantile in np.arange(0, 1, kwargs["ind_filter_granularity"]):
+    try:
+        direct_padj = multipletests(df["pval"], alpha=fdr_target, method=kwargs["adjust_method"])[1]
+    except ZeroDivisionError:
+        direct_padj = df["pval"] * df.shape[0]
+    for quantile in np.arange(0, 1, 0.005):
         threshold = df.reads.quantile(quantile)
         tmp_probe = df["reads"] > threshold
         filtered_df = df.loc[tmp_probe, :].copy()
@@ -909,7 +920,7 @@ def independent_filtering(df, fdr_target=0.1, output_to=None, logger=None, **kwa
         quantiles_tested[optimized_threshold], windows_rejected[optimized_threshold]))
 
     final_df = df.copy()
-    final_df["padj"] = final_df["pval"]
+    final_df["padj"] = direct_padj
     final_df.loc[select_probe, "padj"] = adjusted_df["padj"]
     quantiles_tested_arr = np.asarray(quantiles_tested)
     windows_rejected_arr = np.asarray(windows_rejected)
@@ -948,27 +959,34 @@ def get_elbow(X, Y):
 
     Returns
     -------
-    elbow_x : float
-
-    elbow_y : float
-
+    elbow_x : float or np.nan
+        X coordinate of the elbow/knee point. If the alg fails to find the point, it returns np.nan
+    elbow_y : float or np.nan
+        Y coordinate of the elbow/knee point. If the alg fails to find the point, it returns np.nan
     """
     X = np.asarray(X)
     Y = np.asarray(Y)
+    if X.shape[0] < 3 or X.shape[0] != Y.shape[0]:
+        return np.nan, np.nan
+
     sort_index = X.argsort()
     X_s = X[sort_index]
     Y_s = Y[sort_index]
 
     p1 = np.array([X_s[0], Y_s[0]])
     p2 = np.array([X_s[-1], Y_s[-1]])
-    D = []
-    for x, y in zip(X_s, Y_s):
-        p3 = np.array([x, y])
-        # d = np.abs(np.cross(p2 - p1, p3 - p1)) / np.linalg.norm(p2 - p1)
-        d = np.cross(p2 - p1, p3 - p1) / np.linalg.norm(p2 - p1)
-        D.append(d)
-    midx = np.argmax(D)
-    return X_s[midx], Y_s[midx]
+    P3 = np.column_stack((X_s, Y_s))
+
+    D = np.abs(np.cross(p2-p1, P3-p1) / np.linalg.norm(p2-p1))
+    tmp = np.where(D == np.nanmax(D))[0]
+    if len(tmp) > 0:
+        midx = tmp[-1]
+        X_e = X_s[midx]
+        Y_e = Y_s[midx]
+    else:
+        X_e = np.nan
+        Y_e = np.nan
+    return X_e, Y_e
 
 
 if __name__ == "__main__":
@@ -983,5 +1001,5 @@ if __name__ == "__main__":
     # Simulate some data
     z = ZIP(debug=True)
     counts = np.array([(np.random.random() > pi) *
-                       np.random.poisson(theta) for i in range(n)])
+                       np.random.poisson(theta) for _ in range(n)])
     print(z.fit(counts))

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding=utf-8
 
-#  PINTS: Peak Identifier for Nascent Transcripts Sequencing
+#  PINTS: Peak Identifier for Nascent Transcripts Starts
 #  Copyright (c) 2019-2021 Li Yao at the Yu Lab.
 #
 #  This program is free software: you can redistribute it and/or modify
@@ -35,18 +35,16 @@ logger = logging.getLogger("PINTS - Caller")
 try:
     import numpy as np
     import pandas as pd
-    import scipy
     import pysam
     import pyBigWig
     import pybedtools
-    from scipy.stats import poisson, binom_test, probplot, uniform, nbinom
+    from scipy.stats import poisson
     from scipy.signal import find_peaks, peak_widths
     from scipy.ndimage import gaussian_filter1d
     from pybedtools import BedTool
-    from statsmodels.stats.multitest import multipletests
-    from pints.stats_engine import Poisson, ZIP, NegativeBinomial, ZINB, pval_dist, get_rank, bgIQR, pkIQR, \
+    from pints.stats_engine import Poisson, ZIP, NegativeBinomial, ZINB, pval_dist, bgIQR, pkIQR, \
         independent_filtering, get_elbow
-    from pints.io_engine import get_read_signal, get_coverage, get_coverage_bw, log_assert, normalize_using_input, \
+    from pints.io_engine import get_read_signal, get_coverage_bw, log_assert, normalize_using_input, \
         index_bed_file, peak_bed_to_gtf
     from pints import __version__
 except ImportError as e:
@@ -56,10 +54,49 @@ except ImportError as e:
 
 housekeeping_files = []
 COMMON_HEADER = ('chromosome', 'start', 'end', 'name', 'padj', 'strand', 'reads',
-                 'pval', 'mu_0', 'pi_0', 'mu_1', 'pi_1', 'ler_1', 'ler_2', 'ler_3',
+                 'pval', 'mu_0', 'pi_0', 'mu_1', 'pi_1', 'var_1', 'ler_1', 'ler_2', 'ler_3',
                  'summit', 'summit_val')
 stat_tester = None
 iqr_obj = None
+
+
+def check_update():
+    """
+    Check for updates
+
+    Returns
+    -------
+
+    """
+    logger.info("Checking for updates...")
+    import requests
+    from requests.adapters import HTTPAdapter
+    from urllib3.util import Retry
+    import time
+    requests.packages.urllib3.disable_warnings()
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=3
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+
+    with requests.Session() as http:
+        http.mount("https://", adapter)
+
+        try:
+            req = http.get(url="https://pypi.org/pypi/pyPINTS/json", timeout=10)
+            rj = req.json()
+            remote_version = rj["info"]["version"]
+            import pints
+            if pints.__version__ == remote_version:
+                logger.info("You are using the latest version of PINTS")
+            else:
+                logger.warning("!!!Your PINTS version is out-dated ({cv} vs. {rv})!!!".format(cv=pints.__version__,
+                                                                                            rv=remote_version))
+                logger.warning("Please run `pip install -U pyPINTS` to update!")
+                time.sleep(10)
+        except Exception as ex:
+            logger.error(ex)
 
 
 def handle_exception(exc_type, exc_value, exc_traceback):
@@ -107,8 +144,8 @@ def run_command(cmd, repress_log=False):
         Exit status of the child process
     """
     from subprocess import Popen, PIPE
-    p = Popen(cmd, shell=True, stderr=PIPE, stdout=PIPE)
-    stdout, stderr = p.communicate()
+    with Popen(cmd, shell=True, stderr=PIPE, stdout=PIPE) as p:
+        stdout, stderr = p.communicate()
     stderr = stderr.decode("utf-8")
     stdout = stdout.decode("utf-8")
     if not repress_log:
@@ -117,12 +154,14 @@ def run_command(cmd, repress_log=False):
     return stdout, stderr, p.returncode
 
 
-def runtime_check():
+def runtime_check(check_updates=True):
     """
     Runtime check, make sure all dependent tools are callable
 
     Parameters
     ----------
+    check_updates : bool
+        Set this to True to check whether the PINTS instance is up-to-date
 
     Returns
     -------
@@ -136,7 +175,9 @@ def runtime_check():
         full_path = shutil.which(tool)
         if full_path is None:
             logger.error("Required tool %s is not callable" % tool)
-            exit(1)
+            sys.exit(1)
+    if check_updates:
+        check_update()
 
 
 def merge_intervals(intervals, distance=0):
@@ -177,7 +218,7 @@ def merge_intervals(intervals, distance=0):
     return s[:m + 1]
 
 
-def sliding_window(chromosome_coverage, window_size, step_size):
+def sliding_window(chromosome_coverage, window_size=100, step_size=100):
     """
     Generate sliding windows
 
@@ -186,9 +227,9 @@ def sliding_window(chromosome_coverage, window_size, step_size):
     chromosome_coverage : array-like
         0-based per base coverage array for a certain chromosome
     window_size : int
-        Window size for scanning
+        Window size, by default, 100
     step_size : int
-        Step size for scanning
+        Step size, by default, 100 (non-overlap)
 
     Yields
     ------
@@ -219,7 +260,7 @@ def sliding_window(chromosome_coverage, window_size, step_size):
 
 def check_window(coord_start, coord_end, mu_peak, var_peak, pi_peak, chromosome_coverage, peak_in_bg_threshold,
                  mu_bkg_minimum, sp_bed_handler, chromosome_name, fdr_target, cache, small_window_threshold=5,
-                 flanking=(10000, 5000, 1000), disable_ler=False, top_peak_mu=None):
+                 flanking=(10000, 5000, 1000), disable_ler=False, enable_eler=True, top_peak_mu=None):
     """
     Calculate p-value for a peak
 
@@ -255,6 +296,10 @@ def check_window(coord_start, coord_end, mu_peak, var_peak, pi_peak, chromosome_
         Lengths of local environment that this function will check
     disable_ler : bool
         Disable local environment refinement, by default, False
+    enable_eler : bool
+        Set it to False to disable enhanced LER
+    top_peak_mu : float
+        Density threshold for peaks in local environments to be considered as potential true peaks
 
     Returns
     -------
@@ -280,12 +325,12 @@ def check_window(coord_start, coord_end, mu_peak, var_peak, pi_peak, chromosome_
     pis = []
     ler_counts = []
     # cache = dict()
-    for k, f in enumerate(flanking):
+    for f in flanking:
         # cache = dict()
         qsl = coord_start - f
-        qel = coord_start
+        qel = coord_start - 1
         qsl = qsl if qsl >= 0 else 0
-        qsr = coord_end
+        qsr = coord_end + 1
         qer = coord_end + f
         bg, x = iqr_obj.remove_peaks_in_local_env(stat_tester=stat_tester, bed_handler=sp_bed_handler,
                                                   chromosome=chromosome_name, query_start_left=qsl,
@@ -294,7 +339,8 @@ def check_window(coord_start, coord_end, mu_peak, var_peak, pi_peak, chromosome_
                                                   peak_in_bg_threshold=peak_in_bg_threshold,
                                                   coverage_info=chromosome_coverage,
                                                   fdr_target=fdr_target, cache=cache, 
-                                                  disable_ler=disable_ler, peak_threshold=top_peak_mu)
+                                                  disable_ler=disable_ler, enable_eler=enable_eler,
+                                                  peak_threshold=top_peak_mu)
 
         mu_, var_, pi_, _, _ = stat_tester.fit(bg)
         mus.append(mu_)
@@ -313,7 +359,7 @@ def check_window(coord_start, coord_end, mu_peak, var_peak, pi_peak, chromosome_
     return pvalue, window_value, mu_0, pi_0, ler_counts
 
 
-def quasi_max_score_segment(candidates, donor_tolerance, receptor_tolerance, ce_trigger, max_distance):
+def quasi_max_score_segment(candidates, donor_tolerance, ce_trigger, max_distance):
     """
     Max score segment algorithm to join adjacent sub peaks/seeds
 
@@ -327,8 +373,6 @@ def quasi_max_score_segment(candidates, donor_tolerance, receptor_tolerance, ce_
             density
     donor_tolerance : float
         Donor tolerance in best score segments
-    receptor_tolerance : float
-        Receptor tolerance in best score segments
     ce_trigger : int
         Trigger for receptor tolerance checking
     max_distance : int
@@ -350,7 +394,7 @@ def quasi_max_score_segment(candidates, donor_tolerance, receptor_tolerance, ce_
             new_density = new_total / (candidates[k + 1][1] - c[0])
             if new_density >= donor_tolerance * c[3]:
                 distance_check = c[1] - c[0] < ce_trigger or candidates[k + 1][0] - c[1] > max_distance
-                if distance_check:  # or new_density < (receptor_tolerance * candidates[k + 1][3]):
+                if distance_check:
                     fwd_search.append(c)
                     continue
                 merged = (c[0], candidates[k + 1][1], new_total, new_density)
@@ -367,7 +411,7 @@ def quasi_max_score_segment(candidates, donor_tolerance, receptor_tolerance, ce_
             new_density = new_total / (c[1] - candidates[k - 1][0])
             if new_density >= donor_tolerance * c[3]:
                 distance_check = c[1] - c[0] < ce_trigger or c[0] - candidates[k - 1][1] > max_distance
-                if distance_check:  # or new_density < (receptor_tolerance * candidates[k - 1][3]):
+                if distance_check:
                     rev_search.append(c)
                     continue
                 merged = (candidates[k - 1][0], c[1], new_total, new_density)
@@ -454,13 +498,11 @@ def cut_peaks_dry_run(annotation_gtf, pl_cov_files, mn_cov_files, tss_extension=
     pl_cov = merge_covs(pl_cov_files, highlight_chromosome)
     mn_cov = merge_covs(mn_cov_files, highlight_chromosome)
 
-    def cp_atom(coverage_track, abs_start, abs_end, donor_tolerance, receptor_tolerance=0.1, ce_trigger=3):
+    def cp_atom(coverage_track, abs_start, abs_end, donor_tolerance, ce_trigger=3):
         starts = []
         ends = []
         sub_peaks = cut_peaks(coverage_track[abs_start:abs_end],
-                              peak_rel_height=1.,
                               donor_tolerance=donor_tolerance,
-                              receptor_tolerance=receptor_tolerance,
                               ce_trigger=ce_trigger)
         for sp in sub_peaks:
             starts.append(sp[0] + abs_start)
@@ -479,9 +521,9 @@ def cut_peaks_dry_run(annotation_gtf, pl_cov_files, mn_cov_files, tss_extension=
                 cov_obj = mn_cov
             if np.sum(cov_obj[window.start:window.stop]) > 0:
                 ss, es = cp_atom(cov_obj, window.start, window.stop, donor_tolerance=dt)
-                for s, e in zip(ss, es):
+                for sc, ec in zip(ss, es):
                     predicted_peaks_dicts.append({"seqname": highlight_chromosome,
-                                                  "start": s, "end": e, "name": ".", 
+                                                  "start": sc, "end": ec, "name": ".", 
                                                   "score": ".", "strand": window.strand})
         predicted_peaks = BedTool.from_dataframe(pd.DataFrame(predicted_peaks_dicts))
         tmp_result = predicted_peaks.intersect(pct_tss_bed, c=True, s=True)
@@ -495,13 +537,13 @@ def cut_peaks_dry_run(annotation_gtf, pl_cov_files, mn_cov_files, tss_extension=
 
     smoothed_median_sizes = gaussian_filter1d(median_sizes, 1)
     smoothed_ambs = gaussian_filter1d(ambs, 1)
-    size_knee_x, size_knee = get_elbow(search_range, smoothed_median_sizes)
-    amb_knee_x, amb_knee = get_elbow(search_range, smoothed_ambs)
+    size_knee_x, _ = get_elbow(search_range, smoothed_median_sizes)
+    amb_knee_x, _ = get_elbow(search_range, smoothed_ambs)
     selected_threshold = max(size_knee_x, amb_knee_x)
 
     if output_diagnostics and save_to is not None:
         import matplotlib.pyplot as plt
-        fig, axs = plt.subplots(2, 1)
+        _, axs = plt.subplots(2, 1)
         axs[0].plot(search_range, median_sizes)
         axs[0].axvline(size_knee_x)
         axs[0].set_ylabel("Median size of peaks")
@@ -516,7 +558,7 @@ def cut_peaks_dry_run(annotation_gtf, pl_cov_files, mn_cov_files, tss_extension=
     return selected_threshold
 
 
-def cut_peaks(window, peak_rel_height, donor_tolerance, receptor_tolerance, ce_trigger, join_distance=1, 
+def cut_peaks(window, donor_tolerance, ce_trigger, join_distance=1, peak_rel_height=1.,
               max_distance=30):
     """
     Cut peaks from the given window
@@ -525,16 +567,14 @@ def cut_peaks(window, peak_rel_height, donor_tolerance, receptor_tolerance, ce_t
     ----------
     window : array-like
         Per base read counts / coverage
-    peak_rel_height : float, optional
-        Used for calculation of the peaks width, thus it is only used if width is given.
     donor_tolerance : float
         From sub peak seeking for merging, the new density should be larger than dt*prev_d
-    receptor_tolerance : float
-        From sub peak seeking being merged, the new density should be larger than rt*prev_d
     ce_trigger : int
         Sub peak narrower than cet will trigger receptor tolerance check
     join_distance : int
         The maximum distance for two subpeaks to be joined.
+    peak_rel_height : float, optional
+        Used for calculation of the peaks width, thus it is only used if width is given.
     max_distance : int
         max distance between two subpeaks to be joined, by default, 20
     Returns
@@ -543,7 +583,7 @@ def cut_peaks(window, peak_rel_height, donor_tolerance, receptor_tolerance, ce_t
         List of tuples of merged intervals [(start_1, end_1), ... , (start_n, end_n)]
     """
     peaks, _ = find_peaks(window, rel_height=peak_rel_height)
-    widths, cor_heights, starts, ends = peak_widths(window, peaks, rel_height=peak_rel_height)
+    _, _, starts, ends = peak_widths(window, peaks, rel_height=peak_rel_height)
     intervals = []
     for k, start in enumerate(starts):
         intervals.append((int(start), int(ends[k])))
@@ -556,16 +596,15 @@ def cut_peaks(window, peak_rel_height, donor_tolerance, receptor_tolerance, ce_t
         candidates.append((m[0], m[1], events, events / (m[1] - m[0])))
 
     f, r = quasi_max_score_segment(candidates=candidates, donor_tolerance=donor_tolerance,
-                                   receptor_tolerance=receptor_tolerance, ce_trigger=ce_trigger,
-                                   max_distance=max_distance)
+                                   ce_trigger=ce_trigger, max_distance=max_distance)
     f.extend(r)
     final = merge_intervals(f, distance=join_distance)
     return final
 
 
 def check_window_chromosome(rc_file, output_file, strand_sign, chromosome_name, subpeak_file, fdr_target,
-                            read_counts_threshold, small_peak_threshold=5, min_mu_percent=0.1, 
-                            disable_ler=False, top_peak_threshold=0.75):
+                            small_peak_threshold=5, min_mu_percent=0.1, 
+                            disable_ler=False, enable_eler=True, eler_min=1.):
     """
     Evaluate windows on a chromosome
 
@@ -583,14 +622,16 @@ def check_window_chromosome(rc_file, output_file, strand_sign, chromosome_name, 
         File containing info about all subpeaks
     fdr_target : float
         fdr target
-    read_counts_threshold : int
-        Min number of reads for a peak to be considered
     small_peak_threshold : int
         Peaks shorter than this threshold will be evaluated by Poisson instead of ZIP, by default, 5
     min_mu_percent : float
         Local backgrounds smaller than this percentile among all peaks will be replaced. By default, 0.1.
     disable_ler : bool
         Disable LER. By default, False.
+    enable_eler : bool
+        Set it to False to disable enhanced LER
+    eler_min : float
+        Only consider peaks with density equal to or greater than this value when performing ELER calibration.
     Returns
     -------
     result_df : pd.DataFrame
@@ -601,10 +642,9 @@ def check_window_chromosome(rc_file, output_file, strand_sign, chromosome_name, 
     per_base_cov = np.load(rc_file, allow_pickle=True)
     subpeak_bed = output_file.replace(".bed", "_subpeaks_%s.bed" % chromosome_name)
     bins = []
-    spb_fh = open(subpeak_bed, "w")
     all_peak_mus = []
     try:
-        with gzip.open(subpeak_file, "rt") as peak_obj:
+        with open(subpeak_bed, "w") as spb_fh, gzip.open(subpeak_file, "rt") as peak_obj:
             for line in peak_obj:
                 items = line.strip().split("\t")
                 start = int(items[1])
@@ -632,22 +672,50 @@ def check_window_chromosome(rc_file, output_file, strand_sign, chromosome_name, 
                 spb_fh.write("%s\t%d\t%d\t%s\t%f\t%s\t%s\t%f\t%d\t%d\n" % (
                     chromosome_name, start, end, items[3], mu_peak, var_peak, strand_sign, pi_peak, summit_coord,
                     peak_region[x]))
-        spb_fh.close()
 
         index_bed_file(subpeak_bed, logger=logger)
 
         bed_handler = pysam.TabixFile(subpeak_bed + ".gz")
         if len(all_peak_mus) == 0:
-            logger.warning("No non-trivial peak was detected on chromosome %s" % chromosome_name)
             peak_threshold = 1
             bkg_mu_threshold = 0
             empirical_true_peak_threshold = 0
         else:
             peak_threshold = 1
             bkg_mu_threshold = np.quantile(all_peak_mus, min_mu_percent)
-            empirical_true_peak_threshold = np.quantile(all_peak_mus, top_peak_threshold)
+            search_grid = np.linspace(0, 1, 21)
+            grid_quantiles = np.quantile(all_peak_mus, search_grid)
+            probe = np.where(grid_quantiles>0.5)[0]
+            if probe.shape[0] > 0:
+                suggest_val = search_grid[probe[0]]
+            else:
+                suggest_val = search_grid[-1]
+                
+            if bkg_mu_threshold < 0.5:
+                logger.warning((
+                    "Current min value for local background density is %.3f, "
+                    "please consider increasing the value of --min-mu-percent "
+                    "(current value: %.2f) to %.2f to reduce false positives." % (
+                        bkg_mu_threshold, min_mu_percent, suggest_val
+                    ))
+                )
+            sorted_arr = np.sort(all_peak_mus)
+            Y = np.log1p(sorted_arr[sorted_arr >= eler_min])
+            X = np.log10(np.arange(Y.shape[0]) + 1)
+            _, empirical_true_peak_threshold = get_elbow(X, Y)
+            if np.isnan(empirical_true_peak_threshold):
+                enable_eler = False
+            else:
+                empirical_true_peak_threshold = np.expm1(empirical_true_peak_threshold)
             logger.info("Minimum mu in local environment %f (%s)" % (bkg_mu_threshold, chromosome_name))
-        global_cache = dict()
+
+        if enable_eler:
+                logger.info(
+                    "Peaks with densities higher than {0} ({1}) will be considered as candidate peaks in local "
+                    "background".format(
+                        empirical_true_peak_threshold, chromosome_name)
+                )
+        global_cache = {}
         with gzip.open(subpeak_bed + ".gz", "rt") as peak_obj:
             for peak in peak_obj:
                 candidate_peak = peak.split("\t")
@@ -659,6 +727,7 @@ def check_window_chromosome(rc_file, output_file, strand_sign, chromosome_name, 
                 peak_pi = float(candidate_peak[7])
                 peak_summit = int(candidate_peak[8])
                 peak_summit_val = int(candidate_peak[9])
+
                 pval, wv, mu_bg, pi_bg, lerc = check_window(coord_start=peak_start, coord_end=peak_end, mu_peak=peak_mu,
                                                             var_peak=peak_var, pi_peak=peak_pi,
                                                             chromosome_coverage=per_base_cov,
@@ -668,21 +737,142 @@ def check_window_chromosome(rc_file, output_file, strand_sign, chromosome_name, 
                                                             fdr_target=fdr_target,
                                                             cache=global_cache, 
                                                             disable_ler=disable_ler,
+                                                            enable_eler=enable_eler,
                                                             top_peak_mu=empirical_true_peak_threshold)
-                if wv > read_counts_threshold:
+                if wv > 0:
                     bins.append(
                         (chromosome_name, peak_start, peak_end, peak_id, pval, wv, mu_bg, pi_bg, peak_mu, peak_pi,
-                         peak_summit, peak_summit_val, lerc[0], lerc[1], lerc[2]))
-    except TypeError as e:
+                         peak_var, peak_summit, peak_summit_val, lerc[0], lerc[1], lerc[2]))
+    except TypeError as ex:
         logger.error(str(chromosome_name) + "\t" + str(subpeak_file))
-        logger.error(e)
+        logger.error(ex)
     result_df = pd.DataFrame(bins, columns=("chromosome", "start", "end", "name", "pval", "reads",
-                                            "mu_0", "pi_0", "mu_1", "pi_1", "summit", "summit_val",
+                                            "mu_0", "pi_0", "mu_1", "pi_1", "var_1", "summit", "summit_val",
                                             "ler_1", "ler_2", "ler_3"))
     result_df["strand"] = strand_sign
     result_df = result_df.loc[:, ("chromosome", "start", "end", "name", "pval", "strand", "reads",
-                                  "mu_0", "pi_0", "mu_1", "pi_1", "summit", "summit_val", "ler_1", "ler_2", "ler_3")]
+                                  "mu_0", "pi_0", "mu_1", "pi_1", "var_1",
+                                  "summit", "summit_val", "ler_1", "ler_2", "ler_3")]
     return result_df
+
+
+def stratified_filtering(tmp_df, output_file, fdr_target, dry_run=False, **kwargs):
+    """
+    Stratified multiple testing correction
+
+    Parameters
+    ----------
+    tmp_df : pd.DataFrame
+
+    output_file : str
+        Path of output files
+    fdr_target : float
+        FDR target
+    dry_run : bool
+        Set it to True to put placeholder instead of adjusted p-values
+    **kwargs
+
+    Returns
+    -------
+    result_df : str
+        Path to a compressed and indexed bed file
+    """
+    if dry_run:
+        result_df = tmp_df.copy()
+        result_df["padj"] = result_df["pval"]
+        result_df = result_df.loc[:, COMMON_HEADER]
+    else:
+        fn, ext = os.path.splitext(output_file)
+
+        big_peaks_probe = tmp_df.end - tmp_df.start > kwargs["small_peak_threshold"]
+        small_peaks_probe = tmp_df.end - tmp_df.start <= kwargs["small_peak_threshold"]
+        lamb_global = tmp_df.loc[big_peaks_probe, "mu_1"].quantile(kwargs["top_peak_threshold"])
+        lamb_global = lamb_global if lamb_global >= 1 else 1
+
+        if kwargs["output_diagnostics"]:
+            import matplotlib.pyplot as plt
+            tx = np.arange(0, 1, 0.01)
+            qs = [tmp_df.loc[big_peaks_probe, "mu_1"].quantile(x) for x in tx]
+            plt.plot(tx, qs)
+            plt.xlabel("Quantile")
+            plt.ylabel("Peak density")
+            plt.tight_layout()
+            plt.savefig(fn + "_small_peak_threshold.pdf", transparent=True, bbox_inches="tight")
+            plt.close()
+        logger.info("Lambda for small peaks: %f" % lamb_global)
+
+        small_pois_dict = {}
+
+        def cached_pois(x):
+            if x["end"] - x["start"] > kwargs["small_peak_threshold"]:
+                return x["pval"]
+            expected_counts = lamb_global * (x["end"] - x["start"])
+            k = "{reads}-{tr}".format(reads=x["reads"], tr=expected_counts)
+            if k not in small_pois_dict:
+                small_pois_dict[k] = poisson.sf(x["reads"], expected_counts)
+            return small_pois_dict[k]
+
+        is_disable_small = kwargs.get("disable_small", False)
+        if is_disable_small:
+            tmp_df = tmp_df.loc[big_peaks_probe, :]
+            tmp_df_sm = None
+        else:
+            tmp_df["pval"] = tmp_df.apply(cached_pois, axis=1)
+
+            tmp_df_sm = independent_filtering(tmp_df.loc[small_peaks_probe, :], fdr_target=fdr_target,
+                                              output_to=fn + "_idpf_sm.pdf",
+                                              logger=logger, **kwargs)
+        if kwargs["output_diagnostics"]:
+            pval_dist(tmp_df.loc[tmp_df["end"] - tmp_df["start"] > kwargs["small_peak_threshold"], "pval"],
+                      logger=logger,
+                      output_diagnostics=kwargs["output_diagnostics"],
+                      output_to=fn + "_broad_pval_hist.pdf")
+            pval_dist(tmp_df.loc[tmp_df["end"] - tmp_df["start"] <= kwargs["small_peak_threshold"], "pval"],
+                      logger=logger,
+                      output_diagnostics=kwargs["output_diagnostics"],
+                      output_to=fn + "_narrow_peaks_pval_hist.pdf")
+            pval_dist(tmp_df["pval"],
+                      logger=logger,
+                      output_diagnostics=kwargs["output_diagnostics"],
+                      output_to=fn + "_pval_hist.pdf")
+
+        # stratified independent filtering
+        tmp_df_bg = independent_filtering(tmp_df.loc[tmp_df["end"] - tmp_df["start"] > kwargs["small_peak_threshold"],
+                                          :], output_to=fn + "_idpf_bg.pdf", logger=logger, **kwargs)
+        if tmp_df_sm is not None:
+            result_df = pd.concat([tmp_df_sm, tmp_df_bg])
+            n_sig_small = sum(tmp_df_sm.padj < fdr_target)
+            n_sig_big = sum(tmp_df_bg.padj < fdr_target)
+            small_ratio = n_sig_small / (n_sig_big+1)
+            top_peak_threshold = kwargs.get("top_peak_threshold", 0.75)
+            if small_ratio >= 0.2:
+                value_playgrounds = (0.99, 0.95, 0.9, 0.85, 0.8)
+                tpt_suggestion = None
+                for vp in value_playgrounds:
+                    if top_peak_threshold < vp:
+                        tpt_suggestion = vp
+                
+                if tpt_suggestion is not None:
+                    tpt_suggestion_str = "increasing the value of --top-peak-threshold (current: %.2f) to %.2f or " % (
+                        top_peak_threshold, tpt_suggestion)
+                else:
+                    tpt_suggestion_str = ""
+                
+                logger.warning(
+                    ("The proportion of significant short peaks is relatively high (%.2f), "
+                     "which usually indicates the cap-selection process didn't work well as expected. "
+                     "To reduce false positives, please consider %s"
+                     "using --disable-small to remove all significant short peaks.") % (
+                        small_ratio, tpt_suggestion_str)
+                )
+        else:
+            result_df = tmp_df_bg
+
+        result_df = result_df.loc[:, COMMON_HEADER]
+    result_df.sort_values(by=['chromosome', 'start'], inplace=True)
+    result_df.to_csv(output_file, sep="\t", index=False, header=False)
+    index_bed_file(output_file, logger=logger)
+    return output_file + ".gz"
 
 
 def peaks_single_strand(per_base_cov, output_file, shared_peak_definitions, strand_sign, fdr_target,
@@ -719,13 +909,13 @@ def peaks_single_strand(per_base_cov, output_file, shared_peak_definitions, stra
         sub_peaks_name = output_file.replace(".bed", "_subpeaks_%s.bed" % chrom)
         merged_name = output_file.replace(".bed", "_%s_merged_windows.bed" % chrom)
         args.append((pbc_npy, output_file, strand_sign, chrom, shared_peak_definitions[chrom], fdr_target,
-                     kwargs["read_counts_threshold"], kwargs["small_peak_threshold"], kwargs["min_mu_percent"],
-                     kwargs["disable_ler"], kwargs["top_peak_threshold"]))
+                     kwargs["small_peak_threshold"], kwargs["min_mu_percent"],
+                     kwargs["disable_ler"], kwargs["enable_eler"], kwargs["eler_lower_bound"]))
         housekeeping_files.append(merged_name)
         housekeeping_files.append(sub_peaks_name + ".gz")
         housekeeping_files.append(sub_peaks_name + ".gz.tbi")
 
-    if kwargs["thread_n"] == 1:
+    if kwargs.get("thread_n", 1) == 1:
         # for debugging
         sub_dfs = []
         for arg_i in args:
@@ -733,7 +923,7 @@ def peaks_single_strand(per_base_cov, output_file, shared_peak_definitions, stra
                 check_window_chromosome(*arg_i)
             )
     else:
-        with Pool(kwargs["thread_n"]) as pool:
+        with Pool(kwargs.get("thread_n", 1)) as pool:
             sub_dfs = pool.starmap(check_window_chromosome, args)
 
     sub_dfs = [sdf for sdf in sub_dfs if sdf is not None]
@@ -742,76 +932,8 @@ def peaks_single_strand(per_base_cov, output_file, shared_peak_definitions, stra
 
     if kwargs["output_diagnostics"]:
         tmp_df.to_csv(output_file.replace(".bed", "_debug.csv"), index=False)
-    big_peaks_probe = tmp_df.end - tmp_df.start > kwargs["small_peak_threshold"]
-    small_peaks_probe = tmp_df.end - tmp_df.start <= kwargs["small_peak_threshold"]
-    lamb_global = tmp_df.loc[big_peaks_probe, "mu_1"].quantile(kwargs["top_peak_threshold"])
-    lamb_global = lamb_global if lamb_global >= 1 else 1
 
-    if kwargs["output_diagnostics"]:
-        import matplotlib.pyplot as plt
-        tx = np.arange(0, 1, 0.01)
-        qs = [tmp_df.loc[big_peaks_probe, "mu_1"].quantile(x) for x in tx]
-        plt.plot(tx, qs)
-        plt.xlabel("Quantile")
-        plt.ylabel("Peak density")
-        plt.tight_layout()
-        plt.savefig(fn + "_small_peak_threshold.pdf", transparent=True, bbox_inches="tight")
-        plt.close()
-    logger.info("Lambda for small peaks: %f" % lamb_global)
-    inflated_small_peaks = np.sum(small_peaks_probe)
-
-    small_pois_dict = dict()
-
-    def cached_pois(x):
-        if x["end"] - x["start"] > kwargs["small_peak_threshold"]:
-            return x["pval"]
-        else:
-            expected_counts = lamb_global * (x["end"] - x["start"])
-            k = "{reads}-{tr}".format(reads=x["reads"], tr=expected_counts)
-            if k not in small_pois_dict:
-                small_pois_dict[k] = poisson.sf(x["reads"], expected_counts)
-            return small_pois_dict[k]
-
-    is_disable_small = kwargs.get("disable_small", False)
-    if is_disable_small:
-        tmp_df = tmp_df.loc[big_peaks_probe, :]
-        tmp_df_sm = None
-    else:
-        tmp_df["pval"] = tmp_df.apply(cached_pois, axis=1)
-
-        corrected_small_peaks = np.sum(np.logical_and(tmp_df["pval"] < fdr_target,
-                                                      small_peaks_probe))
-        logger.info("Significant small peaks after correction: %d (%d)" % (corrected_small_peaks, inflated_small_peaks))
-        tmp_df_sm = independent_filtering(tmp_df.loc[small_peaks_probe, :], fdr_target=fdr_target,
-                                          output_to=fn + "_idpf_sm.pdf",
-                                          logger=logger, **kwargs)
-    if kwargs["output_diagnostics"]:
-        pval_dist(tmp_df.loc[tmp_df["end"] - tmp_df["start"] > kwargs["small_peak_threshold"], "pval"],
-                  logger=logger,
-                  output_diagnostics=kwargs["output_diagnostics"],
-                  output_to=fn + "_broad_pval_hist.pdf")
-        pval_dist(tmp_df.loc[tmp_df["end"] - tmp_df["start"] <= kwargs["small_peak_threshold"], "pval"],
-                  logger=logger,
-                  output_diagnostics=kwargs["output_diagnostics"],
-                  output_to=fn + "_narrow_peaks_pval_hist.pdf")
-        pval_dist(tmp_df["pval"],
-                  logger=logger,
-                  output_diagnostics=kwargs["output_diagnostics"],
-                  output_to=fn + "_pval_hist.pdf")
-
-    # stratified independent filtering
-    tmp_df_bg = independent_filtering(tmp_df.loc[tmp_df["end"] - tmp_df["start"] > kwargs["small_peak_threshold"],
-                                      :], output_to=fn + "_idpf_bg.pdf", logger=logger, **kwargs)
-    if tmp_df_sm is not None:
-        result_df = pd.concat([tmp_df_sm, tmp_df_bg])
-    else:
-        result_df = tmp_df_bg
-
-    result_df = result_df.loc[:, COMMON_HEADER]
-    result_df.sort_values(by=['chromosome', 'start'], inplace=True)
-    result_df.to_csv(output_file, sep="\t", index=False, header=False)
-    index_bed_file(output_file, logger=logger)
-    return output_file + ".gz"
+    return stratified_filtering(tmp_df=tmp_df, output_file=output_file, fdr_target=fdr_target, **kwargs)
 
 
 def merge_opposite_peaks(sig_peak_bed, peak_candidate_bed, divergent_output_bed, bidirectional_output_bed,
@@ -853,7 +975,7 @@ def merge_opposite_peaks(sig_peak_bed, peak_candidate_bed, divergent_output_bed,
     sfp_fh = open(singleton_bed, "w")  # singletons failed to pair
     close_threshold = kwargs.get("close_threshold", 300)
     min_len_opposite_peaks = kwargs.get("min_len_opposite_peaks", 0)
-    for nr, line in enumerate(fh):
+    for _, line in enumerate(fh):
         items = line.strip().split("\t")
         start = int(items[1])
         end = int(items[2])
@@ -905,7 +1027,16 @@ def merge_opposite_peaks(sig_peak_bed, peak_candidate_bed, divergent_output_bed,
                 opposite_summits.append(opposite_summit)
                 opposite_summit_vals.append(opposite_summit_val)
             if len(opposite_pvals) > 0:
-                index = np.argmin(opposite_pvals)
+                # if there are multiple significant peaks (more common in promoter regions)
+                # pair peaks with the nearest, opposite, and significant peak
+                probe_sig_peaks = np.where(np.array(opposite_pvals) < fdr_target)[0]
+                if probe_sig_peaks.shape[0] > 1:
+                    abs_distance = np.abs(np.array(opposite_summits) - current_summit)  # the abs dist between TSSs
+                    index = probe_sig_peaks[  # select the abs dist for significant peaks
+                        abs_distance[probe_sig_peaks].argmin()  # and further select peak with the closest one
+                    ]
+                else:
+                    index = np.argmin(opposite_pvals)
                 opposite_start = opposite_starts[index]
                 opposite_end = opposite_ends[index]
                 opposite_pval = opposite_pvals[index]
@@ -973,12 +1104,11 @@ def housekeeping(pybedtools_prefix=""):
         if pybedtools_prefix != "":
             import shutil
             shutil.rmtree(pybedtools_prefix)
-    except Exception as e:
-        logger.warning(str(e))
+    except Exception as ex:
+        logger.warning(str(ex))
 
 
-def show_parameter_info(input_bam, output_dir, output_prefix, thread_n, model, iqr_strategy, stringent_pairs_only,
-                        **kwargs):
+def show_parameter_info(input_bam, **kwargs):
     """
     Show parameters
 
@@ -986,31 +1116,20 @@ def show_parameter_info(input_bam, output_dir, output_prefix, thread_n, model, i
     ----------
     input_bam : str
         Path to the input
-    output_dir : str
-        Path to the output dir
-    output_prefix : str
-        Output prefix
-    thread_n : int
-        Number of threads
-    model : str or None
-        Name of the model
-    iqr_strategy : str
-        IQR strategy
-    stringent_pairs_only : bool
-        Whether Relaxed pairs should be included in bidirectional output
     kwargs
 
     Returns
     -------
 
     """
-    args = kwargs.copy()
-    bam_parser = args.pop("bam_parser")
-    input_pl_bw = args.pop("bw_pl")
-    input_mn_bw = args.pop("bw_mn")
-    control_bam = args.pop("ct_bam")
-    control_pl_bw = args.pop("ct_bw_pl")
-    control_mn_bw = args.pop("ct_bw_mn")
+    _args = kwargs.copy()
+    _args.pop("bam_file")
+    bam_parser = _args.pop("bam_parser")
+    input_pl_bw = _args.pop("bw_pl")
+    input_mn_bw = _args.pop("bw_mn")
+    control_bam = _args.pop("ct_bam")
+    control_pl_bw = _args.pop("ct_bw_pl")
+    control_mn_bw = _args.pop("ct_bw_mn")
     logger.info("Command")
     logger.info(" ".join(sys.argv))
     logger.info("Parameters")
@@ -1024,19 +1143,24 @@ def show_parameter_info(input_bam, output_dir, output_prefix, thread_n, model, i
     elif control_pl_bw is not None and control_mn_bw is not None:
         logger.info("ct_bw_pl(s): {input}".format(input=" ".join(control_pl_bw)))
         logger.info("ct_bw_mn(s): {input}".format(input=" ".join(control_mn_bw)))
-    logger.info("output_dir: %s" % output_dir)
-    logger.info("output_prefix: %s" % output_prefix)
-    logger.info("thread_n: %s" % thread_n)
-    logger.info("model: %s" % model)
-    logger.info("IQR strategy: %s" % iqr_strategy)
-    logger.info("Stringent pairing strategy: %s" % stringent_pairs_only)
-    for k, v in args.items():
-        logger.info("%s: %s" % (k, v))
+
+    bam_parse_pars = {"seq_rc", "mapq_threshold", "output_chrom_size"}
+    alpha_ft_pars = {"annotation_gtf", "tss_extension", "focused_chrom"}
+    if input_bam is None:
+        for a in bam_parse_pars:
+            _args.pop(a)
+    if _args.get("annotation_gtf", "None") is None:
+        for a in alpha_ft_pars:
+            _args.pop(a)
+    testing_pars = {"window_size_threshold", "ce_trigger", "peak_distance",
+                    "peak_width", "div_size_min", "summit_dist_min"}
+    for k, v in _args.items():
+        if k not in testing_pars:
+            logger.info("%s: %s" % (k, v))
 
 
-def unified_element_definition(coverage_dict, chromosome_of_interest, strand_sign, output_file, peak_rel_height=1,
-                               window_size=100, step_size=100, join_distance=1, ce_donor=1.0, 
-                               ce_receptor=0.1, ce_trigger=3):
+def unified_element_definition(coverage_dict, chromosome_of_interest, strand_sign, output_file,
+                               join_distance=1, ce_donor=1.0, ce_trigger=3):
     """
     Unified element boundary definition
     If multiple replicates are present, then this function will merge all signal tracks together
@@ -1051,18 +1175,10 @@ def unified_element_definition(coverage_dict, chromosome_of_interest, strand_sig
         Sign of strand to be added in the bed file, + or -
     output_file : str
         Prefix (including path) for outputs
-    peak_rel_height : float
-        Relative height for a spot to be considered as a sub peak/seed, by default, 1.
-    window_size : int
-        Window size, by default, 100
-    step_size : int
-        Step size, by default, 100 (non-overlap)
     join_distance : int
         Force joining sub peaks within this distance, by default 1
     ce_donor : float
         Donor tolerance in best score segments
-    ce_receptor : float
-        Receptor tolerance in best score segments
     ce_trigger : int
         Trigger for receptor tolerance checking
 
@@ -1075,11 +1191,10 @@ def unified_element_definition(coverage_dict, chromosome_of_interest, strand_sig
     bins = []
     merged_coverage = merge_covs(coverage_dict, chromosome_of_interest)
 
-    for window, coord in sliding_window(merged_coverage, window_size=window_size, step_size=step_size):
+    for window, coord in sliding_window(merged_coverage):
         if window > 0:  # no reads in the bin
             bins.append((chromosome_of_interest, coord[0], coord[1], window))
 
-    logger.info("Before merging, there are %d windows on %s" % (len(bins), chromosome_of_interest))
     tmp_df = pd.DataFrame(bins, columns=("chromosome", "start", "end", "reads"))
     tmp_df["name"] = "."
     tmp_df["strand"] = strand_sign
@@ -1089,34 +1204,27 @@ def unified_element_definition(coverage_dict, chromosome_of_interest, strand_sig
     # merge windows in case peaks are split into different windows
     bed_obj = BedTool(tmp_df.to_csv(sep="\t", index=False, header=False), from_string=True)
     bed_obj = bed_obj.merge(c=(4, 5, 6), o=("distinct", "sum", "distinct"))
-    merged_windows = bed_obj.to_dataframe(names=("Chromosome", "Start", "End", "Name", "Reads", "Strand"))
-    logger.info("After merging, there are %d windows on %s" % (merged_windows.shape[0], chromosome_of_interest))
 
-    spb_fh = open(subpeak_bed, "w")
-    index = 1
-    for nr, row in enumerate(bed_obj):
-        sub_peaks = cut_peaks(merged_coverage[row.start:row.end],
-                              peak_rel_height=peak_rel_height,
-                              donor_tolerance=ce_donor,
-                              receptor_tolerance=ce_receptor,
-                              ce_trigger=ce_trigger,
-                              join_distance=join_distance
-                              )
-        for sp in sub_peaks:
-            start = sp[0] + row.start
-            end = sp[1] + row.start
-            peak_region = merged_coverage[start:end]
-            summit_coord = start + np.argmax(peak_region)
-            spb_fh.write("%s\t%d\t%d\t%s-%d\t%d\n" % (chromosome_of_interest, start, end, chromosome_of_interest,
-                                                      index, summit_coord))
-            index += 1
-    spb_fh.close()
+    with open(subpeak_bed, "w") as spb_fh:
+        index = 1
+        for _, row in enumerate(bed_obj):
+            sub_peaks = cut_peaks(merged_coverage[row.start:row.end],
+                                donor_tolerance=ce_donor,
+                                ce_trigger=ce_trigger,
+                                join_distance=join_distance)
+            for sp in sub_peaks:
+                start = sp[0] + row.start
+                end = sp[1] + row.start
+                peak_region = merged_coverage[start:end]
+                summit_coord = start + np.argmax(peak_region)
+                spb_fh.write("%s\t%d\t%d\t%s-%d\t%d\n" % (chromosome_of_interest, start, end, chromosome_of_interest,
+                                                        index, summit_coord))
+                index += 1
 
     if index > 1:
         index_bed_file(subpeak_bed, logger=logger)
         return subpeak_bed + ".gz"
-    else:
-        return None
+    return None
 
 
 def inferring_elements_from_other_reps(prefix, n_samples):
@@ -1203,12 +1311,12 @@ def get_epig_annotation(annotation_source, output_dir):
         else:
             logger.error(parsed_json["msg"])
 
-    except URLError as e:
-        logger.error(e)
-    except json.JSONDecodeError as e:
-        logger.error("Cannot parse returned info {s} from PINTS web server.".format(s=e))
-    except Exception as e:
-        logger.error(e)
+    except URLError as ex:
+        logger.error(ex)
+    except json.JSONDecodeError as ex:
+        logger.error("Cannot parse returned info {s} from PINTS web server.".format(s=ex))
+    except Exception as ex:
+        logger.error(ex)
     finally:
         return dst
 
@@ -1234,12 +1342,8 @@ def pair(sample_prefix, df_dict, fdr_target, stringent_only, specific_suffix="",
 
     Returns
     -------
-    bidirectional_peaks : str
-        Path to bidirectional peaks
-    divergent_peaks : str
-        Path to divergent peaks
-    unidirectional_peaks : str
-        Path to unidirectional peaks
+    (bidirectional_peaks, divergent_peaks, unidirectional_peaks) : (str, str, str)
+        Path to bidirectional peaks, path to divergent peaks, path to unidirectional peaks
     intermediate_files : PairedIntermediateFiles
         Files recorded in this obj should be deleted
     """
@@ -1261,7 +1365,6 @@ def pair(sample_prefix, df_dict, fdr_target, stringent_only, specific_suffix="",
             generated_files.append("")
             generated_files.append("")
             continue
-        logger.info(f"Start to merge peaks from {specific_suffix} {label} to {anti_label}")
         merge_opposite_peaks(sample_prefix + "%s_sig_%s.bed" % (specific_suffix, label),
                              sample_prefix + "_%s.bed.gz" % anti_label,
                              divergent_output_bed=sample_prefix + "%s_sig_%s_divergent_peaks.bed" % (
@@ -1271,7 +1374,6 @@ def pair(sample_prefix, df_dict, fdr_target, stringent_only, specific_suffix="",
                              singleton_bed=sample_prefix + "%s_sig_%s_singletons_peaks.bed" % (specific_suffix, label),
                              fdr_target=fdr_target, stringent_only=stringent_only,
                              **kwargs)
-        logger.info(f"Peaks merged from {specific_suffix} {label} to {anti_label}")
         generated_files.append(sample_prefix + "%s_sig_%s_divergent_peaks.bed" % (specific_suffix, label))
         generated_files.append(sample_prefix + "%s_sig_%s_bidirectional_peaks.bed" % (specific_suffix, label))
         generated_files.append(sample_prefix + "%s_sig_%s_singletons_peaks.bed" % (specific_suffix, label))
@@ -1279,7 +1381,6 @@ def pair(sample_prefix, df_dict, fdr_target, stringent_only, specific_suffix="",
     for directionality in ("bidirectional", "divergent", "singletons"):
         exp_pl_file = sample_prefix + "%s_sig_pl_%s_peaks.bed" % (specific_suffix, directionality)
         exp_mn_file = sample_prefix + "%s_sig_mn_%s_peaks.bed" % (specific_suffix, directionality)
-        logger.info(f"Merge elements {directionality}")
         if os.path.exists(exp_pl_file) and os.path.exists(exp_mn_file):
             if directionality != "singletons":
                 pri_merged_file = BedTool.cat(*[BedTool(exp_pl_file),
@@ -1290,13 +1391,15 @@ def pair(sample_prefix, df_dict, fdr_target, stringent_only, specific_suffix="",
                                                                     "tss_fwd_vals", "tss_rev", "tss_rev_vals",
                                                                     "confidence"))
                 fwd_tss_cols = pri_merged_df["tss_fwd"].str.split(",", expand=True).fillna(value=-1).astype(int)
-                fwd_tss_val_cols = pri_merged_df["tss_fwd_vals"].str.split(",", expand=True).fillna(value=-1).astype(int)
+                fwd_tss_val_cols = pri_merged_df["tss_fwd_vals"].str.split(",", expand=True).fillna(value=-1).astype(
+                    int)
                 max_index = fwd_tss_val_cols.idxmax(axis=1)
                 pri_merged_df["tss_fwd"] = fwd_tss_cols.values[np.arange(fwd_tss_cols.shape[0]), max_index]
                 pri_merged_df["tss_fwd_val"] = fwd_tss_val_cols.values[np.arange(fwd_tss_cols.shape[0]), max_index]
 
                 rev_tss_cols = pri_merged_df["tss_rev"].str.split(",", expand=True).fillna(value=-1).astype(int)
-                rev_tss_val_cols = pri_merged_df["tss_rev_vals"].str.split(",", expand=True).fillna(value=-1).astype(int)
+                rev_tss_val_cols = pri_merged_df["tss_rev_vals"].str.split(",", expand=True).fillna(value=-1).astype(
+                    int)
                 max_index = rev_tss_val_cols.idxmax(axis=1)
                 pri_merged_df["tss_rev"] = rev_tss_cols.values[np.arange(rev_tss_cols.shape[0]), max_index]
                 pri_merged_df["tss_rev_val"] = rev_tss_val_cols.values[np.arange(rev_tss_cols.shape[0]), max_index]
@@ -1308,13 +1411,12 @@ def pair(sample_prefix, df_dict, fdr_target, stringent_only, specific_suffix="",
                               BedTool(exp_mn_file)],
                             postmerge=False).sort().saveas(
                     sample_prefix + "%s_unidirectional_peaks.bed" % specific_suffix)
-        logger.info(f"Elements merged {directionality}")
     return (sample_prefix + "%s_bidirectional_peaks.bed" % specific_suffix,
             sample_prefix + "%s_divergent_peaks.bed" % specific_suffix,
             sample_prefix + "%s_unidirectional_peaks.bed" % specific_suffix), data_structure._make(generated_files)
 
 
-def annotate_TRE_with_epig_info(peak_file, epig_bigbed_file, only_annotated_records=False, placeholders=dict()):
+def annotate_TRE_with_epig_info(peak_file, epig_bigbed_file, only_annotated_records=False, placeholders={}):
     """
 
     Parameters
@@ -1339,7 +1441,7 @@ def annotate_TRE_with_epig_info(peak_file, epig_bigbed_file, only_annotated_reco
         raise FileNotFoundError(epig_bigbed_file)
 
     with pyBigWig.open(epig_bigbed_file) as ref_bed:
-        for nr, row in peak_df.iterrows():
+        for _, row in peak_df.iterrows():
             cache = set()
             try:
                 hits = ref_bed.entries(row[0], row[1], row[2])
@@ -1351,8 +1453,8 @@ def annotate_TRE_with_epig_info(peak_file, epig_bigbed_file, only_annotated_reco
                             cache.add("H3K27ac")
                         if ann.find("H3K4me3") != -1:
                             cache.add("H3K4me3")
-            except Exception as e:
-                logger.warning(e)
+            except Exception as ex:
+                logger.warning(ex)
             finally:
                 annotations.append(",".join(cache) if len(cache) > 0 else ".")
     peak_df["epig_annotation"] = annotations
@@ -1364,8 +1466,7 @@ def annotate_TRE_with_epig_info(peak_file, epig_bigbed_file, only_annotated_reco
     peak_df.to_csv(peak_file, sep="\t", index=False, header=False)
 
 
-def peak_calling(input_bam, output_dir=".", output_prefix="pints", filters=(),
-                 thread_n=1, model="ZIP", iqr_strategy="bgIQR", stringent_only=False, **kwargs):
+def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
     """
     Peak calling wrapper
 
@@ -1377,16 +1478,6 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", filters=(),
         Path to write output
     output_prefix : str
         Prefix for all outputs
-    filters : list or tuple
-        List of keywords to filter chromosomes
-    thread_n : int
-        Max number of sub processes that can be created.
-    model : str
-        Statistical model to use, can be Poisson, ZIP, NB or ZINB
-    iqr_strategy : str
-        IQR strategy to use, can be bgIQR (based on background densities) or pkIQR (based on peak densities)
-    stringent_only : bool
-        Set it to True if you only want to keep significant pairs (both peaks needs to be significant)
     kwargs :
 
     Returns
@@ -1399,12 +1490,15 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", filters=(),
     log_assert(os.path.exists(output_dir) and os.path.isdir(output_dir), "Cannot write to {0}".format(output_dir),
                logger)
     
-    runtime_check()
+    runtime_check(check_updates=kwargs.pop("check_updates", True))
     logger.info("PINTS version: {0}".format(__version__))
-    show_parameter_info(input_bam, output_dir, output_prefix, thread_n, model, iqr_strategy, stringent_only, **kwargs)
+    model = kwargs.get("model", "ZIP")
+    iqr_strategy = kwargs.get("iqr_strategy", "bgIQR")
+    show_parameter_info(input_bam, **kwargs)
 
     prefix = os.path.join(output_dir, output_prefix)
-    pybdt_tmp = os.path.join(output_dir, "pybdt_"+datetime.datetime.now().strftime("%Y_%M_%d_%H_%M_%S")+"_"+str(os.getpid()))
+    pybdt_tmp = os.path.join(output_dir,
+                             "pybdt_" + datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S") + "_" + str(os.getpid()))
     if not os.path.exists(pybdt_tmp):
         os.mkdir(pybdt_tmp)
     pybedtools.set_tempdir(pybdt_tmp)
@@ -1444,6 +1538,7 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", filters=(),
     chromosome_coverage_mn = []
     rcs = []  # read counts for experiment
     ircs = []  # read counts for input/control
+    filters = kwargs.pop("filters", ())
     chromosomes = set()
 
     if input_bam is not None:
@@ -1484,12 +1579,12 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", filters=(),
             housekeeping_files.extend(plc.values())
             housekeeping_files.extend(mnc.values())
 
-    subpeak_pl_beds = dict()
-    subpeak_mn_beds = dict()
-    if kwargs["gene_annotation"] is not None:
-        log_assert(os.path.exists(kwargs["gene_annotation"]), "Cannot find gene annotation file", logger)
+    subpeak_pl_beds = {}
+    subpeak_mn_beds = {}
+    if kwargs["annotation_gtf"] is not None:
+        log_assert(os.path.exists(kwargs["annotation_gtf"]), "Cannot find gene annotation file", logger)
         if kwargs["highlight_chromosome"] in chromosome_coverage_pl[0]:
-            kwargs["donor_tolerance"] = cut_peaks_dry_run(kwargs["gene_annotation"], chromosome_coverage_pl,
+            kwargs["donor_tolerance"] = cut_peaks_dry_run(kwargs["annotation_gtf"], chromosome_coverage_pl,
                                                           chromosome_coverage_mn, tss_extension=kwargs["tss_extension"],
                                                           highlight_chromosome=kwargs["highlight_chromosome"],
                                                           output_diagnostics=kwargs["output_diagnostics"],
@@ -1502,12 +1597,8 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", filters=(),
                                                                    ("+", "-"), ("pl", "mn")):
             target_dict[chromosome] = unified_element_definition(chrom_coverage, chromosome, sign,
                                                                  prefix + "_{0}.bed".format(strand_short),
-                                                                 peak_rel_height=kwargs.get("peak_rel_height", 1),
-                                                                 window_size=kwargs.get("window_size", 100),
-                                                                 step_size=kwargs.get("step_size", 100),
                                                                  ce_donor=kwargs.get("donor_tolerance", 1),
                                                                  join_distance=kwargs.get("peak_distance", 1),
-                                                                 ce_receptor=kwargs.get("receptor_tolerance", 0.1),
                                                                  ce_trigger=kwargs.get("ce_trigger", 3))
 
             if target_dict[chromosome] is not None:
@@ -1582,17 +1673,16 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", filters=(),
     for rep, pl_cov_dict in enumerate(chromosome_coverage_pl):
         logger.info("Working on sample %d" % (rep + 1))
         sample_prefix = prefix + "_%d" % (rep + 1)
-        df_dict = dict()
-        for cov_dict, label, spb, anti_label, strand_sign in zip(
+        df_dict = {}
+        for cov_dict, label, spb, strand_sign in zip(
                 (pl_cov_dict, chromosome_coverage_mn[rep]),
-                ("pl", "mn"), (subpeak_pl_beds, subpeak_mn_beds), ("mn", "pl"), ("+", "-")):
+                ("pl", "mn"), (subpeak_pl_beds, subpeak_mn_beds), ("+", "-")):
             if spb is None:
                 continue
             peaks_bed = peaks_single_strand(per_base_cov=cov_dict,
                                             output_file=sample_prefix + "_{0}.bed".format(label),
                                             shared_peak_definitions=spb,
                                             strand_sign=strand_sign,
-                                            thread_n=thread_n,
                                             fdr_target=fdr_target,
                                             **kwargs)
 
@@ -1602,7 +1692,7 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", filters=(),
 
         logger.info("Pairing peaks")
         (bid, div, unid), gc = pair(sample_prefix, df_dict=df_dict, fdr_target=fdr_target,
-                                    stringent_only=stringent_only, **kwargs)
+                                    stringent_only=kwargs.get("stringent_only", False), **kwargs)
         logger.info("Pairing finished on sample %d" % (rep + 1))
         for g in gc:
             housekeeping_files.append(g)
@@ -1619,7 +1709,8 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", filters=(),
 
             relaxed_fdr = kwargs.get("relaxed_fdr_target", fdr_target * 2)
             (r_bid, r_div, r_unid), r_gc = pair(sample_prefix, df_dict=df_dict, fdr_target=relaxed_fdr,
-                                                stringent_only=stringent_only, specific_suffix="_EA", **kwargs)
+                                                stringent_only=kwargs.get("stringent_only", False),
+                                                specific_suffix="_EA", **kwargs)
             # in situ update relaxed peak calls
             annotate_TRE_with_epig_info(r_bid, epig_annotation, only_annotated_records=True,
                                         placeholders={3: "Marginal"})
@@ -1666,13 +1757,13 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", filters=(),
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Peak Identifier for Nascent Transcripts Sequencing")
+    parser = argparse.ArgumentParser(description="Peak Identifier for Nascent Transcripts Starts")
     group = parser.add_argument_group("Input/Output")
     group.add_argument("--bam-file", action="store", dest="bam_file", nargs="*",
                        type=str, required=False,
                        help="input bam file, if you want to use bigwig files, please use --bw-pl and --bw-mn")
     group.add_argument("--save-to", action="store", dest="save_to",
-                       type=str, required=True, default=".",
+                       type=str, required=False, default=".",
                        help="save peaks to this path (a folder), by default, current folder")
     group.add_argument("--file-prefix", action="store", dest="file_prefix",
                        type=str, required=True, default=str(os.getpid()),
@@ -1698,14 +1789,21 @@ if __name__ == "__main__":
                        help="Bam file for input/control (minus strand). If you want to use bigwig instead of BAM, "
                             "please use --input-bw-pl and --input-bw-mn")
     group.add_argument("--exp-type", action="store", default="CoPRO", dest="bam_parser",
-                       choices=("CoPRO", "GROcap", "PROcap", "CAGE", "NETCAGE", "csRNAseq", "PROseq", "GROseq",
+                       choices=("CoPRO", "GROcap", "PROcap", "CAGE", "NETCAGE",
+                                "RAMPAGE", "csRNAseq", "STRIPEseq", "PROseq", "GROseq",
                                 "R_5", "R_3", "R1_5", "R1_3", "R2_5", "R2_3"),
-                       help="Type of experiment, acceptable values are: CoPRO/GROcap/GROseq/PROcap/PROseq, or if you "
-                            "know the position of RNA ends which you're interested on the reads, you can specify "
-                            "R_5, R_3, R1_5, R1_3, R2_5 or R2_3")
-    group.add_argument("--reverse-complement", action="store_true", dest="seq_reverse_complement",
+                       help="Type of experiment. If the experiment is not listed as a choice, "
+                            "or you know the position of RNA ends on the reads and you want to override the defaults, "
+                            "you can specify: "
+                            "R_5 (5' of the read for single-end lib), "
+                            "R_3 (3' of the read for single-end lib), "
+                            "R1_5 (5' of the read1 for paired-end lib), "
+                            "R1_3 (3' of the read1 for paired-end lib), "
+                            "R2_5 (5' of the read2 for paired-end lib), "
+                            "or R2_3 (3' of the read2 for paired-end lib)")
+    group.add_argument("--reverse-complement", action="store_true", dest="seq_rc",
                        required=False, default=False,
-                       help="Set this switch if reads in this library represent the reverse complement of nascent "
+                       help="Set this switch if reads in this library represent the reverse complement of "
                             "RNAs, like PROseq")
     group.add_argument("-f", "--filters", action="store", type=str, nargs="*", default=[],
                        help="reads from chromosomes whose names contain any matches in filters will be ignored")
@@ -1728,22 +1826,12 @@ if __name__ == "__main__":
                        help="Minimum length requirement for peaks on the opposite strand to be paired, set it to 0 to loose this requirement")
     group.add_argument("--mapq-threshold", action="store", dest="mapq_threshold",
                        type=int, required=False, default=30, help="Minimum mapping quality")
-    group.add_argument("--read-counts-threshold", action="store", dest="read_counts_threshold",
-                       type=int, required=False, default=0,
-                       help="Threshold for a window to be considered as having read")
     group.add_argument("--small-peak-threshold", action="store", dest="small_peak_threshold",
                        type=int, required=False, default=5,
                        help="Threshold for small peaks, peaks with width smaller than this value will be required "
                             "to run extra test")
-    group.add_argument("--ind-filtering-granularity", action="store", dest="ind_filter_granularity",
-                       type=int, required=False, default=0.005,
-                       help="Granularity for independent filtering")
-    group.add_argument("--window-size", action="store", dest="window_size",
-                       type=int, required=False, default=100, help="size for sliding windows")
     group.add_argument("--max-window-size", action="store", dest="window_size_threshold",
                        type=int, required=False, default=2000, help="max size of divergent windows")
-    group.add_argument("--step-size", action="store", dest="step_size",
-                       type=int, required=False, default=100, help="step size for sliding windows")
 
     group = parser.add_argument_group("Edge trimming")
     group.add_argument("--annotation-gtf", action="store", dest="annotation_gtf", type=str, required=False,
@@ -1756,17 +1844,18 @@ if __name__ == "__main__":
                        required=False,
                        help="If --annotation-gtf is specified, you use this parameter to change which chromosome the "
                             "tool should learn the values from.")
-    group.add_argument("--donor-tolerance", action="store", dest="donor_tolerance",
-                       type=float, required=False, default=1.0, help="Donor tolerance in best score segments")
-    group.add_argument("--receptor-tolerance", action="store", dest="receptor_tolerance",
-                       type=float, required=False, default=0.1, help="Receptor tolerance in best score segments")
+    group.add_argument("--alpha", "--donor-tolerance", action="store", dest="donor_tolerance",
+                       type=float, required=False, default=0.3, 
+                       help="The stringency for PINTS to cluster nearby TSSs into a peak. 0 is the least stringent; "
+                            "1 is the most stringent.")
     group.add_argument("--ce-trigger", action="store", dest="ce_trigger",
                        type=int, required=False, default=3, help="Trigger for receptor tolerance checking")
 
     group = parser.add_argument_group("Peak properties")
     group.add_argument("--top-peak-threshold", action="store", dest="top_peak_threshold",
                        type=float, required=False, default=0.75,
-                       help="Min size for a divergent peak")
+                       help="For very short peaks (smaller than --small-peak-threshold), "
+                            "we use the quantile threshold for peak densities as the background density")
     group.add_argument("--min-mu-percent", action="store", dest="min_mu_percent",
                        type=float, required=False, default=0.1,
                        help="Local backgrounds smaller than this percentile among all peaks will be replaced.")
@@ -1776,9 +1865,6 @@ if __name__ == "__main__":
     group.add_argument("--peak-width", action="store", dest="peak_width",
                        type=int, required=False, default=None,
                        help="Required width of peaks in samples.")
-    group.add_argument("--peak-rel-height", action="store", dest="peak_rel_height",
-                       type=int, required=False, default=1,
-                       help="Used for calculation of the peaks width, thus it is only used if width is given.")
     group.add_argument("--div-size-min", action="store", dest="div_size_min",
                        type=int, required=False, default=0,
                        help="Min size for a divergent peak")
@@ -1788,15 +1874,21 @@ if __name__ == "__main__":
 
     group = parser.add_argument_group("Testing")
     group.add_argument("--model", action="store", type=str, required=False, default="ZIP",
-                       choices=("ZIP", "NB", "Poisson", "ZINB"),
-                       help="Statistical model for testing, can be Poisson, ZIP, NB or ZINB")
+                       choices=("ZIP", "Poisson",),
+                       help="Statistical model for testing the significance of peaks.")
     group.add_argument("--IQR-strategy", action="store", type=str, required=False,
                        dest="iqr_strategy", default="bgIQR", choices=("bgIQR", "pkIQR"),
                        help="IQR strategy, can be bgIQR (more robust) or pkIQR (more efficient)")
     group.add_argument("--disable-ler", action="store_true", required=False, default=False,
                        help="Disable Local Environment Refinement")
+    group.add_argument("--disable-eler", dest="enable_eler", action="store_false", default=True,
+                       required=False, help="Disable Enhanced Local Environment Refinement")
+    group.add_argument("--eler-lower-bound", dest="eler_lower_bound", action="store", default=1., type=float,
+                       required=False, help="Lower bound of the empirical estimation for the density of "
+                                            "potential true peaks in the local background.")
     group.add_argument("--disable-small", action="store_true", required=False, default=False,
-                       help="Disable small peak correction")
+                       help="Set this switch to prevent PINTS from reporting very short peaks"
+                            "(shorter than --small-peak-threshold)")
 
     group = parser.add_argument_group("Other")
     group.add_argument("--epig-annotation", action="store", dest="epig_annotation", type=str, required=False,
@@ -1809,12 +1901,15 @@ if __name__ == "__main__":
     group.add_argument("--dont-output-chrom-size", action="store_false", dest="output_chrom_size",
                        required=False, default=True,
                        help="Don't write chromosome dict to local folder (not recommended)")
+    group.add_argument("--dont-check-updates", action="store_false", dest="check_updates",
+                       required=False, default=True,
+                       help="Set this switch to disable update check.")
     group.add_argument("--debug", action="store_true", dest="output_diagnostics",
                        required=False, default=False,
                        help="Save diagnostics (independent filtering and pval dist) to local folder")
-    group.add_argument("--borrow-info-reps", action="store_true", dest="borrow_info_reps",
-                       required=False, default=False,
-                       help="Borrow information from reps to refine calling of divergent elements")
+    group.add_argument("--dont-borrow-info-reps", action="store_false", dest="borrow_info_reps",
+                       required=False, default=True,
+                       help="Don't borrow information from reps to refine calling of divergent elements")
     group.add_argument("--thread", action="store", dest="thread_n",
                        type=int, required=False, default=1,
                        help="Max number of threads PINTS can create")
@@ -1824,30 +1919,12 @@ if __name__ == "__main__":
 
     warnings.filterwarnings("ignore", message="numpy.dtype size changed")
     warnings.filterwarnings("ignore", message="numpy.ufunc size changed")
-    DEFAULT_PREFIX = "peakcalling_" + datetime.datetime.now().strftime("%Y_%M_%d_%H_%M_%S")
-    handler = logging.FileHandler(os.path.join(args.save_to, "{0}.log".format(DEFAULT_PREFIX)))
+    DEFAULT_PREFIX = "peakcalling_" + datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+    handler = logging.FileHandler(os.path.join(args.save_to, "{0}_{1}.log".format(DEFAULT_PREFIX, os.getpid())))
     formatter = logging.Formatter("%(name)s - %(asctime)s - %(levelname)s: %(message)s")
     handler.setFormatter(formatter)
     logger.addHandler(handler)
     # redirect exception message to log
     sys.excepthook = handle_exception
 
-    peak_calling(args.bam_file, args.save_to, args.file_prefix, close_threshold=args.close_threshold,
-                 window_size=args.window_size, step_size=args.step_size, fdr_target=args.fdr_target,
-                 adjust_method=args.adjust_method, mapq_threshold=args.mapq_threshold,
-                 read_counts_threshold=args.read_counts_threshold, small_peak_threshold=args.small_peak_threshold,
-                 chromosome_startswith=args.chromosome_startswith, window_size_threshold=args.window_size_threshold,
-                 peak_rel_height=args.peak_rel_height, gene_annotation=args.annotation_gtf,
-                 output_chrom_size=args.output_chrom_size, output_diagnostics=args.output_diagnostics,
-                 ind_filter_granularity=args.ind_filter_granularity, thread_n=args.thread_n,
-                 div_size_min=args.div_size_min, summit_dist_min=args.summit_dist_min,
-                 top_peak_threshold=args.top_peak_threshold, bw_pl=args.bw_pl, bw_mn=args.bw_mn,
-                 donor_tolerance=args.donor_tolerance, receptor_tolerance=args.receptor_tolerance,
-                 ce_trigger=args.ce_trigger, bam_parser=args.bam_parser, seq_rc=args.seq_reverse_complement,
-                 filters=args.filters, min_mu_percent=args.min_mu_percent, ct_bam=args.ct_bam, ct_bw_pl=args.ct_bw_pl,
-                 ct_bw_mn=args.ct_bw_mn, model=args.model, iqr_strategy=args.iqr_strategy,
-                 highlight_chromosome=args.focused_chrom, disable_ler=args.disable_ler,
-                 stringent_only=args.stringent_pairs_only, min_len_opposite_peaks=args.min_len_opposite_peaks,
-                 disable_small=args.disable_small, borrow_info_reps=args.borrow_info_reps,
-                 tss_extension=args.tss_extension, peak_distance=args.peak_distance,
-                 epig_annotation=args.epig_annotation, relaxed_fdr_target=args.relaxed_fdr_target)
+    peak_calling(args.bam_file, args.save_to, args.file_prefix, **vars(args))
