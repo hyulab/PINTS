@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-#  PINTS: Peak Identifier for Nascent Transcripts Sequencing
+#  PINTS: Peak Identifier for Nascent Transcripts Starts
 #  Copyright (c) 2019-2021 Li Yao at the Yu Lab.
 #
 #  This program is free software: you can redistribute it and/or modify
@@ -25,8 +25,6 @@ import warnings
 try:
     import numpy as np
     import pandas as pd
-    import scipy
-    import pysam
     from pybedtools import BedTool
     from pints.io_engine import get_read_signal, get_coverage_bw, log_assert
     from collections import namedtuple
@@ -267,24 +265,24 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     if sum((args.bw_pl is None, args.bw_mn is None)) == 1:
-        raise argparse.ArgumentError("both of the two arguments --bw-pl --bw-mn are required")
+        parser.error("both of the two arguments --bw-pl --bw-mn are required")
 
     if args.bam_files is not None:
         if not len(args.bam_files) == len(args.divergent_files) == len(args.bidirectional_files) == len(
                 args.unidirectional_files):
-            raise argparse.ArgumentError("Number of peak calls from different categories should match")
+            parser.error("Number of peak calls from different categories should match")
         # if not (len(args.bam_parser) == 1 or len(args.bam_parser) == len(args.bam_files)):
         #     raise argparse.ArgumentError("You need to provide one or paired exp-type for bam-files")
 
     if args.bw_pl is not None:
         if not len(args.bw_pl) == len(args.bw_mn) == len(args.divergent_files) == len(args.bidirectional_files) == len(
                 args.unidirectional_files):
-            raise argparse.ArgumentError("Number of peak calls from different categories should match")
+            parser.error("Number of peak calls from different categories should match")
 
     assert len(args.div_ext_left) == len(args.div_ext_right)
     assert len(args.single_ext_left) == len(args.single_ext_right)
 
-    groups = dict()
+    groups = {}
     Group = namedtuple("Group", ("bam_file", "divergent_calls", "bidirectional_calls", "single_calls"))
     for i in range(1, (len(args.bam_files) if args.bam_files is not None else len(args.bw_pl)) + 1):
         groups = {

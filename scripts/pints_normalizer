@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding=utf-8
 
-#  PINTS: Peak Identifier for Nascent Transcripts Sequencing
+#  PINTS: Peak Identifier for Nascent Transcripts Starts
 #  Copyright (c) 2019-2021 Li Yao at the Yu Lab.
 #
 #  This program is free software: you can redistribute it and/or modify
@@ -24,12 +24,17 @@ from pints import __version__
 
 try:
     import pysam
-    import pyBigWig
-    import pyranges as pr
     import numpy as np
     from Bio import SeqIO
-    from pints.io_engine import log_assert, get_read_signal
-    from pints.visualizer import bam_to_bigwig
+    from pints.io_engine import log_assert
+
+    from importlib.util import spec_from_loader, module_from_spec
+    from importlib.machinery import SourceFileLoader
+    spec = spec_from_loader("pints_visualizer", SourceFileLoader(
+        "pints_visualizer", 
+        os.path.join(os.path.split(__file__)[0], "pints_visualizer")))
+    visualizer = module_from_spec(spec)
+    spec.loader.exec_module(visualizer)
 except ImportError as e:
     missing_package = str(e).replace("No module named '", "").replace("'", "")
     sys.exit("Please install %s first!" % missing_package)
@@ -43,7 +48,7 @@ logging.basicConfig(format="%(name)s - %(asctime)s - %(levelname)s: %(message)s"
 logger = logging.getLogger("PINTS - Normalizer")
 
 
-def spikein_normalization(bam_files, spike_ins, exp_type, output_dir, cell_nums=[], spikein_scale=1000000, **kwargs):
+def spikein_normalization(bam_files, spike_ins, exp_type, output_dir, cell_nums=(), spikein_scale=1000000, **kwargs):
     """
     Normalize samples using spike-in counts and cell counts
 
