@@ -26,6 +26,7 @@ NP_DT_RANGE = (127, 32767, 2147483647, 9223372036854775807)
 NP_DT_NAME = (np.int8, np.int16, np.int32, np.int64)
 GTF_HEADER = ["seqname", "source", "feature", "start", "end", "score",
               "strand", "frame"]
+__logger_name__ = "PINTS.IO-engine"
 
 
 def log_assert(bool_, message, logger):
@@ -72,7 +73,7 @@ def _get_coverage_bw(bw_file, chromosome_startswith, output_dir, output_prefix):
     -------
 
     """
-    logger = logging.getLogger("PINTS - IO engine")
+    logger = logging.getLogger(__logger_name__)
     try:
         import pyBigWig
     except ImportError as e:
@@ -81,9 +82,9 @@ def _get_coverage_bw(bw_file, chromosome_startswith, output_dir, output_prefix):
         sys.exit(-1)
     bw = pyBigWig.open(bw_file)
     log_assert(bw.isBigWig(), "BigWig file %s is not valid." % bw_file, logger)
-    chromosome_coverage = dict()
-    chromosome_pre_accessible_dict = dict()
-    chromosome_reads_dict = dict()
+    chromosome_coverage = {}
+    chromosome_pre_accessible_dict = {}
+    chromosome_reads_dict = {}
 
     data_type = np.int32
     bw_max = max(abs(bw.header()["maxVal"]), abs(bw.header()["minVal"]))
@@ -93,11 +94,8 @@ def _get_coverage_bw(bw_file, chromosome_startswith, output_dir, output_prefix):
             break
 
     chrom_size_list = []
-    # max_reference_length = 0
-    genome_size = 0
     read_counts = 0
 
-    # result = {}
     for chromosome, csize in bw.chroms().items():
         if chromosome.startswith(chromosome_startswith):
             fn = os.path.join(output_dir, "%s_%s" % (output_prefix, chromosome))
@@ -113,16 +111,7 @@ def _get_coverage_bw(bw_file, chromosome_startswith, output_dir, output_prefix):
             chrom_size_list.append((chromosome, csize))
             chromosome_pre_accessible_dict[chromosome] = []
             chromosome_reads_dict[chromosome] = 0
-            genome_size += csize
-    """
-    if "output_chrom_size" in kwargs.keys() and kwargs["output_chrom_size"]:
-        csize_fn = os.path.join(output_dir, output_prefix + ".csize")
-        with open(csize_fn, "w") as f:
-            pd.DataFrame(chrom_size_list, columns=["Chromosome", "Size"]).to_csv(f,
-                                                                                 sep="\t",
-                                                                                 index=False,
-                                                                                 header=False)
-    """
+    
     bw.close()
     return chromosome_coverage, read_counts
 
@@ -155,20 +144,20 @@ def get_coverage_bw(bw_pl, bw_mn, chromosome_startswith, output_dir, output_pref
     rc : int
         Number of total read counts
     """
-    logger = logging.getLogger("IO engine")
+    logger = logging.getLogger(__logger_name__)
     pl, pc = _get_coverage_bw(bw_pl, chromosome_startswith, output_dir, output_prefix + "_pl")
     mn, mc = _get_coverage_bw(bw_mn, chromosome_startswith, output_dir, output_prefix + "_mn")
     log_assert(pl.keys() == mn.keys(), "bw_pl and bw_mn should have the same chromosomes", logger)
     return pl, mn, pc + mc
 
 
-class BamParsers(object):
+class BamParsers:
     def __init__(self, bam_obj, pl_cov, mn_cov, mapq, **kwargs):
         c = list(pl_cov.keys())
         c.extend(list(mn_cov.keys()))
         self.total_reads = 0
         self.chroms = set()
-        if c is not None:
+        if len(c) > 0:
             self.chroms = set(c)
         self.bam_obj = bam_obj
         self.pl_cov = pl_cov
@@ -386,7 +375,7 @@ class BamParsers(object):
                 self.mn_cov[read.reference_name][pos_3prime] += 1
 
 
-def get_read_signal(input_bam, loc_prime, chromosome_startswith, output_dir, output_prefix, filters=[],
+def get_read_signal(input_bam, loc_prime, chromosome_startswith, output_dir, output_prefix, filters=(),
                     reverse_complement=False, **kwargs):
     """
 
@@ -416,7 +405,7 @@ def get_read_signal(input_bam, loc_prime, chromosome_startswith, output_dir, out
     read_counts : int
         Total read counts passing filters
     """
-    logger = logging.getLogger("IO engine")
+    logger = logging.getLogger(__logger_name__)
     supported_protocols = {
         "PROcap": "R_5_f",
         "GROcap": "R_5_f",
@@ -433,13 +422,13 @@ def get_read_signal(input_bam, loc_prime, chromosome_startswith, output_dir, out
     if loc_prime in supported_protocols:
         read_num, read_end, fw_rv = supported_protocols[loc_prime].split("_")
         loc_prime = "%s_%s" % (read_num, read_end)
-        reverse_complement = False if fw_rv == "f" else True
+        reverse_complement = bool(fw_rv!="f")
     log_assert(loc_prime in ("R_5", "R_3", "R1_5", "R1_3", "R2_5", "R2_3"),
                "library_type must be R1_5, R1_3, R2_5 or R2_3. Current value: {0}".format(loc_prime), logger)
     library_layout, interested_end = loc_prime.split("_")
     mapq_threshold = kwargs["mapq_threshold"] if "mapq_threshold" in kwargs.keys() else 30
-    chromosome_coverage_pl = dict()
-    chromosome_coverage_mn = dict()
+    chromosome_coverage_pl = {}
+    chromosome_coverage_mn = {}
 
     result_pl = {}
     result_mn = {}
@@ -449,7 +438,6 @@ def get_read_signal(input_bam, loc_prime, chromosome_startswith, output_dir, out
     except Exception as e:
         logger.error(e)
         sys.exit(-1)
-    genome_size = 0
 
     for chromosome in bam.header["SQ"]:
         if "SN" in chromosome.keys() and "LN" in chromosome.keys() and \
@@ -461,7 +449,6 @@ def get_read_signal(input_bam, loc_prime, chromosome_startswith, output_dir, out
             if not ignore_flag:
                 chromosome_coverage_pl[chromosome["SN"]] = np.zeros(chromosome["LN"], dtype=np.uint32)
                 chromosome_coverage_mn[chromosome["SN"]] = np.zeros(chromosome["LN"], dtype=np.uint32)
-                genome_size += chromosome["LN"]
 
     def load_signal_from_cache(pre_chromosome_coverage, results, direction="pl"):
         read_counts = 0
@@ -580,7 +567,7 @@ def normalize_using_input(assay_pl, assay_mn, input_pl, input_mn, scale_factor, 
     """
 
     def strand_atom(assay_coverage, input_coverage, sf=1., direction="pl"):
-        results = dict()
+        results = {}
         for chrom_name, npy_dump in assay_coverage.items():
             if chrom_name in input_coverage:
                 matched_input = np.load(input_coverage[chrom_name]) * sf
@@ -630,20 +617,17 @@ def get_coverage(input_bam, library_type, chromosome_startswith, output_dir, out
     chromosome_coverage_mn : dict
         Dictionary of per base coverage per chromosome (negative strand)
     """
-    logger = logging.getLogger("IO engine")
+    logger = logging.getLogger(__logger_name__)
     log_assert(library_type in ("se", "pe_fr", "pe_rf"), "library_type must be se, pe_fr or pe_rf", logger)
     mapq_threshold = kwargs["mapq_threshold"] if "mapq_threshold" in kwargs.keys() else 30
-    chromosome_coverage_pl = dict()
-    chromosome_coverage_mn = dict()
-    chromosome_pre_accessible_dict = dict()
-    chromosome_reads_dict = dict()
-    # chromosome_lambda_dict = dict()
+    chromosome_coverage_pl = {}
+    chromosome_coverage_mn = {}
+    chromosome_pre_accessible_dict = {}
+    chromosome_reads_dict = {}
     bam = pysam.AlignmentFile(input_bam, "rb")
 
     chrom_size_list = []
-    # max_reference_length = 0
-    genome_size = 0
-
+    
     for chromosome in bam.header["SQ"]:
         if "SN" in chromosome.keys() and "LN" in chromosome.keys() and \
                 chromosome["SN"].startswith(chromosome_startswith):
@@ -652,8 +636,6 @@ def get_coverage(input_bam, library_type, chromosome_startswith, output_dir, out
             chrom_size_list.append((chromosome["SN"], chromosome["LN"]))
             chromosome_pre_accessible_dict[chromosome["SN"]] = []
             chromosome_reads_dict[chromosome["SN"]] = 0
-            # chromosome_lambda_dict[chromosome["SN"]] = 0.0
-            genome_size += chromosome["LN"]
 
     if "output_chrom_size" in kwargs.keys() and kwargs["output_chrom_size"]:
         csize_fn = os.path.join(output_dir, output_prefix + ".csize")
@@ -795,9 +777,7 @@ def read_lines(filename):
 
     with fn_open(filename, mode) as fh:
         for line in fh:
-            if line.startswith('#'):
-                continue
-            else:
+            if not line.startswith('#'):
                 yield parse(line)
 
 
@@ -831,7 +811,6 @@ def parse(line):
     for i, info in enumerate(infos, 1):
         # It should be key="value".
         try:
-            # key, _, value = re.split(R_KEYVALUE, info, 1)
             key, value = info.split()
         # But sometimes it is just "value".
         except ValueError:
