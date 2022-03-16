@@ -31,12 +31,9 @@ logging.basicConfig(format="%(name)s - %(asctime)s - %(levelname)s: %(message)s"
 logger = logging.getLogger("PINTS - Visualizer")
 
 try:
-    import pysam
     import pyBigWig
     import numpy as np
-    import pandas as pd
-    from Bio import SeqIO
-    from pints.io_engine import log_assert, get_read_signal
+    from pints.io_engine import get_read_signal
 except ImportError as e:
     missing_package = str(e).replace("No module named '", "").replace("'", "")
     logger.error("Please install %s first!" % missing_package)
