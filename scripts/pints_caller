@@ -691,7 +691,7 @@ def check_window_chromosome(rc_file, output_file, strand_sign, chromosome_name, 
             else:
                 suggest_val = search_grid[-1]
                 
-            if bkg_mu_threshold < 0.5:
+            if bkg_mu_threshold < 0.5 and len(all_peak_mus) > 1000:
                 logger.warning((
                     "Current min value for local background density is %.3f, "
                     "please consider increasing the value of --min-mu-percent "
