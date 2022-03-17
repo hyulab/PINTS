@@ -762,10 +762,12 @@ def render_pep440_pre(pieces):
     if pieces["closest-tag"]:
         rendered = pieces["closest-tag"]
         if pieces["distance"]:
-            rendered += ".post0.dev%%d" %% pieces["distance"]
+            rendered += ".%%d" %% pieces["distance"]
+        else:
+            rendered += ".0"
     else:
         # exception #1
-        rendered = "0.post0.dev%%d" %% pieces["distance"]
+        rendered = "0.%%d" %% pieces["distance"]
     return rendered
 
 
@@ -1270,10 +1272,12 @@ def render_pep440_pre(pieces):
     if pieces["closest-tag"]:
         rendered = pieces["closest-tag"]
         if pieces["distance"]:
-            rendered += ".post0.dev%d" % pieces["distance"]
+            rendered += ".%d" % pieces["distance"]
+        else:
+            rendered += ".0"
     else:
         # exception #1
-        rendered = "0.post0.dev%d" % pieces["distance"]
+        rendered = "0.%d" % pieces["distance"]
     return rendered
 
 
