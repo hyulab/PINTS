@@ -71,12 +71,6 @@ Or you can call peaks from BigWig files:
 pints_caller --save-to output_dir --file-prefix output_prefix --bw-pl path_to_pl.bw --bw-mn path_to_mn.bw --thread 16
 ```
 
-If you want to call peaks from experiments with replicates:
-
-```shell
-pints_caller --bam-file input1.bam input2.bam --save-to output_dir --file-prefix output_prefix --thread 16 --exp-type PROcap
-```
-
 ## Outputs
 
 * prefix+`_{SID}_divergent_peaks.bed`: Divergent TREs;
@@ -101,7 +95,7 @@ For divergent or bidirectional TREs, there will be 6 columns in the outputs:
 5. Major TSSs on the forward strand, if there are multiple major TSSs, they will be separated by comma `,`
 6. Major TSSs on the reverse strand, if there are multiple major TSSs, they will be separated by comma `,`
 
-For single TREs, there will be 6 columns in the output:
+For unidirectional TREs, there will be 9 columns in the output:
 
 1. Chromosome
 2. Start
@@ -109,6 +103,9 @@ For single TREs, there will be 6 columns in the output:
 4. Peak ID
 5. Q-value
 6. Strand
+7. Read counts
+8. Position of the summit TSS
+9. Height of the summit
 
 For all three types of TREs, if a valid biosample name for `--epig-annotation` is provided, then an additional column with epigenomic annotation for each TRE will show up in the final output.
 
