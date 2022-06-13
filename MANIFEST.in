@@ -1,1 +1,2 @@
 include versioneer.py
+include pints/_version.py

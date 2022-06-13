@@ -16,7 +16,6 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
 import sys
-import warnings
 
 try:
     import pysam
@@ -31,54 +30,7 @@ except ImportError as e:
     sys.exit("Please install %s first!" % missing_package)
 
 
-def prop_test(pi_0, l_0, pi_1, l_1, empirical_threshold=5, alternative="greater"):
-    """
-    survivors = np.array([[1781, total1 - 1781], [1443, total2 - 47]])
-    proportions_ztest
-    In the two sample test, smaller means that the alternative hypothesis is
-    p1 < p2 and larger means p1 > p2 where p1 is the proportion of the first sample and p2 of the second one
-    :return:
-    """
-    count_0 = int(pi_0 * l_0)
-    total_0 = l_0
-    count_1 = int(pi_1 * l_1)
-    total_1 = l_1
-    # if no zero
-    if count_0 == 0 or count_1 == 0:
-        return 10e-16
-    try:
-        while count_0 < empirical_threshold:
-            count_0 = int(pi_0 * l_0 * 10)
-            total_0 *= 10
-        while count_1 < empirical_threshold:
-            count_1 = int(pi_1 * l_1 * 10)
-            total_1 *= 10
-        _, pval = fisher_exact(np.array([[count_0, count_1], [total_0 - count_0, total_1 - count_1]]),
-                               alternative=alternative)
-    except Exception as e:
-        print(e, count_0, total_0, count_1, total_1)
-        pval = 1
-    return pval
-
-
-def get_rank(input_array):
-    """
-    Get the rank of an array
-
-    Parameters
-    ----------
-    input_array : np.Array
-
-    Returns
-    ranks : np.Array
-        Rank of the element in input_array
-    -------
-
-    """
-    temp = input_array.argsort()
-    ranks = np.empty_like(temp)
-    ranks[temp] = np.arange(len(input_array))
-    return ranks
+__CACHE_KEY_FORMAT__ = "%d-%d"
 
 
 def pval_dist(pval_list, logger, output_diagnostics=True, output_to=None):
@@ -297,214 +249,8 @@ class ZIP(StatModel):
         return p
 
     def sf(self, peak_mu, peak_var, peak_pi, le_mu, le_var, le_pi):
-        # return 1 - ZIP.zip_cdf(peak_mu, peak_pi, le_mu)
         from scipy.stats import poisson
         return poisson.sf(peak_mu, le_mu)
-
-
-class NegativeBinomial(StatModel):
-    def fit(self, window):
-        """
-        EM for Negative Binomial
-
-        Parameters
-        ----------
-        window
-
-        Returns
-        -------
-        r : float
-
-        p : float
-
-        pi : None
-
-        llc : None
-
-        convergence : bool
-
-        """
-
-        def log_likelihood(params, *args):
-            r, p = params
-            X = args[0]
-            N = X.size
-
-            # MLE estimate based on the formula on Wikipedia:
-            # http://en.wikipedia.org/wiki/Negative_binomial_distribution#Maximum_likelihood_estimation
-            result = np.sum(gammaln(X + r)) \
-                     - np.sum(np.log(factorial(X))) \
-                     - N * (gammaln(r)) \
-                     + N * r * np.log(p) \
-                     + np.sum(X * np.log(1 - (p if p < 1 else 1 - self.infinitesimal)))
-
-            return -result
-
-        if self.init_mu is None or self.init_variance is None:
-            # reasonable initial values (from fitdistr function in R)
-            m = np.mean(window)
-            v = np.var(window)
-            size = (m ** 2) / (v - m) if v > m else 10
-
-            # convert mu/size parameterization to prob/size
-            p0 = size / ((size + m) if size + m != 0 else 1)
-            r0 = size
-        else:
-            size = self.init_mu ** 2 / (self.init_variance - self.init_mu) if self.init_variance > self.init_mu else 10
-            p0 = size / ((size + self.init_mu) if size + self.init_mu != 0 else 1)
-            r0 = size
-        initial_params = np.array([r0, p0])
-        try:
-            bounds = [(self.infinitesimal, None), (self.infinitesimal, 1)]
-            optimres = BFGS(log_likelihood,
-                            x0=initial_params,
-                            args=(window,),
-                            approx_grad=1,
-                            bounds=bounds)
-
-            params = optimres[0]
-            convergent_flag = True if optimres[2]["warnflag"] == 0 else False
-        except:
-            # print("Failed to converge.")
-            return r0, p0, 0, None, False
-        return params[0], params[1], 0, None, convergent_flag
-
-    def sf(self, peak_mu, peak_var, peak_pi, le_mu, le_var, le_pi):
-        return nbinom.sf(peak_mu * (1 - peak_var) / peak_var, le_mu, le_var)
-
-
-class ZINB(StatModel):
-    @staticmethod
-    def fit_nb(X, Z, pi, initial_params=None):
-        infinitesimal = np.finfo(float).eps
-
-        def log_likelihood(params, *args):
-            mu, k = params
-            X = args[0]
-            Z = args[1]
-            pi = args[2]
-            muk = mu + k
-            muk = muk if muk > 0 else infinitesimal
-            pi = pi if pi > 0 else infinitesimal
-            k = k if k > 0 else infinitesimal
-            mu = mu if mu > 0 else infinitesimal
-            one_minus_pi = 1 - pi
-            one_minus_pi = one_minus_pi if one_minus_pi > 0 else infinitesimal
-
-            is_zeros = X == 0
-            is_zeros = is_zeros.astype(int)
-            # incomplete log-likelihood function
-            """
-            result = np.sum(is_zeros * np.log(pi + (1 - pi) * ((k / (muk)) ** k))) + np.sum((1 - is_zeros) * (
-                    np.log(1 - pi) + gammaln(X + k) - gammaln(X + 1) - gammaln(k) + k * np.log(k) - k * np.log(
-                muk) + X * np.log(mu if mu > 0 else infinitesimal) - X * np.log(muk)))
-            """
-            # complete log-likelihood function
-            result = 0
-            try:
-                result = np.sum(Z * np.log(pi)) + np.sum((1 - Z) * (
-                        np.log(one_minus_pi) + gammaln(X + k) - gammaln(X + 1) - gammaln(k) + k * np.log(
-                    k) - k * np.log(
-                    muk) + X * np.log(mu) - X * np.log(muk)))
-            except Exception:
-                print("pi", pi, np.log(pi))
-                print("1-pi", np.log(1 - pi))
-                print(gammaln(k))
-                print(np.log(k))
-                print(np.log(mu))
-                print(pi, mu, k, muk)
-            return -result
-
-        if initial_params is None:
-            # reasonable initial values (from fitdistr function in R)
-            m = np.mean(X)
-            v = np.var(X)
-            size = (m ** 2) / (v - m) if v > m else 10
-
-            # convert mu/size parameters to mu/k
-            p_0 = size / ((size + m) if size + m != 0 else 1)
-            mu_0 = size * (1 - p_0) / p_0
-            k_0 = 1 / size
-            initial_params = np.array([mu_0, k_0])
-
-        bounds = [(infinitesimal, None), (infinitesimal, None)]
-        optimres = BFGS(log_likelihood,
-                        x0=initial_params,
-                        args=(X, Z, pi),
-                        approx_grad=1,
-                        bounds=bounds)
-        params = optimres[0]
-        return params[0], params[1]
-
-    def fit(self, window):
-        infinitesimal = np.finfo(float).eps
-        if self.init_mu is None or self.init_k is None or self.init_pi is None:
-            not_zero = window != 0
-            nn_zero = sum(not_zero)
-            init_pi = (window.shape[0] - not_zero.sum()) / window.shape[0]
-            if nn_zero > 0:
-                init_mu = np.mean(window[not_zero])
-                s2 = np.var(window[not_zero])
-                size = init_mu ** 2 / (s2 - init_mu + 0.0001)
-                size = size if size > 0 else 0.0001
-                init_k = 1 / size
-            else:
-                init_mu = 0
-                init_k = 1
-        else:
-            init_mu = self.init_mu
-            init_k = self.init_k
-            init_pi = self.init_pi
-        mu = init_mu
-        k = init_k
-        pi = init_pi
-        mu_pre = mu
-        k_pre = k
-        pi_pre = pi
-        n_iter = 0
-        hat_z = np.zeros(len(window))
-        zero_elements = window == 0
-        n = len(window)
-        prev_likelihood = 0.
-        likelihoods = []
-
-        while True:
-            # expectation
-            # in case of overflow
-            # nb_term = k_pre / (mu_pre + k_pre)
-            # if nb_term < 1 and k_pre >
-            hat_z[zero_elements] = pi_pre / (pi_pre + (1 - pi_pre) * ((k_pre / (mu_pre + k_pre)) ** k_pre))
-            # maximization
-            pi = hat_z.sum() / n
-            # mu & k
-            mu, k = ZINB.fit_nb(window, hat_z, pi_pre, [mu_pre, k_pre])
-            # estimate likelihood
-            pos_pmf = nbinom.pmf(window, 1 / k, 1 / (1 + k * mu))
-            pos_pmf[pos_pmf == 0] = infinitesimal
-            likelihood = np.sum(zero_elements * np.log(pi if pi > 0 else infinitesimal)) + np.log(pos_pmf).sum()
-            likelihoods.append(likelihood)
-
-            if n_iter > 0:
-                if abs(likelihood - prev_likelihood) < self.stop_diff or abs(mu - mu_pre) < self.stop_diff or abs(
-                        k - k_pre) < self.stop_diff or abs(pi - pi_pre) < self.stop_diff:
-                    if self.debug and self.output_to != "":
-                        import matplotlib.pyplot as plt
-                        plt.plot(likelihoods)
-                        plt.ylabel('Log-likelihood')
-                        plt.xlabel('Iteration')
-                        plt.tight_layout()
-                        plt.savefig(self.output_to, bbox_inches="tight", transparent=True)
-                    return mu, k, pi, likelihood, True
-                if n_iter > self.max_iter:
-                    return init_mu, init_k, init_pi, likelihood, False
-            prev_likelihood = likelihood
-            mu_pre = mu
-            k_pre = k
-            pi_pre = pi
-            n_iter += 1
-
-    def sf(self, peak_mu, peak_var, peak_pi, le_mu, le_var, le_pi):
-        pass
 
 
 class IQR(ABC):
@@ -685,7 +431,7 @@ class bgIQR(IQR):
         all_dens = []
 
         for k, (b, s) in enumerate(re_l):
-            cache_key = "%d-%d" % (b, s)
+            cache_key = __CACHE_KEY_FORMAT__ % (b, s)
             if cache_key in cache:
                 if cache[cache_key] == 1:
                     new_local_env[se_l[k][0]:se_l[k][1]] = -1
@@ -695,7 +441,7 @@ class bgIQR(IQR):
                 uncertain_se_l.append(se_l[k])
                 all_dens.append(dens_l[k])
         for k, (b, s) in enumerate(re_r):
-            cache_key = "%d-%d" % (b, s)
+            cache_key = __CACHE_KEY_FORMAT__ % (b, s)
             if cache_key in cache:
                 if cache[cache_key] == 1:
                     new_local_env[se_r[k][0] + coord_offset:se_r[k][1] + coord_offset] = -1
@@ -733,7 +479,7 @@ class bgIQR(IQR):
 
             outlier_t, _ = bgIQR.get_outlier_threshold(bg_mus)
             for k, v in enumerate(bg_mus):
-                cache_key = "%d-%d" % (re_coords[k][0], re_coords[k][1])
+                cache_key = __CACHE_KEY_FORMAT__ % (re_coords[k][0], re_coords[k][1])
                 if v < outlier_t or (
                         enable_eler and all_dens[k] > peak_threshold and re_coords[k][1] - re_coords[k][0] > small_window_threshold):
                     ler_count += 1
@@ -746,7 +492,7 @@ class bgIQR(IQR):
             uncertain_re_l.extend(uncertain_re_r)
 
             for k, (b, s) in enumerate(uncertain_re_l):
-                cache_key = "%d-%d" % (re_coords[k][0], re_coords[k][1])
+                cache_key = __CACHE_KEY_FORMAT__ % (re_coords[k][0], re_coords[k][1])
                 background_window = np.concatenate((coverage_info[b - 2500:b],
                                                     coverage_info[s:s + 2500]),
                                                    axis=None)
@@ -875,6 +621,7 @@ def independent_filtering(df, fdr_target=0.1, output_to=None, logger=None, **kwa
     from pints.io_engine import log_assert
     import pandas as pd
 
+    adjust_method = kwargs.get("adjust_method", "fdr_bh")
     log_assert(isinstance(df, pd.DataFrame), "df needs to be pd.DataFrame", logger)
     log_assert("reads" in df.columns, "Please provide read counts (reads) in df", logger)
     quantiles_tested = []
@@ -884,7 +631,7 @@ def independent_filtering(df, fdr_target=0.1, output_to=None, logger=None, **kwa
     select_probe = None
     read_counts_threshold = 0
     try:
-        direct_padj = multipletests(df["pval"], alpha=fdr_target, method=kwargs["adjust_method"])[1]
+        direct_padj = multipletests(df["pval"], alpha=fdr_target, method=adjust_method)[1]
     except ZeroDivisionError:
         direct_padj = df["pval"] * df.shape[0]
     for quantile in np.arange(0, 1, 0.005):
@@ -892,7 +639,7 @@ def independent_filtering(df, fdr_target=0.1, output_to=None, logger=None, **kwa
         tmp_probe = df["reads"] > threshold
         filtered_df = df.loc[tmp_probe, :].copy()
         try:
-            mult_res = multipletests(filtered_df["pval"], alpha=fdr_target, method=kwargs["adjust_method"])
+            mult_res = multipletests(filtered_df["pval"], alpha=fdr_target, method=adjust_method)
             read_out = mult_res[1]
         except ZeroDivisionError:
             # if we cannot run BH, then we use Bonferroni correction
@@ -924,7 +671,7 @@ def independent_filtering(df, fdr_target=0.1, output_to=None, logger=None, **kwa
     final_df.loc[select_probe, "padj"] = adjusted_df["padj"]
     quantiles_tested_arr = np.asarray(quantiles_tested)
     windows_rejected_arr = np.asarray(windows_rejected)
-    if kwargs["output_diagnostics"] and output_to is not None:
+    if kwargs.get("output_diagnostics", False) and output_to is not None:
         import matplotlib.pyplot as plt
         fig, ax1 = plt.subplots(figsize=(5.5, 5.5))
         ax2 = ax1.twinx()
@@ -987,19 +734,3 @@ def get_elbow(X, Y):
         X_e = np.nan
         Y_e = np.nan
     return X_e, Y_e
-
-
-if __name__ == "__main__":
-    warnings.filterwarnings("error")
-    np.random.seed(299)
-    n = 1000
-    theta = 2.5  # Poisson rate
-    pi = 0.55  # probability of extra-zeros (pi = 1-psi)
-    mu = 4.48
-    k = 0.25
-
-    # Simulate some data
-    z = ZIP(debug=True)
-    counts = np.array([(np.random.random() > pi) *
-                       np.random.poisson(theta) for _ in range(n)])
-    print(z.fit(counts))
