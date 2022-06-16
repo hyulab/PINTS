@@ -1390,6 +1390,8 @@ def pair(sample_prefix, df_dict, fdr_target, stringent_only, specific_suffix="",
                 pri_merged_df = pri_merged_file.to_dataframe(names=("chrom", "start", "end", "tss_fwd",
                                                                     "tss_fwd_vals", "tss_rev", "tss_rev_vals",
                                                                     "confidence"))
+                for str_col in ("tss_fwd", "tss_fwd_vals", "tss_rev", "tss_rev_vals"):
+                    pri_merged_df[str_col] = pri_merged_df[str_col].astype(str)
                 fwd_tss_cols = pri_merged_df["tss_fwd"].str.split(",", expand=True).fillna(value=-1).astype(int)
                 fwd_tss_val_cols = pri_merged_df["tss_fwd_vals"].str.split(",", expand=True).fillna(value=-1).astype(
                     int)
