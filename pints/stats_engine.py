@@ -178,7 +178,7 @@ class ZIP(StatModel):
         # if there's no non-zero observation
         if zs == window.shape[0]:
             return 0, 0, 0, 0, True
-        
+
         if self.init_mu is None or self.init_pi is None:
             init_lamb, init_pi = ZIP.zip_moment_estimators(windows=window)
         else:
@@ -346,10 +346,10 @@ class IQR(ABC):
 
     @staticmethod
     @abstractmethod
-    def remove_peaks_in_local_env(stat_tester, bed_handler, chromosome, query_start_left, 
-                                  query_end_left, query_start_right, query_end_right, 
+    def remove_peaks_in_local_env(stat_tester, bed_handler, chromosome, query_start_left,
+                                  query_end_left, query_start_right, query_end_right,
                                   small_window_threshold, peak_in_bg_threshold,
-                                  coverage_info, fdr_target, cache, disable_ler=False, 
+                                  coverage_info, fdr_target, cache, disable_ler=False,
                                   enable_eler=True, peak_threshold=None):
         """
         LER-based local environment refinement
@@ -400,24 +400,24 @@ class IQR(ABC):
 
 class bgIQR(IQR):
     @staticmethod
-    def remove_peaks_in_local_env(stat_tester, bed_handler, chromosome, query_start_left, 
-                                  query_end_left, query_start_right, query_end_right, 
-                                  small_window_threshold, peak_in_bg_threshold, 
-                                  coverage_info, fdr_target, cache, disable_ler=False, 
+    def remove_peaks_in_local_env(stat_tester, bed_handler, chromosome, query_start_left,
+                                  query_end_left, query_start_right, query_end_right,
+                                  small_window_threshold, peak_in_bg_threshold,
+                                  coverage_info, fdr_target, cache, disable_ler=False,
                                   enable_eler=True, peak_threshold=None):
         ler_count = 0
         bg_mus = []
         local_env_left = coverage_info[query_start_left:query_end_left]
         local_env_right = coverage_info[query_start_right:query_end_right]
         local_cache = defaultdict(int)
-        se_l, re_l, dens_l = bgIQR.atom_ler(bed_handler=bed_handler, chromosome=chromosome, 
-                                            query_start=query_start_left, query_end=query_end_left, 
+        se_l, re_l, dens_l = bgIQR.atom_ler(bed_handler=bed_handler, chromosome=chromosome,
+                                            query_start=query_start_left, query_end=query_end_left,
                                             queried_peaks=local_cache, small_window_threshold=small_window_threshold,
                                             peak_in_bg_threshold=peak_in_bg_threshold)
-        se_r, re_r, dens_r = bgIQR.atom_ler(bed_handler=bed_handler, chromosome=chromosome, 
-                                            query_start=query_start_right, query_end=query_end_right, 
+        se_r, re_r, dens_r = bgIQR.atom_ler(bed_handler=bed_handler, chromosome=chromosome,
+                                            query_start=query_start_right, query_end=query_end_right,
                                             queried_peaks=local_cache, small_window_threshold=small_window_threshold,
-                                       peak_in_bg_threshold=peak_in_bg_threshold)
+                                            peak_in_bg_threshold=peak_in_bg_threshold)
         coord_offset = len(local_env_left)
         new_local_env = np.concatenate((local_env_left, local_env_right), axis=None)
 
@@ -481,7 +481,7 @@ class bgIQR(IQR):
             for k, v in enumerate(bg_mus):
                 cache_key = __CACHE_KEY_FORMAT__ % (re_coords[k][0], re_coords[k][1])
                 if v < outlier_t or (
-                        enable_eler and all_dens[k] > peak_threshold and re_coords[k][1] - re_coords[k][0] > small_window_threshold):
+                        enable_eler and all_dens[k] > peak_threshold):
                     ler_count += 1
                     new_local_env[se_coords[k][0]:se_coords[k][1]] = -1
                     cache[cache_key] = 1
@@ -512,7 +512,7 @@ class bgIQR(IQR):
 
                 p_val_formal = stat_tester.sf(mu_pk, var_pk, pi_pk, mu_bg, var_bg, pi_bg)
                 if p_val_formal < fdr_target or (
-                        enable_eler and mu_pk > peak_threshold and s - b > small_window_threshold):
+                        enable_eler and mu_pk > peak_threshold):
                     new_local_env[se_coords[k][0]:se_coords[k][1]] = -1
                     ler_count += 1
                     cache[cache_key] = 1
@@ -548,6 +548,10 @@ class pkIQR(IQR):
                                             peak_in_bg_threshold=peak_in_bg_threshold, offset=coord_offset)
 
         new_local_env = np.concatenate((local_env_left, local_env_right), axis=None)
+
+        if disable_ler:
+            return new_local_env, ler_count
+
         all_dens = dens_l + dens_r
         if len(all_dens) >= 3:
             _, outlier_t = pkIQR.get_outlier_threshold(all_dens, 1)
@@ -583,7 +587,7 @@ class pkIQR(IQR):
 
                 p_val_formal = stat_tester.sf(mu_pk, var_pk, pi_pk, mu_bg, var_bg, pi_bg)
                 if p_val_formal < fdr_target or (
-                        enable_eler and mu_pk > peak_threshold and s - b > small_window_threshold):
+                        enable_eler and mu_pk > peak_threshold):
                     new_local_env[se_l[k][0]:se_l[k][1]] = -1
                     ler_count += 1
         return new_local_env[new_local_env >= 0], ler_count

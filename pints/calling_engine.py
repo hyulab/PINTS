@@ -20,6 +20,7 @@ import logging
 import os
 import sys
 from collections import namedtuple
+from glob import glob
 from multiprocessing import Pool
 
 
@@ -685,17 +686,8 @@ def check_window_chromosome(rc_file, output_file, strand_sign, chromosome_name, 
                 suggest_val = search_grid[-1]
 
             if bkg_mu_threshold < 0.5 and len(all_peak_mus) > 1000:
-                msg = (
-                        "Current min value for local background density is %.3f, "
-                        "please consider increasing the value of --min-mu-percent "
-                        "(current value: %.2f) to %.2f to reduce false positives." % (
-                            bkg_mu_threshold, min_mu_percent, suggest_val
-                        )
-                )
-                if __STRICT_QC__:
-                    raise RuntimeError(msg)
-                else:
-                    logger.warning(msg)
+                with open(subpeak_bed.replace(".bed", ".mmp"), "w") as fh:
+                    fh.write(str(suggest_val))
             sorted_arr = np.sort(all_peak_mus)
             Y = np.log1p(sorted_arr[sorted_arr >= eler_min])
             X = np.log10(np.arange(Y.shape[0]) + 1)
@@ -850,21 +842,10 @@ def stratified_filtering(tmp_df, output_file, fdr_target, dry_run=False, **kwarg
                     if top_peak_threshold < vp:
                         tpt_suggestion = vp
 
-                if tpt_suggestion is not None:
-                    tpt_suggestion_str = "increasing the value of --top-peak-threshold (current: %.2f) to %.2f or " % (
-                        top_peak_threshold, tpt_suggestion)
-                else:
-                    tpt_suggestion_str = ""
-
-                msg = ("The proportion of significant short peaks is relatively high (%.2f), "
-                       "which usually indicates the cap-selection process didn't work well as expected. "
-                       "To reduce false positives, please consider %s"
-                       "using --disable-small to remove all significant short peaks.") % (
-                        small_ratio, tpt_suggestion_str)
-                if __STRICT_QC__:
-                    raise RuntimeError(msg)
-                else:
-                    logger.warning(msg)
+                if tpt_suggestion is None:
+                    tpt_suggestion = 1
+                with open(fn+".tpt", "w") as fh:
+                    fh.write(str(tpt_suggestion))
         else:
             result_df = tmp_df_bg
 
@@ -900,7 +881,6 @@ def peaks_single_strand(per_base_cov, output_file, shared_peak_definitions, stra
         Path to a compressed and indexed bed file
     """
     global housekeeping_files
-    fn, ext = os.path.splitext(output_file)
 
     args = []
     for chrom, pbc_npy in per_base_cov.items():
@@ -1046,7 +1026,8 @@ def merge_opposite_peaks(sig_peak_bed, peak_candidate_bed, divergent_output_bed,
                 opposite_summit_val = int(opposite_summit_vals[index])
                 opposite_sum = sum(opposite_vals[:index + 1])
         except ValueError as err:
-            logger.warning("No peak candidate among %s:%d-%d\n%s" % (items[0], query_start, query_end, err))
+            # logger.warning("No peak candidate among %s:%d-%d\n%s" % (items[0], query_start, query_end, err))
+            pass
         if opposite_start is np.nan:
             sfp_fh.write(line)
         else:
@@ -1453,7 +1434,7 @@ def annotate_tre_with_epig_info(peak_file, epig_bigbed_file, only_annotated_reco
                         if ann.find("ELS") != -1:
                             cache.add("DNase")
                             cache.add("H3K27ac")
-                        if ann.find("H3K4me3") != -1 or ann.find("PLS"):
+                        if ann.find("H3K4me3") != -1 or ann.find("PLS") != -1:
                             cache.add("DNase")
                             cache.add("H3K4me3")
                         if ann.find("CTCF") != -1:
@@ -1470,6 +1451,69 @@ def annotate_tre_with_epig_info(peak_file, epig_bigbed_file, only_annotated_reco
         for col, value in placeholders.items():
             peak_df[col] = value
     peak_df.to_csv(peak_file, sep="\t", index=False, header=False)
+
+
+def on_the_fly_qc(output_prefix, min_mu_percent, top_peak_threshold, is_strict_mode=False):
+    """
+    On-the-fly QC
+
+    Parameters
+    ----------
+    output_prefix : str
+        Prefix to all outputs
+    min_mu_percent : float
+        Current value for --min-mu-percent
+    top_peak_threshold : float
+        Current value for --top-peak-threshold
+    is_strict_mode : bool
+        Set this to True will raise RuntimeError if on-the-fly QC find any warnings
+
+    Raises:
+        RuntimeError: _description_
+    """
+    global housekeeping_files
+    warning_msgs = []
+    mmp_values = []
+    for mmp_file in glob("{}*.mmp".format(output_prefix)):
+        housekeeping_files.append(mmp_file)
+        with open(mmp_file) as fh:
+            mmp_values.append(float(fh.read().strip()))
+    if len(mmp_values) > 0:
+        mmp_suggestion = max(mmp_values)
+        if mmp_suggestion > min_mu_percent:
+            msg = (
+                    "Please consider increasing the value of --min-mu-percent "
+                    "(current: %.2f) to %.2f to reduce false positives." % (
+                        min_mu_percent, mmp_suggestion
+                    )
+            )
+            warning_msgs.append(msg)
+        
+    tpt_values = []
+    for tpt_file in glob("{}*.tpt".format(output_prefix)):
+        housekeeping_files.append(tpt_file)
+        with open(tpt_file) as fh:
+            tpt_values.append(float(fh.read().strip()))
+    if len(tpt_values) > 0:
+        tpt_suggestion = max(tpt_values)
+        if tpt_suggestion > top_peak_threshold:
+            if tpt_suggestion < 1:
+                tpt_suggestion_str = "increasing the value of --top-peak-threshold (current: %.2f) to %.2f or " % (
+                    top_peak_threshold, tpt_suggestion)
+            else:
+                tpt_suggestion_str = ""
+            msg = ("The proportion of significant short peaks is relatively high, "
+                "which usually indicates the cap-selection process didn't work well as expected. "
+                "To reduce false positives, please consider %s"
+                "using --disable-small to remove all significant short peaks.") % (tpt_suggestion_str)
+            warning_msgs.append(msg)
+
+    if len(warning_msgs) > 0:
+        if is_strict_mode:
+            raise RuntimeError("\n".join(warning_msgs))
+        else:
+            for msg in warning_msgs:
+                logger.warning(msg)
 
 
 def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
@@ -1745,6 +1789,13 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
             housekeeping_files.append(r_bid)
             housekeeping_files.append(r_div)
             housekeeping_files.append(r_unid)
+
+        # on-the-fly QC
+        on_the_fly_qc(
+            sample_prefix,
+            kwargs.get("min_mu_percent", 0.1), 
+            kwargs.get("top_peak_threshold", 0.75), 
+            is_strict_mode=__STRICT_QC__)
 
         if kwargs.get("output_diagnostics", False):
             peak_bed_to_gtf(pl_df=df_dict["pl"], mn_df=df_dict["mn"],
