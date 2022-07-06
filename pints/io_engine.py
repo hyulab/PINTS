@@ -447,8 +447,13 @@ def get_read_signal(input_bam, loc_prime, chromosome_startswith, output_dir, out
                 if chromosome["SN"].find(keyword) != -1:
                     ignore_flag = 1
             if not ignore_flag:
-                chromosome_coverage_pl[chromosome["SN"]] = np.zeros(chromosome["LN"], dtype=np.uint32)
-                chromosome_coverage_mn[chromosome["SN"]] = np.zeros(chromosome["LN"], dtype=np.uint32)
+                if chromosome["LN"] > 0:
+                    chromosome_coverage_pl[chromosome["SN"]] = np.zeros(chromosome["LN"], dtype=np.uint32)
+                    chromosome_coverage_mn[chromosome["SN"]] = np.zeros(chromosome["LN"], dtype=np.uint32)
+                else:
+                    logger.warning(
+                        "The sequence length of chromosome {} is 0."
+                        "Ignoring this chromosome.".format(chromosome["SN"]))
 
     def load_signal_from_cache(pre_chromosome_coverage, results, direction="pl"):
         read_counts = 0
@@ -627,7 +632,7 @@ def get_coverage(input_bam, library_type, chromosome_startswith, output_dir, out
     bam = pysam.AlignmentFile(input_bam, "rb")
 
     chrom_size_list = []
-    
+
     for chromosome in bam.header["SQ"]:
         if "SN" in chromosome.keys() and "LN" in chromosome.keys() and \
                 chromosome["SN"].startswith(chromosome_startswith):
