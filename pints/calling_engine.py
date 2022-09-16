@@ -55,7 +55,7 @@ except ImportError as e:
 housekeeping_files = []
 COMMON_HEADER = ('chromosome', 'start', 'end', 'name', 'padj', 'strand', 'reads',
                  'pval', 'mu_0', 'pi_0', 'mu_1', 'pi_1', 'var_1', 'ler_1', 'ler_2', 'ler_3',
-                 'summit', 'summit_val')
+                 'non_zeros', 'summit', 'summit_val')
 __SUB_PEAK_TPL__ = "_subpeaks_%s.bed"
 __SIG_PEAK_TPL__ = "%s_sig_%s.bed"
 __STRICT_QC__ = False
@@ -603,7 +603,7 @@ def cut_peaks(window, donor_tolerance, ce_trigger, join_distance=1, peak_rel_hei
 
 
 def check_window_chromosome(rc_file, output_file, strand_sign, chromosome_name, subpeak_file, fdr_target,
-                            small_peak_threshold=5, min_mu_percent=0.1,
+                            small_peak_threshold=5, min_mu_percent=0.1, disable_qc=False,
                             disable_ler=False, enable_eler=True, eler_min=1.):
     """
     Evaluate windows on a chromosome
@@ -626,10 +626,12 @@ def check_window_chromosome(rc_file, output_file, strand_sign, chromosome_name, 
         Peaks shorter than this threshold will be evaluated by Poisson instead of ZIP, by default, 5
     min_mu_percent : float
         Local backgrounds smaller than this percentile among all peaks will be replaced. By default, 0.1.
+    disable_qc : bool
+        Disable QC warnings. By default, False.
     disable_ler : bool
         Disable LER. By default, False.
     enable_eler : bool
-        Set it to False to disable enhanced LER
+        Set it as False to disable enhanced LER
     eler_min : float
         Only consider peaks with density equal to or greater than this value when performing ELER calibration.
     Returns
@@ -662,10 +664,11 @@ def check_window_chromosome(rc_file, output_file, strand_sign, chromosome_name, 
                     all_peak_mus.append(mu_peak)
                 x = np.argmax(peak_region)
                 summit_coord = start + x
+                non_zero_loci = (peak_region > 0).sum()
 
-                spb_fh.write("%s\t%d\t%d\t%s\t%f\t%s\t%s\t%f\t%d\t%d\n" % (
-                    chromosome_name, start, end, items[3], mu_peak, var_peak, strand_sign, pi_peak, summit_coord,
-                    peak_region[x]))
+                spb_fh.write("%s\t%d\t%d\t%s\t%f\t%s\t%s\t%f\t%d\t%d\t%d\n" % (
+                    chromosome_name, start, end, items[3], mu_peak, var_peak, strand_sign, pi_peak, non_zero_loci, 
+                    summit_coord, peak_region[x]))
 
         index_bed_file(subpeak_bed, logger=logger)
 
@@ -685,9 +688,12 @@ def check_window_chromosome(rc_file, output_file, strand_sign, chromosome_name, 
             else:
                 suggest_val = search_grid[-1]
 
-            if bkg_mu_threshold < 0.5 and len(all_peak_mus) > 1000:
-                with open(subpeak_bed.replace(".bed", ".mmp"), "w") as fh:
-                    fh.write(str(suggest_val))
+            if not disable_qc:
+                if bkg_mu_threshold < 0.5 and len(all_peak_mus) > 1000:
+                    bkg_mu_threshold = np.quantile(all_peak_mus, suggest_val)
+                    with open(subpeak_bed.replace(".bed", ".mmp"), "w") as fh:
+                        fh.write(str(suggest_val))
+
             sorted_arr = np.sort(all_peak_mus)
             Y = np.log1p(sorted_arr[sorted_arr >= eler_min])
             X = np.log10(np.arange(Y.shape[0]) + 1)
@@ -714,8 +720,9 @@ def check_window_chromosome(rc_file, output_file, strand_sign, chromosome_name, 
                 peak_mu = float(candidate_peak[4])
                 peak_var = float(candidate_peak[5])
                 peak_pi = float(candidate_peak[7])
-                peak_summit = int(candidate_peak[8])
-                peak_summit_val = int(candidate_peak[9])
+                peak_non_zeros = int(candidate_peak[8])
+                peak_summit = int(candidate_peak[9])
+                peak_summit_val = int(candidate_peak[10])
 
                 pval, wv, mu_bg, pi_bg, lerc = check_window(coord_start=peak_start, coord_end=peak_end, mu_peak=peak_mu,
                                                             var_peak=peak_var, pi_peak=peak_pi,
@@ -731,17 +738,17 @@ def check_window_chromosome(rc_file, output_file, strand_sign, chromosome_name, 
                 if wv > 0:
                     bins.append(
                         (chromosome_name, peak_start, peak_end, peak_id, pval, wv, mu_bg, pi_bg, peak_mu, peak_pi,
-                         peak_var, peak_summit, peak_summit_val, lerc[0], lerc[1], lerc[2]))
+                         peak_var, peak_summit, peak_summit_val, lerc[0], lerc[1], lerc[2], peak_non_zeros))
     except TypeError as ex:
         logger.error(str(chromosome_name) + "\t" + str(subpeak_file))
         logger.error(ex)
     result_df = pd.DataFrame(bins, columns=("chromosome", "start", "end", "name", "pval", "reads",
                                             "mu_0", "pi_0", "mu_1", "pi_1", "var_1", "summit", "summit_val",
-                                            "ler_1", "ler_2", "ler_3"))
+                                            "ler_1", "ler_2", "ler_3", "non_zeros"))
     result_df["strand"] = strand_sign
     result_df = result_df.loc[:, ("chromosome", "start", "end", "name", "pval", "strand", "reads",
                                   "mu_0", "pi_0", "mu_1", "pi_1", "var_1",
-                                  "summit", "summit_val", "ler_1", "ler_2", "ler_3")]
+                                  "summit", "summit_val", "ler_1", "ler_2", "ler_3", "non_zeros")]
     return result_df
 
 
@@ -834,18 +841,19 @@ def stratified_filtering(tmp_df, output_file, fdr_target, dry_run=False, **kwarg
             result_df = pd.concat([tmp_df_sm, tmp_df_bg])
             n_sig_small = sum(tmp_df_sm.padj < fdr_target)
             n_sig_big = sum(tmp_df_bg.padj < fdr_target)
-            small_ratio = n_sig_small / (n_sig_big + 1)
-            if small_ratio >= 0.2:
-                value_playgrounds = (0.99, 0.95, 0.9, 0.85, 0.8)
-                tpt_suggestion = None
-                for vp in value_playgrounds:
-                    if top_peak_threshold < vp:
-                        tpt_suggestion = vp
+            if not kwargs.get("disable_qc", False):
+                small_ratio = n_sig_small / (n_sig_big + 1)
+                if small_ratio >= 0.2:
+                    value_playgrounds = (0.99, 0.95, 0.9, 0.85, 0.8)
+                    tpt_suggestion = None
+                    for vp in value_playgrounds:
+                        if top_peak_threshold < vp:
+                            tpt_suggestion = vp
 
-                if tpt_suggestion is None:
-                    tpt_suggestion = 1
-                with open(fn+".tpt", "w") as fh:
-                    fh.write(str(tpt_suggestion))
+                    if tpt_suggestion is None:
+                        tpt_suggestion = 1
+                    with open(fn+".tpt", "w") as fh:
+                        fh.write(str(tpt_suggestion))
         else:
             result_df = tmp_df_bg
 
@@ -890,8 +898,8 @@ def peaks_single_strand(per_base_cov, output_file, shared_peak_definitions, stra
         merged_name = output_file.replace(".bed", "_%s_merged_windows.bed" % chrom)
         args.append((pbc_npy, output_file, strand_sign, chrom, shared_peak_definitions[chrom], fdr_target,
                      kwargs.get("small_peak_threshold", 5), kwargs.get("min_mu_percent", 0.1),
-                     kwargs.get("disable_ler", False), kwargs.get("enable_eler", True),
-                     kwargs.get("eler_lower_bound", 1.)))
+                     kwargs.get("disable_qc", False), kwargs.get("disable_ler", False),
+                     kwargs.get("enable_eler", True), kwargs.get("eler_lower_bound", 1.)))
         housekeeping_files.append(merged_name)
         housekeeping_files.append(sub_peaks_name + ".gz")
         housekeeping_files.append(sub_peaks_name + ".gz.tbi")
@@ -1320,6 +1328,10 @@ def pair(sample_prefix, df_dict, fdr_target, stringent_only, specific_suffix="",
         If there's anything you want to add to the outputs
 
     kwargs :
+        window_size_threshold : int
+            Peaks larger than this value will be discarded. By default, 2000.
+        keep_sticks : bool
+            Set this to True to keep significant peaks with signal on a single position.
 
     Returns
     -------
@@ -1339,7 +1351,10 @@ def pair(sample_prefix, df_dict, fdr_target, stringent_only, specific_suffix="",
         sig_bins = peak_df.loc[peak_df["padj"] < fdr_target, :]
         generated_files.append(sample_prefix + __SIG_PEAK_TPL__ % (specific_suffix, label))
         with open(sample_prefix + __SIG_PEAK_TPL__ % (specific_suffix, label), "w") as f:
-            sig_bins.to_csv(f, sep="\t", index=False, header=False)
+            if kwargs.get("keep_sticks", True):
+                sig_bins.to_csv(f, sep="\t", index=False, header=False)
+            else:
+                sig_bins.loc[sig_bins.non_zeros > 1, :].to_csv(f, sep="\t", index=False, header=False)
 
         if not os.path.exists(sample_prefix + __SIG_PEAK_TPL__ % (specific_suffix, label)):
             generated_files.append("")
@@ -1482,8 +1497,10 @@ def on_the_fly_qc(output_prefix, min_mu_percent, top_peak_threshold, is_strict_m
         mmp_suggestion = max(mmp_values)
         if mmp_suggestion > min_mu_percent:
             msg = (
-                    "Please consider increasing the value of --min-mu-percent "
-                    "(current: %.2f) to %.2f to reduce false positives." % (
+                    "To reduce false positives, PINTS overrided your current "
+                    " --min-mu-percent value. "
+                    "To dismiss this warning, please consider increasing the value "
+                    " of --min-mu-percent (current: %.2f) to %.2f." % (
                         min_mu_percent, mmp_suggestion
                     )
             )
@@ -1579,6 +1596,7 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
                    logger)
 
     __STRICT_QC__ = kwargs.get("strict_qc", False)
+    disable_qc = kwargs.get("disable_qc", False)
     input_coverage_pl = []
     input_coverage_mn = []
     chromosome_coverage_pl = []
@@ -1791,11 +1809,12 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
             housekeeping_files.append(r_unid)
 
         # on-the-fly QC
-        on_the_fly_qc(
-            sample_prefix,
-            kwargs.get("min_mu_percent", 0.1), 
-            kwargs.get("top_peak_threshold", 0.75), 
-            is_strict_mode=__STRICT_QC__)
+        if not disable_qc:
+            on_the_fly_qc(
+                sample_prefix,
+                kwargs.get("min_mu_percent", 0.1),
+                kwargs.get("top_peak_threshold", 0.75),
+                is_strict_mode=__STRICT_QC__)
 
         if kwargs.get("output_diagnostics", False):
             peak_bed_to_gtf(pl_df=df_dict["pl"], mn_df=df_dict["mn"],
