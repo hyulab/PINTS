@@ -108,6 +108,10 @@ if __name__ == "__main__":
                             "to run extra test")
     group.add_argument("--max-window-size", action="store", dest="window_size_threshold",
                        type=int, required=False, default=2000, help="max size of divergent windows")
+                       
+    group.add_argument("--remove-sticks", action="store_false", dest="keep_sticks",
+                       required=False, default=True,
+                       help="Set this switch to remove stick-like peaks (signal on a single position)")
 
     group = parser.add_argument_group("Edge trimming")
     group.add_argument("--annotation-gtf", action="store", dest="annotation_gtf", type=str, required=False,
@@ -181,6 +185,9 @@ if __name__ == "__main__":
     group.add_argument("--dont-check-updates", action="store_false", dest="check_updates",
                        required=False, default=True,
                        help="Set this switch to disable update check.")
+    group.add_argument("--disable-qc", action="store_true", dest="disable_qc",
+                       required=False, default=False,
+                       help="Disable on-the-fly quality control")
     group.add_argument("--strict-qc", action="store_true", dest="strict_qc",
                        required=False, default=False,
                        help="Raise exceptions if PINTS detects abnormalities during on-the-fly quality control; "
