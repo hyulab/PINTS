@@ -1,8 +1,9 @@
 # PINTS: Peak Identifier for Nascent Transcripts Starts
 
-![](https://img.shields.io/badge/platform-linux%20%7C%20osx-lightgrey.svg)
-![](https://img.shields.io/badge/python-3.x-blue.svg)
+![Supported platforms](https://img.shields.io/badge/platform-linux%20%7C%20osx-lightgrey.svg)
+![Supported Python versions](https://img.shields.io/badge/python-3.x-blue.svg)
 [![PyPI](https://github.com/liyao001/PINTS/actions/workflows/python-publish.yml/badge.svg)](https://github.com/liyao001/PINTS/actions/workflows/python-publish.yml)
+[![PINTS web portal](https://img.shields.io/website?label=PINTS%20web%20portal&url=https%3A%2F%2Fpints.yulab.org)](//pints.yulab.org)
 
 ## Installation
 
