@@ -843,8 +843,15 @@ def stratified_filtering(tmp_df, output_file, fdr_target, dry_run=False, **kwarg
             n_sig_big = sum(tmp_df_bg.padj < fdr_target)
             if not kwargs.get("disable_qc", False):
                 small_ratio = n_sig_small / (n_sig_big + 1)
-                if small_ratio >= 0.2:
+                value_playgrounds = ()
+                if small_ratio > 1:
+                    value_playgrounds = (0.99, 0.95, 0.9)
+                elif small_ratio >= 0.2:
+                    value_playgrounds = (0.99, 0.95, 0.9, 0.85)
+                elif small_ratio >= 0.18:
                     value_playgrounds = (0.99, 0.95, 0.9, 0.85, 0.8)
+
+                if len(value_playgrounds) > 0:
                     tpt_suggestion = None
                     for vp in value_playgrounds:
                         if top_peak_threshold < vp:
@@ -1034,7 +1041,6 @@ def merge_opposite_peaks(sig_peak_bed, peak_candidate_bed, divergent_output_bed,
                 opposite_summit_val = int(opposite_summit_vals[index])
                 opposite_sum = sum(opposite_vals[:index + 1])
         except ValueError as err:
-            # logger.warning("No peak candidate among %s:%d-%d\n%s" % (items[0], query_start, query_end, err))
             pass
         if opposite_start is np.nan:
             sfp_fh.write(line)
@@ -1239,16 +1245,24 @@ def inferring_elements_from_other_reps(prefix, n_samples):
         bid_file = sample_prefix + "_bidirectional_peaks.bed"
         div_file = sample_prefix + "_divergent_peaks.bed"
         single_file = sample_prefix + "_unidirectional_peaks.bed"
-        log_assert(os.path.exists(bid_file), "Cannot locate bidirectional output %s" % bid_file, logger)
-        log_assert(os.path.exists(div_file), "Cannot locate divergent output %s" % div_file, logger)
-        log_assert(os.path.exists(single_file), "Cannot locate unidirectional output %s" % single_file, logger)
-        bids.append(BedTool(bid_file))
-        divs.append(BedTool(div_file))
-        sigs.append(BedTool(single_file))
-    merged_bids = BedTool.cat(*bids, c=(4, 5, 6,), o=("distinct", "distinct", "distinct",))
-    merged_divs = BedTool.cat(*divs, c=(4, 5, 6,), o=("distinct", "distinct", "distinct",))
+        if os.path.exists(bid_file):
+            bids.append(BedTool(bid_file))
+        if os.path.exists(div_file):
+            divs.append(BedTool(div_file))
+        if os.path.exists(single_file):
+            sigs.append(BedTool(single_file))
+    if len(bids) > 0:
+        merged_bids = BedTool.cat(*bids, c=(4, 5, 6,), o=("distinct", "distinct", "distinct",))
+    else:
+        merged_bids = None
+    if len(divs) > 0:
+        merged_divs = BedTool.cat(*divs, c=(4, 5, 6,), o=("distinct", "distinct", "distinct",))
+    else:
+        merged_divs = None
 
     for separate_calls, pool, label in zip((bids, divs), (merged_bids, merged_divs), ("bidirectional", "divergent")):
+        if pool is None:
+            continue
         for i, separate_bed in enumerate(separate_calls):
             not_reported_ele = pool.intersect(separate_bed, v=True).intersect(sigs[i], u=True)
             BedTool.cat(*[separate_bed, not_reported_ele], postmerge=False).sort().saveas(
@@ -1379,10 +1393,19 @@ def pair(sample_prefix, df_dict, fdr_target, stringent_only, specific_suffix="",
         exp_mn_file = sample_prefix + "%s_sig_mn_%s_peaks.bed" % (specific_suffix, directionality)
         if os.path.exists(exp_pl_file) and os.path.exists(exp_mn_file):
             if directionality != "singletons":
-                pri_merged_file = BedTool.cat(*[BedTool(exp_pl_file),
-                                                BedTool(exp_mn_file)],
-                                              c=(12, 13, 14, 15, 16),
-                                              o=("collapse", "collapse", "collapse", "collapse", "distinct"))
+                tmp_pl_bed = BedTool(exp_pl_file)
+                tmp_mn_bed = BedTool(exp_mn_file)
+                if tmp_pl_bed.count() == 0 and tmp_mn_bed.count() == 0:
+                    continue
+                elif tmp_pl_bed.count() == 0:
+                    pri_merged_file = tmp_mn_bed
+                elif tmp_mn_bed.count() == 0:
+                    pri_merged_file = tmp_pl_bed
+                else:
+                    pri_merged_file = BedTool.cat(*[BedTool(exp_pl_file),
+                                                    BedTool(exp_mn_file)],
+                                                  c=(12, 13, 14, 15, 16),
+                                                  o=("collapse", "collapse", "collapse", "collapse", "distinct"))
                 pri_merged_df = pri_merged_file.to_dataframe(names=("chrom", "start", "end", "tss_fwd",
                                                                     "tss_fwd_vals", "tss_rev", "tss_rev_vals",
                                                                     "confidence"))
@@ -1468,7 +1491,7 @@ def annotate_tre_with_epig_info(peak_file, epig_bigbed_file, only_annotated_reco
     peak_df.to_csv(peak_file, sep="\t", index=False, header=False)
 
 
-def on_the_fly_qc(output_prefix, min_mu_percent, top_peak_threshold, is_strict_mode=False):
+def on_the_fly_qc(output_prefix, min_mu_percent, top_peak_threshold, significant_calls=0, is_strict_mode=False):
     """
     On-the-fly QC
 
@@ -1480,6 +1503,8 @@ def on_the_fly_qc(output_prefix, min_mu_percent, top_peak_threshold, is_strict_m
         Current value for --min-mu-percent
     top_peak_threshold : float
         Current value for --top-peak-threshold
+    significant_calls : int
+        Number of significant calls
     is_strict_mode : bool
         Set this to True will raise RuntimeError if on-the-fly QC find any warnings
 
@@ -1487,6 +1512,7 @@ def on_the_fly_qc(output_prefix, min_mu_percent, top_peak_threshold, is_strict_m
         RuntimeError: _description_
     """
     global housekeeping_files
+    info_msgs = []
     warning_msgs = []
     mmp_values = []
     for mmp_file in glob("{}*.mmp".format(output_prefix)):
@@ -1498,13 +1524,13 @@ def on_the_fly_qc(output_prefix, min_mu_percent, top_peak_threshold, is_strict_m
         if mmp_suggestion > min_mu_percent:
             msg = (
                     "To reduce false positives, PINTS overrided your current "
-                    " --min-mu-percent value. "
-                    "To dismiss this warning, please consider increasing the value "
-                    " of --min-mu-percent (current: %.2f) to %.2f." % (
+                    "--min-mu-percent value. "
+                    "To dismiss this message, please consider increasing the value "
+                    "of --min-mu-percent (current: %.2f) to %.2f." % (
                         min_mu_percent, mmp_suggestion
                     )
             )
-            warning_msgs.append(msg)
+            info_msgs.append(msg)
         
     tpt_values = []
     for tpt_file in glob("{}*.tpt".format(output_prefix)):
@@ -1520,17 +1546,98 @@ def on_the_fly_qc(output_prefix, min_mu_percent, top_peak_threshold, is_strict_m
             else:
                 tpt_suggestion_str = ""
             msg = ("The proportion of significant short peaks is relatively high, "
-                "which usually indicates the cap-selection process didn't work well as expected. "
-                "To reduce false positives, please consider %s"
-                "using --disable-small to remove all significant short peaks.") % (tpt_suggestion_str)
+                   "which usually indicates the cap-selection process didn't work well as expected. "
+                   "To reduce false positives, please consider %s"
+                   "using --disable-small to remove all significant short peaks.") % tpt_suggestion_str
             warning_msgs.append(msg)
 
+    if significant_calls > 150_000:
+        msg = ("The number of significant calls is higher than what we usually observe in TSS assays, "
+               "please consider using a smaller FDR cutoff (--fdr-target)")
+        warning_msgs.append(msg)
+
+    for im in info_msgs:
+        logger.info(im)
     if len(warning_msgs) > 0:
         if is_strict_mode:
             raise RuntimeError("\n".join(warning_msgs))
         else:
             for msg in warning_msgs:
                 logger.warning(msg)
+
+
+def parse_input_files(output_dir, output_prefix, filters, pl_cov_target, mn_cov_target, rc_target,
+                      bam_files=None, bw_pl_files=None, bw_mn_files=None, **kwargs):
+    """
+    Unified function for parsing input bam/bigwig files
+
+    Parameters
+    ----------
+    output_dir : str
+        Path to write intermediate files
+    output_prefix : str
+
+    filters : tuple/list/set
+
+    pl_cov_target : list
+
+    mn_cov_target : list
+
+    rc_target : list
+
+    bam_files : list or None
+
+    bw_pl_files : list or None
+
+    bw_mn_files : list or None
+
+    kwargs
+
+    Returns
+    -------
+
+    """
+    global housekeeping_files
+    if bam_files is not None:
+        log_assert(kwargs.get("bam_parser", None) is not None,
+                   "Please specify which type of experiment this data "
+                   "was generated from with --exp-type", logger)
+        for i, bf in enumerate(bam_files):
+            log_assert(os.path.exists(bf), "Cannot find input bam file %s" % bf, logger)
+            logger.info("Loading {0}...".format(bf))
+            plc, mnc, rc = get_read_signal(input_bam=bf,
+                                           loc_prime=kwargs["bam_parser"],
+                                           reverse_complement=kwargs.get("seq_rc", False),
+                                           output_dir=output_dir,
+                                           output_prefix=output_prefix + "_%d" % i,
+                                           filters=filters,
+                                           **kwargs)
+
+            pl_cov_target.append(plc)
+            mn_cov_target.append(mnc)
+            rc_target.append(rc)
+            housekeeping_files.extend(plc.values())
+            housekeeping_files.extend(mnc.values())
+            logger.info("{0} loaded.".format(bf))
+    elif bw_pl_files is not None and bw_mn_files is not None:
+        log_assert(len(bw_pl_files) == len(bw_mn_files),
+                   "Must provide the same amount of bigwig files for both strands", logger)
+
+        for i, bw_pl in enumerate(bw_pl_files):
+            log_assert(os.path.exists(bw_pl), "Cannot find bigwig file %s" % bw_pl, logger)
+            log_assert(os.path.exists(bw_mn_files[i]), "Cannot find bigwig file %s" % bw_mn_files[i], logger)
+            logger.info("Loading {0} and {1}...".format(bw_pl, bw_mn_files[i]))
+            plc, mnc, rc = get_coverage_bw(bw_pl=bw_pl, bw_mn=bw_mn_files[i],
+                                           chromosome_startswith=kwargs.get("chromosome_startswith", ""),
+                                           output_dir=output_dir,
+                                           output_prefix=output_prefix + "_%d" % i)
+
+            pl_cov_target.append(plc)
+            mn_cov_target.append(mnc)
+            rc_target.append(rc)
+            housekeeping_files.extend(plc.values())
+            housekeeping_files.extend(mnc.values())
+            logger.info("{0} and {1} loaded.".format(bw_pl, bw_mn_files[i]))
 
 
 def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
@@ -1592,7 +1699,8 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
 
     if kwargs["bw_pl"] is not None and kwargs["bw_mn"] is not None:
         log_assert(len(kwargs["bw_pl"]) == len(kwargs["bw_mn"]),
-                   "If you want to use bigwig files as input, make sure you provide both bws for forward and reverse strand",
+                   "If you want to use bigwig files as input, make sure "
+                   "you provide both bws for forward and reverse strand",
                    logger)
 
     __STRICT_QC__ = kwargs.get("strict_qc", False)
@@ -1604,45 +1712,13 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
     rcs = []  # read counts for experiment
     ircs = []  # read counts for input/control
     filters = kwargs.pop("filters", ())
-    chromosomes = set()
 
-    if input_bam is not None:
-        log_assert(kwargs["bam_parser"] is not None, "Please specify which type of experiment this data "
-                                                     "was generated from with --exp-type", logger)
-        for i, bf in enumerate(input_bam):
-            log_assert(os.path.exists(bf), "Cannot find input bam file %s" % bf, logger)
-            plc, mnc, rc = get_read_signal(input_bam=bf,
-                                           loc_prime=kwargs["bam_parser"],
-                                           reverse_complement=kwargs.get("seq_rc", False),
-                                           output_dir=output_dir,
-                                           output_prefix=output_prefix + "_%d" % i,
-                                           filters=filters,
-                                           **kwargs)
-            chromosomes = chromosomes.union(set(plc.keys()))
-            chromosomes = chromosomes.union(set(mnc.keys()))
-            chromosome_coverage_pl.append(plc)
-            chromosome_coverage_mn.append(mnc)
-            rcs.append(rc)
-            housekeeping_files.extend(plc.values())
-            housekeeping_files.extend(mnc.values())
-    else:
-        log_assert(len(kwargs["bw_pl"]) == len(kwargs["bw_mn"]),
-                   "Must provide the same amount of bigwig files for both strands", logger)
-
-        for i, bw_pl in enumerate(kwargs["bw_pl"]):
-            log_assert(os.path.exists(bw_pl), "Cannot find bigwig file %s" % bw_pl, logger)
-            log_assert(os.path.exists(kwargs["bw_mn"][i]), "Cannot find bigwig file %s" % kwargs["bw_mn"][i], logger)
-            plc, mnc, rc = get_coverage_bw(bw_pl=bw_pl, bw_mn=kwargs["bw_mn"][i],
-                                           chromosome_startswith=kwargs.get("chromosome_startswith", ""),
-                                           output_dir=output_dir,
-                                           output_prefix=output_prefix + "_%d" % i)
-            chromosomes = chromosomes.union(set(plc.keys()))
-            chromosomes = chromosomes.union(set(mnc.keys()))
-            chromosome_coverage_pl.append(plc)
-            chromosome_coverage_mn.append(mnc)
-            rcs.append(rc)
-            housekeeping_files.extend(plc.values())
-            housekeeping_files.extend(mnc.values())
+    parse_input_files(output_dir=output_dir, output_prefix=output_prefix, filters=filters,
+                      pl_cov_target=chromosome_coverage_pl, mn_cov_target=chromosome_coverage_mn,
+                      rc_target=rcs, bam_files=input_bam,
+                      bw_pl_files=kwargs.get("bw_pl", None), bw_mn_files=kwargs.get("bw_mn", None), **kwargs)
+    chromosomes = set().union(*[set(d.keys()) for d in chromosome_coverage_pl])
+    chromosomes = chromosomes.union(*[set(d.keys()) for d in chromosome_coverage_mn])
 
     subpeak_pl_beds = {}
     subpeak_mn_beds = {}
@@ -1672,43 +1748,10 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
                 housekeeping_files.append(target_dict[chromosome])
                 housekeeping_files.append(target_dict[chromosome] + ".tbi")
 
-    if kwargs.get("ct_bam", None) is not None:
-        logger.info("Loading control sample")
-        for i, bf in enumerate(kwargs["ct_bam"]):
-            log_assert(os.path.exists(bf), "Cannot find control bam file %s" % bf, logger)
-            iplc, imnc, irc = get_read_signal(input_bam=bf,
-                                              loc_prime=kwargs["bam_parser"],
-                                              reverse_complement=kwargs.get("seq_rc", False),
-                                              output_dir=output_dir,
-                                              output_prefix="ct_" + output_prefix + "_%d" % i,
-                                              filters=filters,
-                                              **kwargs)
-            input_coverage_pl.append(iplc)
-            input_coverage_mn.append(imnc)
-            ircs.append(irc)
-            housekeeping_files.extend(iplc.values())
-            housekeeping_files.extend(imnc.values())
-        logger.info("Control sample loaded")
-    elif kwargs.get("ct_bw_pl", None) is not None and kwargs.get("ct_bw_mn", None) is not None:
-        logger.info("Loading control sample")
-        for i, bw_pl in enumerate(kwargs["ct_bw_pl"]):
-            log_assert(os.path.exists(bw_pl), "Cannot find control bw file %s" % bw_pl, logger)
-            log_assert(os.path.exists(kwargs["ct_bw_mn"][i]),
-                       "Cannot find control bw file %s" % kwargs["ct_bw_mn"][i], logger)
-            logger.info(bw_pl)
-            logger.info(kwargs["ct_bw_mn"][i])
-            iplc, imnc, irc = get_coverage_bw(bw_pl=bw_pl,
-                                              bw_mn=kwargs["ct_bw_mn"][i],
-                                              chromosome_startswith=kwargs["chromosome_startswith"],
-                                              output_dir=output_dir,
-                                              output_prefix="ct_" + output_prefix + "_%d" % i)
-
-            input_coverage_pl.append(iplc)
-            input_coverage_mn.append(imnc)
-            ircs.append(irc)
-            housekeeping_files.extend(iplc.values())
-            housekeeping_files.extend(imnc.values())
-        logger.info("Control sample loaded")
+    parse_input_files(output_dir=output_dir, output_prefix="ct_" + output_prefix, filters=filters,
+                      pl_cov_target=input_coverage_pl, mn_cov_target=input_coverage_mn,
+                      rc_target=ircs, bam_files=kwargs.get("ct_bam", None),
+                      bw_pl_files=kwargs.get("ct_bw_pl", None), bw_mn_files=kwargs.get("ct_bw_mn", None), **kwargs)
 
     if len(ircs) > 0:
         if len(ircs) == 1 and len(rcs) > 1:
@@ -1741,6 +1784,7 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
         logger.info("Working on sample %d" % (rep + 1))
         sample_prefix = prefix + "_%d" % (rep + 1)
         df_dict = {}
+        n_significant = 0
         for cov_dict, label, spb, strand_sign in zip(
                 (pl_cov_dict, chromosome_coverage_mn[rep]),
                 ("pl", "mn"), (subpeak_pl_beds, subpeak_mn_beds), ("+", "-")):
@@ -1755,6 +1799,7 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
 
             peak_df = pd.read_csv(peaks_bed, sep="\t", header=None, names=COMMON_HEADER)
             peak_df = peak_df.loc[peak_df["end"] - peak_df["start"] < kwargs.get("window_size_threshold", 2000), :]
+            n_significant += np.sum(peak_df["padj"] < fdr_target)
             df_dict[label] = peak_df
 
         logger.info("Pairing peaks")
@@ -1814,6 +1859,7 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
                 sample_prefix,
                 kwargs.get("min_mu_percent", 0.1),
                 kwargs.get("top_peak_threshold", 0.75),
+                n_significant,
                 is_strict_mode=__STRICT_QC__)
 
         if kwargs.get("output_diagnostics", False):
