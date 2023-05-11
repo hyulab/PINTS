@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding=utf-8
 
-#  PINTS: Peak Identifier for Nascent Transcripts Sequencing
+#  PINTS: Peak Identifier for Nascent Transcripts Starts
 #  Copyright (c) 2019-2022. Li Yao at the Yu Lab.
 #
 #  This program is free software: you can redistribute it and/or modify
@@ -322,6 +322,7 @@ def check_window(coord_start, coord_end, mu_peak, var_peak, pi_peak, chromosome_
             or window_value == 0:
         return 1., window_value, 0, 0, (0, 0, 0)
     flanking = np.asarray(flanking, dtype=int) // 2
+    chr_len = len(chromosome_coverage)
     mus = []
     variances = []
     pis = []
@@ -333,9 +334,10 @@ def check_window(coord_start, coord_end, mu_peak, var_peak, pi_peak, chromosome_
         qsr = coord_end + 1
         qer = coord_end + f
         bg, x = iqr_obj.remove_peaks_in_local_env(stat_tester=stat_tester, bed_handler=sp_bed_handler,
-                                                  chromosome=chromosome_name, query_start_left=qsl,
-                                                  query_end_left=qel, query_start_right=qsr,
-                                                  query_end_right=qer, small_window_threshold=small_window_threshold,
+                                                  chromosome=chromosome_name, query_start_left=max(qsl, 0),
+                                                  query_end_left=max(qel, 0), query_start_right=min(qsr, chr_len),
+                                                  query_end_right=min(qer, chr_len),
+                                                  small_window_threshold=small_window_threshold,
                                                   peak_in_bg_threshold=peak_in_bg_threshold,
                                                   coverage_info=chromosome_coverage,
                                                   fdr_target=fdr_target, cache=cache,

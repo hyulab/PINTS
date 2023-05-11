@@ -148,7 +148,7 @@ def RPM_normalization(bam_files, exp_type, output_dir, rc=False, **kwargs):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("-m", "--method", help="Normalization method, acceptable values: RPM or Spikein")
     parser.add_argument("-b", "--bam", nargs="+", required=True)
     parser.add_argument("-f", "--fasta-spike-in")
