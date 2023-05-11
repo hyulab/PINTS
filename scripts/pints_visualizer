@@ -147,11 +147,11 @@ def coverage_dict_to_bigwig(pl_dict, mn_dict, output_pref, normalization_factor=
     if rpm_normalization:
         logger.info("%d reads passed filter" % (pl_sum + mn_sum))
         rpm_scale = 1000 * 1000 / (pl_sum + mn_sum)
-        logger.info("RPM normalizing (forward strand)")
+        logger.info("RPM normalizing (forward strand) with scale factor {:.3f}".format(rpm_scale))
         pl_ranges[3] = (np.asarray(pl_ranges[3]) * rpm_scale).tolist()
         logger.info("Done: RPM normalizing (forward strand)")
 
-        logger.info("RPM normalizing (reverse strand)")
+        logger.info("RPM normalizing (reverse strand) with scale factor {:.3f}".format(rpm_scale))
         # mn_ranges.Score *= rpm_scale
         mn_ranges[3] = (np.asarray(mn_ranges[3]) * rpm_scale).tolist()
         logger.info("Done: RPM normalizing (reverse strand)")
@@ -241,7 +241,7 @@ def bam_to_bigwig(bam_file, exp_type, output_pref, normalization_factor, rpm=Fal
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("-b", "--bam", action="store", required=True)
     parser.add_argument("-e", "--exp-type", action="store", default=None, dest="bam_parser",
                         help="Type of experiment, acceptable values are: CoPRO/GROcap/GROseq/PROcap/PROseq, or if you "
