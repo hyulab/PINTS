@@ -33,7 +33,8 @@ logger = logging.getLogger("PINTS - Caller")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Peak Identifier for Nascent Transcripts Starts")
+    parser = argparse.ArgumentParser(description="Peak Identifier for Nascent Transcripts Starts",
+                                     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     group = parser.add_argument_group("Input/Output")
     group.add_argument("--bam-file", action="store", dest="bam_file", nargs="*",
                        type=str, required=False,
@@ -125,7 +126,7 @@ if __name__ == "__main__":
                        help="If --annotation-gtf is specified, you use this parameter to change which chromosome the "
                             "tool should learn the values from.")
     group.add_argument("--alpha", "--donor-tolerance", action="store", dest="donor_tolerance",
-                       type=float, required=False, default=0.3, 
+                       type=float, required=False, default=0.3,
                        help="The stringency for PINTS to cluster nearby TSSs into a peak. 0 is the least stringent; "
                             "1 is the most stringent.")
     group.add_argument("--ce-trigger", action="store", dest="ce_trigger",
@@ -175,7 +176,7 @@ if __name__ == "__main__":
                        help="Refine peak calls with compiled epigenomic annotation from the PINTS web server."
                             " Values should be the name of the biosample, for example, K562.")
     group.add_argument("--relaxed-fdr-target", action="store", dest="relaxed_fdr_target", default=0.2,
-                       type=float, required=False, help="Relaxed FDR cutoff for TREs overlap with ")
+                       type=float, required=False, help="Relaxed FDR cutoff for TREs overlap with epigenomic annotations")
     group.add_argument("--chromosome-start-with", action="store", dest="chromosome_startswith",
                        type=str, required=False, default="chr",
                        help="Only keep reads mapped to chromosomes with this prefix")

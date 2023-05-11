@@ -42,7 +42,8 @@ logger = logging.getLogger("PINTS - BoundaryExtender")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Element boundary refinement")
+    parser = argparse.ArgumentParser(description="Element boundary refinement",
+                                     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--bam-files", action="store", dest="bam_files", nargs="*",
                        type=str, required=False,
