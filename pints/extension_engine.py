@@ -2,7 +2,7 @@
 # coding=utf-8
 
 #  PINTS: Peak Identifier for Nascent Transcripts Starts
-#  Copyright (c) 2019-2022. Li Yao at the Yu Lab.
+#  Copyright (c) 2019-2023 Yu Lab.
 #
 #  This program is free software: you can redistribute it and/or modify
 #  it under the terms of the GNU General Public License as published by
@@ -17,7 +17,6 @@
 import os
 import sys
 import logging
-import warnings
 
 try:
     import numpy as np
@@ -28,7 +27,6 @@ try:
 except ImportError as e:
     missing_package = str(e).replace("No module named '", "").replace("'", "")
     sys.exit("Please install %s first!" % missing_package)
-warnings.filterwarnings("error")
 
 logger = logging.getLogger("PINTS - BoundaryExtender")
 __EXTENDED_FILE_TPL__ = "_element_{de_tag}bp.bed"
