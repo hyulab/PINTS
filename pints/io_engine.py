@@ -2,7 +2,7 @@
 # coding=utf-8
 #
 # PINTS: Peak Identifier for Nascent Transcripts Starts
-# Copyright (C) 2019-2023 Yu Lab.
+# Copyright (C) 2019-2024 Yu Lab.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -101,7 +101,10 @@ def _get_coverage_bw(bw_file, chromosome_startswith, output_dir, output_prefix):
             fn = os.path.join(output_dir, "%s_%s" % (output_prefix, chromosome))
             chromosome_coverage[chromosome] = fn + ".npy"
             if not os.path.exists(chromosome_coverage[chromosome]):
-                _chromosome_cov = np.nan_to_num(bw.values(chromosome, 0, csize))
+                if pyBigWig.numpy:
+                    _chromosome_cov = np.nan_to_num(bw.values(chromosome, 0, csize, numpy=True))
+                else:
+                    _chromosome_cov = np.nan_to_num(bw.values(chromosome, 0, csize))
                 _chromosome_cov[_chromosome_cov < 0] *= -1
                 _chromosome_cov = _chromosome_cov.astype(data_type, copy=False)
                 np.save(fn, _chromosome_cov)
@@ -422,7 +425,7 @@ def get_read_signal(input_bam, loc_prime, chromosome_startswith, output_dir, out
     if loc_prime in supported_protocols:
         read_num, read_end, fw_rv = supported_protocols[loc_prime].split("_")
         loc_prime = "%s_%s" % (read_num, read_end)
-        reverse_complement = bool(fw_rv!="f")
+        reverse_complement = bool(fw_rv != "f")
     log_assert(loc_prime in ("R_5", "R_3", "R1_5", "R1_3", "R2_5", "R2_3"),
                "library_type must be R1_5, R1_3, R2_5 or R2_3. Current value: {0}".format(loc_prime), logger)
     library_layout, interested_end = loc_prime.split("_")
@@ -710,7 +713,8 @@ def index_bed_file(file_path, logger=None):
     else:
         log_assert(os.path.exists(file_path), "Bed file {} cannot be located".format(file_path), logger)
     # compress and index
-    BedTool(file_path).tabix(force=True)
+    fn = BedTool(file_path).bgzip(in_place=True, force=True)
+    pysam.tabix_index(fn, preset="bed" if fn.find("bed") != -1 else "gff", force=True, csi=True)
     # remove original file
     os.remove(file_path)
 

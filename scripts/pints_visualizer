@@ -2,7 +2,7 @@
 # coding=utf-8
 
 #  PINTS: Peak Identifier for Nascent Transcripts Starts
-#  Copyright (c) 2019-2023 Yu Lab.
+#  Copyright (c) 2019-2024 Yu Lab.
 #
 #  This program is free software: you can redistribute it and/or modify
 #  it under the terms of the GNU General Public License as published by
