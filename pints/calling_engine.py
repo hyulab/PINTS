@@ -1870,9 +1870,9 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
 
     for rep, pl_cov_dict in enumerate(chromosome_coverage_pl):
         housekeeping_files.append(sample_prefix + "_pl.bed.gz")
-        housekeeping_files.append(sample_prefix + "_pl.bed.gz.tbi")
+        housekeeping_files.append(sample_prefix + "_pl.bed.gz.csi")
         housekeeping_files.append(sample_prefix + "_mn.bed.gz")
-        housekeeping_files.append(sample_prefix + "_mn.bed.gz.tbi")
+        housekeeping_files.append(sample_prefix + "_mn.bed.gz.csi")
 
         logger.info("Finished on sample %d" % (rep + 1))
         logger.info("Divergent peaks were saved to %s" % sample_prefix + "_divergent_peaks.bed")
