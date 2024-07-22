@@ -2,7 +2,7 @@
 # coding=utf-8
 
 #  PINTS: Peak Identifier for Nascent Transcripts Starts
-#  Copyright (c) 2019-2023 Yu Lab.
+#  Copyright (c) 2019-2024 Yu Lab.
 #
 #  This program is free software: you can redistribute it and/or modify
 #  it under the terms of the GNU General Public License as published by
@@ -674,7 +674,7 @@ def check_window_chromosome(rc_file, output_file, strand_sign, chromosome_name, 
 
         index_bed_file(subpeak_bed, logger=logger)
 
-        bed_handler = pysam.TabixFile(subpeak_bed + ".gz")
+        bed_handler = pysam.TabixFile(subpeak_bed + ".gz", index=subpeak_bed + ".gz.csi")
         if len(all_peak_mus) == 0:
             peak_threshold = 1
             bkg_mu_threshold = 0
@@ -861,7 +861,7 @@ def stratified_filtering(tmp_df, output_file, fdr_target, dry_run=False, **kwarg
 
                     if tpt_suggestion is None:
                         tpt_suggestion = 1
-                    with open(fn+".tpt", "w") as fh:
+                    with open(fn + ".tpt", "w") as fh:
                         fh.write(str(tpt_suggestion))
         else:
             result_df = tmp_df_bg
@@ -966,7 +966,7 @@ def merge_opposite_peaks(sig_peak_bed, peak_candidate_bed, divergent_output_bed,
     -------
 
     """
-    tbx = pysam.TabixFile(peak_candidate_bed)
+    tbx = pysam.TabixFile(peak_candidate_bed, index=peak_candidate_bed + ".csi")
     fh = open(sig_peak_bed, "r")
     div_fh = open(divergent_output_bed, "w")
     bid_fh = open(bidirectional_output_bed, "w")
@@ -1533,7 +1533,7 @@ def on_the_fly_qc(output_prefix, min_mu_percent, top_peak_threshold, significant
                     )
             )
             info_msgs.append(msg)
-        
+
     tpt_values = []
     for tpt_file in glob("{}*.tpt".format(output_prefix)):
         housekeeping_files.append(tpt_file)
@@ -1748,7 +1748,7 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
 
             if target_dict[chromosome] is not None:
                 housekeeping_files.append(target_dict[chromosome])
-                housekeeping_files.append(target_dict[chromosome] + ".tbi")
+                housekeeping_files.append(target_dict[chromosome] + ".csi")
 
     parse_input_files(output_dir=output_dir, output_prefix="ct_" + output_prefix, filters=filters,
                       pl_cov_target=input_coverage_pl, mn_cov_target=input_coverage_mn,
@@ -1870,9 +1870,9 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
 
     for rep, pl_cov_dict in enumerate(chromosome_coverage_pl):
         housekeeping_files.append(sample_prefix + "_pl.bed.gz")
-        housekeeping_files.append(sample_prefix + "_pl.bed.gz.tbi")
+        housekeeping_files.append(sample_prefix + "_pl.bed.gz.csi")
         housekeeping_files.append(sample_prefix + "_mn.bed.gz")
-        housekeeping_files.append(sample_prefix + "_mn.bed.gz.tbi")
+        housekeeping_files.append(sample_prefix + "_mn.bed.gz.csi")
 
         logger.info("Finished on sample %d" % (rep + 1))
         logger.info("Divergent peaks were saved to %s" % sample_prefix + "_divergent_peaks.bed")

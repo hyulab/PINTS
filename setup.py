@@ -15,7 +15,7 @@ setup(
                       "pybedtools>=0.8.1", "statsmodels>=0.12.1", "pyBigWig", "biopython", "matplotlib"),
     extras_require={},
     scripts=["scripts/pints_caller", "scripts/pints_normalizer", "scripts/pints_visualizer",
-             "scripts/pints_boundary_extender"],
+             "scripts/pints_boundary_extender", "scripts/pints_counter", "scripts/pints_sample_qc"],
     url="https://pints.yulab.org",
     license="GPL",
     author="Li Yao",
