@@ -150,7 +150,30 @@ def get_coverage_bw(bw_pl, bw_mn, chromosome_startswith, output_dir, output_pref
     logger = logging.getLogger(__logger_name__)
     pl, pc = _get_coverage_bw(bw_pl, chromosome_startswith, output_dir, output_prefix + "_pl")
     mn, mc = _get_coverage_bw(bw_mn, chromosome_startswith, output_dir, output_prefix + "_mn")
-    log_assert(pl.keys() == mn.keys(), "bw_pl and bw_mn should have the same chromosomes", logger)
+
+    pl_chrs = set(pl.keys())
+    mn_chrs = set(mn.keys())
+
+    if pl_chrs != mn_chrs:
+        logger.warning("BW files do not have the same chromosomes. "
+                       "Only chromosomes appear in both files will be analysed.")
+        allowed_bws = pl_chrs.intersection(mn_chrs)
+        logger.info("Consistent chromosomes: %s" % sorted(allowed_bws))
+
+        def _clean(in_dict, whitelist):
+            adjust_counts = 0  # need to adjust the total read counts
+            static_keys = list(in_dict.keys())
+            for c in static_keys:
+                if c not in whitelist:
+                    adjust_counts += np.abs(np.nansum(np.load(in_dict[c])))
+                    os.remove(in_dict[c])
+                    del in_dict[c]
+            return adjust_counts
+
+        c0 = _clean(pl, allowed_bws)
+        pc -= c0
+        c1 = _clean(mn, allowed_bws)
+        mc -= c1
     return pl, mn, pc + mc
 
 
