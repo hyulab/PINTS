@@ -911,7 +911,7 @@ def peaks_single_strand(per_base_cov, output_file, shared_peak_definitions, stra
                      kwargs.get("enable_eler", True), kwargs.get("eler_lower_bound", 1.)))
         housekeeping_files.append(merged_name)
         housekeeping_files.append(sub_peaks_name + ".gz")
-        housekeeping_files.append(sub_peaks_name + ".gz.tbi")
+        housekeeping_files.append(sub_peaks_name + ".gz.csi")
 
     if kwargs.get("thread_n", 1) == 1:
         # for debugging
