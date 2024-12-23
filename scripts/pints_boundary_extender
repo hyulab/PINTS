@@ -29,7 +29,6 @@ try:
 except ImportError as e:
     missing_package = str(e).replace("No module named '", "").replace("'", "")
     sys.exit("Please install %s first!" % missing_package)
-warnings.filterwarnings("error")
 
 DEFAULT_PREFIX = str(os.getpid())
 logging.basicConfig(format="%(name)s - %(asctime)s - %(levelname)s: %(message)s",
