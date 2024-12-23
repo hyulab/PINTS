@@ -84,12 +84,12 @@ def main(input_file, layout, div_file, bid_file, single_file, divergent_extensio
     bid = bid.loc[np.logical_or(bid[0].isin(pl), bid[0].isin(mn)), :]
     single = pd.read_csv(single_file, sep="\t", header=None)
     single = single.loc[np.logical_or(single[0].isin(pl), single[0].isin(mn)), :]
-    div["pl_summit"] = 0
-    div["mn_summit"] = 0
+    div["pl_summit"] = "0"
+    div["mn_summit"] = "0"
     div["element_start"] = 0
     div["element_end"] = 0
-    bid["pl_summit"] = 0
-    bid["mn_summit"] = 0
+    bid["pl_summit"] = "0"
+    bid["mn_summit"] = "0"
     single["summit"] = 0
     for chromosome in pl:
         pl_cov = np.load(pl[chromosome], allow_pickle=True)
@@ -171,10 +171,6 @@ def main(input_file, layout, div_file, bid_file, single_file, divergent_extensio
     bid.to_csv(bid_file.replace(".bed", __EXTENDED_FILE_TPL__.format(de_tag=de_tag)), sep="\t", index=False,
                header=False)
     single_obj = BedTool(single.to_csv(sep="\t", index=False, header=False), from_string=True)
-    # div_obj = BedTool(div.to_csv(sep="\t", index=False, header=False), from_string=True)
-    # bid_obj = BedTool(bid.to_csv(sep="\t", index=False, header=False), from_string=True)
-    # single_obj = single_obj.intersect(div_obj, v=True)
-    # single_obj = single_obj.intersect(bid_obj, v=True)
 
     if promoter_bed is not None:
         promoter_bed_obj = BedTool(promoter_bed)
