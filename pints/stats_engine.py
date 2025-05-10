@@ -3,8 +3,8 @@
 # Created by: Li Yao (ly349@cornell.edu)
 # Created on: 2019-08-07
 #
-# PINTS: Peak Identifier for Nascent Transcripts Starts
-# Copyright (C) 2019-2024 Yu Lab.
+# PINTS: Peak Identifier for Nascent Transcript Starts
+# Copyright (C) 2019-2025 Yu Lab.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -20,7 +20,7 @@ import sys
 try:
     import pysam
     import numpy as np
-    from scipy.stats import poisson, fisher_exact, nbinom
+    from scipy.stats import poisson, chi2
     from scipy.special import gamma, digamma, polygamma, gammaln, psi, factorial
     from scipy.optimize import fmin_l_bfgs_b as BFGS
     from abc import ABC, abstractmethod
@@ -28,7 +28,6 @@ try:
 except ImportError as e:
     missing_package = str(e).replace("No module named '", "").replace("'", "")
     sys.exit("Please install %s first!" % missing_package)
-
 
 __CACHE_KEY_FORMAT__ = "%d-%d"
 
@@ -87,6 +86,10 @@ class StatModel(ABC):
 
     @abstractmethod
     def sf(self, peak_mu, peak_var, peak_pi, le_mu, le_var, le_pi):
+        pass
+
+    @abstractmethod
+    def lrt(self, group_1_obs, group_2_obs):
         pass
 
 
@@ -150,6 +153,51 @@ class ZIP(StatModel):
 
         return lamb_mo, pi_mo
 
+    @staticmethod
+    def _log_likelihood_core(count, count_numbers, pi, lamb):
+        smallest = np.finfo(float).eps
+        # estimate log likelihood
+        # compute the Poisson PMF scaled by the non-zero-inflation component (i.e., the "Poisson part").
+        u_pmf = (1 - pi) * poisson.pmf(count, lamb)
+        # handle the zero-inflation part correctly
+        u_pmf[np.where(count == 0)] += pi
+        u_pmf[u_pmf < self.infinitesimal] = smallest
+        likelihood = (np.log(u_pmf) * count_numbers).sum()
+        return likelihood
+
+    @staticmethod
+    def log_likelihood(observations, pi, lamb):
+        """
+        Compute the log-likelihood of a zero-inflated Poisson (ZIP) model
+        given observed count data.
+
+        Parameters
+        ----------
+        observations : array-like
+            A 1D array or list of observed count data (non-negative integers).
+        pi : float
+            The zero-inflation probability (0 <= pi <= 1), representing the probability
+            of structural zeros in the ZIP model.
+        lamb : float
+            The Poisson mean (lambda > 0) for the count-generating part of the model.
+
+        Returns
+        -------
+        float
+            The total log-likelihood of the observed data under the specified zero-inflated Poisson model.
+
+        Notes
+        -----
+            The ZIP model assumes that the probability mass function is:
+                P(X=0) = pi + (1 - pi) * exp(-lambda)
+                P(X=k) = (1 - pi) * Poisson(lambda) for k > 0
+
+        """
+        # extract unique observed values (e.g., 0, 1, 2, ...) and their frequencies
+        u_ele, c_ele = np.unique(observations, return_counts=True)
+        # estimate log likelihood
+        return ZIP._log_likelihood_core(u_ele, c_ele, pi, lamb)
+
     def fit(self, window):
         """
         EM for Zero-inflated Poisson
@@ -188,7 +236,6 @@ class ZIP(StatModel):
         pi = init_pi
         n_iter = 0
         hat_z = np.zeros(len(window))
-        smallest = np.finfo(float).eps
 
         if zs == 0:
             m = window.mean()
@@ -206,10 +253,7 @@ class ZIP(StatModel):
             indicator = 1 - hat_z
             lamb = (indicator * window).sum() / indicator.sum()
             # estimate likelihood
-            u_pmf = (1 - pi) * poisson.pmf(u_ele, lamb)
-            u_pmf[np.where(u_ele == 0)] += pi
-            u_pmf[u_pmf < smallest] = smallest
-            likelihood = (np.log(u_pmf) * c_ele).sum()
+            likelihood = ZIP._log_likelihood_core(u_ele, c_ele, pi, lamb)
             likelihoods.append(likelihood)
             if n_iter > 0:
                 if abs(likelihood - prev_likelihood) < self.stop_diff:
@@ -225,6 +269,55 @@ class ZIP(StatModel):
                     return lamb, lamb, pi, likelihood, False
             prev_likelihood = likelihood
             n_iter += 1
+
+    def lrt(self, group_1_obs, group_2_obs):
+        """
+        Perform a likelihood ratio test (LRT) to compare two zero-inflated Poisson populations.
+
+        This method tests the null hypothesis that both groups share the same
+        ZIP parameters (lambda and pi) versus the alternative that each group
+        has its own parameters.
+
+        Parameters
+        ----------
+        group_1_obs : array-like
+            Observed count data for group 1 (non-negative integers).
+        group_2_obs : array-like
+            Observed count data for group 2 (non-negative integers).
+
+        Returns
+        -------
+        statistic : float
+            The LRT statistic, computed as:
+                W = 2 * (logL_group1 + logL_group2 - logL_pooled)
+        p_value : float
+            The p-value from the chi-square distribution with 2 degrees of freedom.
+        """
+        # convert input to NumPy arrays for consistent numerical operations
+        group_1_obs = np.asarray(group_1_obs)
+        group_2_obs = np.asarray(group_2_obs)
+
+        # estimate ZIP parameters for each group using self.fit()
+        lamb1, _, pi1, _, _ = self.fit(group_1_obs)
+        lamb2, _, pi2, _, _ = self.fit(group_2_obs)
+
+        # compute log-likelihoods under the unrestricted model (each group has its own params)
+        loglik1 = ZIP.log_likelihood(group_1_obs, pi1, lamb1)
+        loglik2 = ZIP.log_likelihood(group_2_obs, pi2, lamb2)
+
+        # combine both groups and fit a common ZIP model (under H0)
+        merged_obs = np.concatenate((group_1_obs, group_2_obs))
+        lamb0, _, pi0, _, _ = self.fit(np.asarray(merged_obs))
+
+        # compute log-likelihood under the null hypothesis (shared parameters)
+        loglik_null = ZIP.log_likelihood(merged_obs, pi0, lamb0)
+
+        # likelihood ratio test statistic
+        statistic = 2 * (loglik1 + loglik2 - loglik_null)
+
+        # compute p-value from chi-square distribution with 2 degrees of freedom
+        p_value = chi2.sf(statistic, df=2)
+        return statistic, p_value
 
     @staticmethod
     def zip_cdf(x, pi, lambda_):
@@ -728,7 +821,7 @@ def get_elbow(X, Y):
     p2 = np.array([X_s[-1], Y_s[-1]])
     P3 = np.column_stack((X_s, Y_s))
 
-    D = np.abs(np.cross(p2-p1, P3-p1) / np.linalg.norm(p2-p1))
+    D = np.abs(np.cross(p2 - p1, P3 - p1) / np.linalg.norm(p2 - p1))
     tmp = np.where(D == np.nanmax(D))[0]
     if len(tmp) > 0:
         midx = tmp[-1]

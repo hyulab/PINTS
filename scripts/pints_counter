@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 # coding=utf-8
 
-#  PINTS: Peak Identifier for Nascent Transcripts Starts
-#  Copyright (c) 2019-2024 Yu Lab.
+#  PINTS: Peak Identifier for Nascent Transcript Starts
+#  Copyright (c) 2019-2025 Yu Lab.
 #
 #  This program is free software: you can redistribute it and/or modify
 #  it under the terms of the GNU General Public License as published by
@@ -31,7 +31,7 @@ pints_de -b C1_1_bidirectional_peaks.bed C2_1_bidirectional_peaks.bed \
 """
 
 
-def prepare_regions(primary_regions, additional_regions=None, min_dist=0):
+def prepare_regions(primary_regions, additional_regions=None, max_dist=0):
     """
     Prepare regions based on primary and additional regions in each library.
 
@@ -41,7 +41,7 @@ def prepare_regions(primary_regions, additional_regions=None, min_dist=0):
         A list/tuple of primary regions (e.g. bidirectional peaks)
     additional_regions : Optional[Sequence[str]]
         A list/tuple of additional regions (e.g. unidirectional peaks)
-    min_dist : int
+    max_dist : int
         Maximum distance between features allowed for features to be merged.
         Default is 0 (overlapping & book-ended features are merged.)
 
@@ -56,7 +56,7 @@ def prepare_regions(primary_regions, additional_regions=None, min_dist=0):
     merged_regions = pybedtools.BedTool.cat(
         *[pybedtools.BedTool(f) for f in all_files], postmerge=False
     ).sort().merge(
-        d=min_dist).saveas()
+        d=max_dist).saveas()
     return merged_regions
 
 
@@ -143,7 +143,7 @@ norm_counts <- counts(dds, normalized=TRUE)
 
 def main(bidirectional_calls, pl_bws, conditions, replications, save_to,
          unidirectional_calls=None, mn_bws=None, condition_names=None,
-         print_deseq2=True):
+         max_dist=0, print_deseq2=True):
     """
 
     Parameters
@@ -170,6 +170,8 @@ def main(bidirectional_calls, pl_bws, conditions, replications, save_to,
         Signal files for the reverse strand
     condition_names : Optional[Sequence[str]]
         Names of conditions
+    max_dist : int
+        Maximum distance between TRES allowed for TREs to be merged.
     print_deseq2 : bool
         Print boilerplate for running DESeq2
 
@@ -200,7 +202,7 @@ def main(bidirectional_calls, pl_bws, conditions, replications, save_to,
         condition_names = ["Cond{}".format(i) for i in range(1, per_sample_conditions[0] + 1)]
 
     # actual logic
-    union_of_regions = prepare_regions(bidirectional_calls, unidirectional_calls)
+    union_of_regions = prepare_regions(bidirectional_calls, unidirectional_calls, max_dist=max_dist)
     labels = ["{}_{}".format(c, replications[i]) for i, c in enumerate(conditions)]
     counts_mat_dict = dict()
 
@@ -236,6 +238,11 @@ if __name__ == "__main__":
     parser.add_argument("-r", "--replicates", nargs="+", type=int, required=True,
                         help="Ordinal numbers of replications. For example, if you have three replicates for condA, "
                              "you need to type `1 2 3` here.")
+    parser.add_argument("--max-dist", type=int, required=False, default=0,
+                        help="Maximum distance between TRES allowed for TREs to be merged. "
+                             "Default 0: overlapping & book-ended features are merged. "
+                             "Negative values enforce the number of b.p. required for overlap. "
+                             "See bedtools manual for more details.")
     parser.add_argument("-s", "--save-to", type=str, required=True)
     parser.add_argument("-d", "--deseq2", action="store_true",
                         help="Generate R code for using DESeq2 to identify differentially expressed peaks")
