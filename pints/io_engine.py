@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 # coding=utf-8
-#
-# PINTS: Peak Identifier for Nascent Transcripts Starts
-# Copyright (C) 2019-2024 Yu Lab.
+
+#  PINTS: Peak Identifier for Nascent Transcript Starts
+#  Copyright (C) 2019-2025 Yu Lab.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -21,6 +21,7 @@ import gzip
 import numpy as np
 import pandas as pd
 from collections import defaultdict
+from functools import reduce
 
 NP_DT_RANGE = (127, 32767, 2147483647, 9223372036854775807)
 NP_DT_NAME = (np.int8, np.int16, np.int32, np.int64)
@@ -51,6 +52,14 @@ def log_assert(bool_, message, logger):
     except AssertionError as err:
         logger.error("%s" % err)
         sys.exit(1)
+
+
+def determine_data_type(max_value):
+    data_type = np.int32
+    for k, v in enumerate(NP_DT_RANGE):
+        if v > max_value:
+            return NP_DT_NAME[k]
+    return data_type
 
 
 def _get_coverage_bw(bw_file, chromosome_startswith, output_dir, output_prefix):
@@ -86,12 +95,8 @@ def _get_coverage_bw(bw_file, chromosome_startswith, output_dir, output_prefix):
     chromosome_pre_accessible_dict = {}
     chromosome_reads_dict = {}
 
-    data_type = np.int32
     bw_max = max(abs(bw.header()["maxVal"]), abs(bw.header()["minVal"]))
-    for k, v in enumerate(NP_DT_RANGE):
-        if v > bw_max:
-            data_type = NP_DT_NAME[k]
-            break
+    data_type = determine_data_type(bw_max)
 
     chrom_size_list = []
     read_counts = 0
@@ -926,3 +931,97 @@ def peak_bed_to_gtf(pl_df, mn_df, save_to, version=""):
                                                  index=False,
                                                  header=False)
     index_bed_file(save_to)
+
+
+def merge_replicates_bw(per_sample_coverage_pls, per_sample_coverage_mns, output_dir, output_prefix):
+    """
+    Merge replicate files for 'plus' and 'minus' strand coverage into a consolidated format and save the
+    merged data to disk. This function processes chromosome-specific coverage files for each replicate,
+    merging them into a single file per chromosome. It returns the paths of the merged files and the
+    combined read counts for both 'plus' and 'minus' strands.
+
+    Parameters
+    ----------
+    per_sample_coverage_pls : list of dict
+        List of dictionaries representing the file paths for 'plus' strand coverage per sample. Each
+        dictionary contains chromosome-specific file paths for a given replicate.
+    per_sample_coverage_mns : list of dict
+        List of dictionaries representing the file paths for 'minus' strand coverage per sample. Each
+        dictionary contains chromosome-specific file paths for a given replicate.
+    output_dir : str
+        Directory where the merged chromosome files will be saved.
+    output_prefix : str
+        Prefix to append to the filenames of the merged chromosome-specific files.
+
+    Returns
+    -------
+    tuple
+        A tuple containing the following:
+        - merged_pl : dict
+            Dictionary where keys are chromosome names and values are paths to the merged 'plus' strand
+            coverage files.
+        - merged_mn : dict
+            Dictionary where keys are chromosome names and values are paths to the merged 'minus' strand
+            coverage files.
+        - pl_rc : int
+            Total read count for the 'plus' strand after merging all replicates.
+        - mn_rc : int
+            Total read count for the 'minus' strand after merging all replicates.
+
+    Raises
+    ------
+    ValueError
+        If the number of replicates for 'plus' and 'minus' strands are not equal.
+        If the input lists of replicates are empty (no data to merge).
+
+    Notes
+    -----
+    1. Ensure that all input dictionaries in `per_sample_coverage_pls` and `per_sample_coverage_mns`
+       have the same chromosomes.
+    2. The merged output files are stored in the specified `output_dir` using NumPy arrays with
+       appropriate data types determined from the maximum values in the merged data.
+    """
+    merged_pl = {}
+    merged_mn = {}
+    pl_rc = 0
+    mn_rc = 0
+
+    shared_chromosomes = reduce(set.intersection, (set(d.keys()) for d in per_sample_coverage_pls+per_sample_coverage_mns))
+
+    if len(per_sample_coverage_pls) != len(per_sample_coverage_mns):
+        raise ValueError("Number of replicates for pl and mn must be the same")
+
+    def merge_chromosome_data(sample_data_list, chromosome):
+        merged = np.load(sample_data_list[0][chromosome]).astype(np.int32)
+        for replicate in sample_data_list[1:]:
+            merged += np.load(replicate[chromosome])
+        return merged
+
+    # no need to merge if there is only one replicate
+    if len(per_sample_coverage_pls) == 1:
+        merged_pl = per_sample_coverage_pls[0]
+        merged_mn = per_sample_coverage_mns[0]
+    elif len(per_sample_coverage_pls) == 0:
+        raise ValueError("Number of replicates for pl and mn must be greater than 1.")
+    else:
+        for chrom in shared_chromosomes:
+            # merge data
+            merged_pl_data = merge_chromosome_data(per_sample_coverage_pls, chrom)
+            pl_rc += np.sum(merged_pl_data)
+            merged_mn_data = merge_chromosome_data(per_sample_coverage_mns, chrom)
+            mn_rc += np.sum(merged_mn_data)
+
+            # merged file paths
+            pl_fn = os.path.join(output_dir, "%s_pl_%s.npy" % (output_prefix, chrom))
+            mn_fn = os.path.join(output_dir, "%s_mn_%s.npy" % (output_prefix, chrom))
+
+            merged_pl[chrom] = pl_fn
+            merged_mn[chrom] = mn_fn
+
+            # dump data with appropriate data types
+            data_type = determine_data_type(np.max(merged_pl_data))
+            np.save(pl_fn, merged_pl_data.astype(data_type, copy=False))
+
+            data_type = determine_data_type(np.max(merged_mn_data))
+            np.save(mn_fn, merged_mn_data.astype(data_type, copy=False))
+    return merged_pl, merged_mn, pl_rc, mn_rc
