@@ -1,4 +1,4 @@
-#  PINTS: Peak Identifier for Nascent Transcripts Starts
+#  PINTS: Peak Identifier for Nascent Transcript Starts
 #  Copyright (c) 2019-2023 Yu Lab.
 #
 #  This program is free software: you can redistribute it and/or modify

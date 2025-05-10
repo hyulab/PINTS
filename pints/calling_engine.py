@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 # coding=utf-8
 
-#  PINTS: Peak Identifier for Nascent Transcripts Starts
-#  Copyright (c) 2019-2024 Yu Lab.
+#  PINTS: Peak Identifier for Nascent Transcript Starts
+#  Copyright (c) 2019-2025 Li Yao at the Yu Lab.
 #
 #  This program is free software: you can redistribute it and/or modify
 #  it under the terms of the GNU General Public License as published by
@@ -22,7 +22,6 @@ import sys
 from collections import namedtuple
 from glob import glob
 from multiprocessing import Pool
-
 
 logging.basicConfig(format="%(name)s - %(asctime)s - %(levelname)s: %(message)s",
                     datefmt="%d-%b-%y %H:%M:%S",
@@ -45,7 +44,7 @@ try:
     from .stats_engine import Poisson, ZIP, pval_dist, bgIQR, pkIQR, \
         independent_filtering, get_elbow
     from .io_engine import get_read_signal, get_coverage_bw, log_assert, normalize_using_input, \
-        index_bed_file, peak_bed_to_gtf
+        index_bed_file, peak_bed_to_gtf, merge_replicates_bw
     from pints import __version__
 except ImportError as e:
     missing_package = str(e).replace("No module named '", "").replace("'", "")
@@ -315,18 +314,24 @@ def check_window(coord_start, coord_end, mu_peak, var_peak, pi_peak, chromosome_
         pi for local env
     ler_counts : int
         # of local peaks masked by LER
+    lrt_pval : float
+        P-value from LRT test
+    sig_dens : float
+        Signal density
     """
     selected_window = chromosome_coverage[coord_start:coord_end]
     window_value = np.sum(selected_window)
+    sig_dens = (selected_window > 0).sum() / (coord_end - coord_start)
     if coord_end - coord_start < small_window_threshold \
             or window_value == 0:
-        return 1., window_value, 0, 0, (0, 0, 0)
+        return 1., window_value, 0., 0., (0, 0, 0), 1., sig_dens
     flanking = np.asarray(flanking, dtype=int) // 2
     chr_len = len(chromosome_coverage)
     mus = []
     variances = []
     pis = []
     ler_counts = []
+    lrt_pvals = []
     for f in flanking:
         qsl = coord_start - f
         qel = coord_start - 1
@@ -345,6 +350,8 @@ def check_window(coord_start, coord_end, mu_peak, var_peak, pi_peak, chromosome_
                                                   peak_threshold=top_peak_mu)
 
         mu_, var_, pi_, _, _ = stat_tester.fit(bg)
+        w, pval = stat_tester.lrt(selected_window, bg)
+        lrt_pvals.append(pval)
         mus.append(mu_)
         variances.append(var_)
         pis.append(pi_)
@@ -358,7 +365,7 @@ def check_window(coord_start, coord_end, mu_peak, var_peak, pi_peak, chromosome_
 
     pvalue = stat_tester.sf(mu_peak, var_peak, pi_peak, mu_0, var_0, pi_0)
 
-    return pvalue, window_value, mu_0, pi_0, ler_counts
+    return pvalue, window_value, mu_0, pi_0, ler_counts, np.mean(lrt_pvals), sig_dens
 
 
 def quasi_max_score_segment(candidates, donor_tolerance, ce_trigger, max_distance):
@@ -606,7 +613,8 @@ def cut_peaks(window, donor_tolerance, ce_trigger, join_distance=1, peak_rel_hei
 
 def check_window_chromosome(rc_file, output_file, strand_sign, chromosome_name, subpeak_file, fdr_target,
                             small_peak_threshold=5, min_mu_percent=0.1, disable_qc=False,
-                            disable_ler=False, enable_eler=True, eler_min=1.):
+                            disable_ler=False, enable_eler=True, eler_min=1., sensitive=False,
+                            fc_cutoff=1.5, init_dens_cutoff=0.25, init_height_cutoff=4):
     """
     Evaluate windows on a chromosome
 
@@ -636,6 +644,15 @@ def check_window_chromosome(rc_file, output_file, strand_sign, chromosome_name, 
         Set it as False to disable enhanced LER
     eler_min : float
         Only consider peaks with density equal to or greater than this value when performing ELER calibration.
+    sensitive : bool
+        Use LRT for more sensitive peak testing
+    fc_cutoff : float
+        Fold-change cutoff to enable likelihood-ratio test
+    init_dens_cutoff : float
+        Peaks with fewer initiation locations than this fraction will not undergo LRT testing
+    init_height_cutoff : float
+        Peaks with initiation summit lower than this value will not undergo LRT testing
+
     Returns
     -------
     result_df : pd.DataFrame
@@ -644,6 +661,10 @@ def check_window_chromosome(rc_file, output_file, strand_sign, chromosome_name, 
     global housekeeping_files
     per_base_cov = np.load(rc_file, allow_pickle=True)
     subpeak_bed = output_file.replace(".bed", __SUB_PEAK_TPL__ % chromosome_name)
+    if fc_cutoff > 0:
+        real_fc_cutoff = 1. / fc_cutoff
+    else:
+        real_fc_cutoff = 1.
     bins = []
     all_peak_mus = []
     try:
@@ -719,28 +740,27 @@ def check_window_chromosome(rc_file, output_file, strand_sign, chromosome_name, 
                 peak_start = int(candidate_peak[1])
                 peak_end = int(candidate_peak[2])
                 peak_id = candidate_peak[3]
-                peak_mu = float(candidate_peak[4])
+                mu_peak = float(candidate_peak[4])
                 peak_var = float(candidate_peak[5])
-                peak_pi = float(candidate_peak[7])
+                pi_peak = float(candidate_peak[7])
                 peak_non_zeros = int(candidate_peak[8])
                 peak_summit = int(candidate_peak[9])
                 peak_summit_val = int(candidate_peak[10])
 
-                pval, wv, mu_bg, pi_bg, lerc = check_window(coord_start=peak_start, coord_end=peak_end, mu_peak=peak_mu,
-                                                            var_peak=peak_var, pi_peak=peak_pi,
-                                                            chromosome_coverage=per_base_cov,
-                                                            peak_in_bg_threshold=peak_threshold,
-                                                            mu_bkg_minimum=bkg_mu_threshold, sp_bed_handler=bed_handler,
-                                                            chromosome_name=chromosome_name,
-                                                            fdr_target=fdr_target,
-                                                            cache=global_cache,
-                                                            disable_ler=disable_ler,
-                                                            enable_eler=enable_eler,
-                                                            top_peak_mu=empirical_true_peak_threshold)
+                pval, wv, mu_bg, pi_bg, lerc, lrtp, sig_dens = check_window(
+                    coord_start=peak_start, coord_end=peak_end, mu_peak=mu_peak,
+                    var_peak=peak_var, pi_peak=pi_peak, chromosome_coverage=per_base_cov,
+                    peak_in_bg_threshold=peak_threshold, mu_bkg_minimum=bkg_mu_threshold,
+                    sp_bed_handler=bed_handler, chromosome_name=chromosome_name,
+                    fdr_target=fdr_target, cache=global_cache, disable_ler=disable_ler,
+                    enable_eler=enable_eler, top_peak_mu=empirical_true_peak_threshold)
                 if wv > 0:
+                    use_lrt = sensitive and pi_peak > 0. and pi_bg > 0. and (
+                                mu_bg / mu_peak < real_fc_cutoff) and sig_dens > init_dens_cutoff and peak_summit_val > init_height_cutoff
                     bins.append(
-                        (chromosome_name, peak_start, peak_end, peak_id, pval, wv, mu_bg, pi_bg, peak_mu, peak_pi,
-                         peak_var, peak_summit, peak_summit_val, lerc[0], lerc[1], lerc[2], peak_non_zeros))
+                        (chromosome_name, peak_start, peak_end, peak_id, lrtp if use_lrt else pval,
+                         wv, mu_bg, pi_bg, mu_peak, pi_peak, peak_var, peak_summit, peak_summit_val,
+                         lerc[0], lerc[1], lerc[2], peak_non_zeros))
     except TypeError as ex:
         logger.error(str(chromosome_name) + "\t" + str(subpeak_file))
         logger.error(ex)
@@ -908,7 +928,9 @@ def peaks_single_strand(per_base_cov, output_file, shared_peak_definitions, stra
         args.append((pbc_npy, output_file, strand_sign, chrom, shared_peak_definitions[chrom], fdr_target,
                      kwargs.get("small_peak_threshold", 5), kwargs.get("min_mu_percent", 0.1),
                      kwargs.get("disable_qc", False), kwargs.get("disable_ler", False),
-                     kwargs.get("enable_eler", True), kwargs.get("eler_lower_bound", 1.)))
+                     kwargs.get("enable_eler", True), kwargs.get("eler_lower_bound", 1.),
+                     kwargs.get("sensitive", False), kwargs.get("fc_cutoff", 1.5),
+                     kwargs.get("init_dens_cutoff", 0.25), kwargs.get("init_height_cutoff", 4)))
         housekeeping_files.append(merged_name)
         housekeeping_files.append(sub_peaks_name + ".gz")
         housekeeping_files.append(sub_peaks_name + ".gz.csi")
@@ -961,7 +983,7 @@ def merge_opposite_peaks(sig_peak_bed, peak_candidate_bed, divergent_output_bed,
             Distance threshold for two peaks (on opposite strands) to be merged
         min_len_opposite_peaks : int
             Minimum length requirement for peaks on the opposite strand to be paired,
-            set it to 0 to loose this requirement
+            set it to 0 to lose this requirement
     Returns
     -------
 
@@ -1569,37 +1591,55 @@ def on_the_fly_qc(output_prefix, min_mu_percent, top_peak_threshold, significant
 
 
 def parse_input_files(output_dir, output_prefix, filters, pl_cov_target, mn_cov_target, rc_target,
-                      bam_files=None, bw_pl_files=None, bw_mn_files=None, **kwargs):
+                      bam_files=None, bw_pl_files=None, bw_mn_files=None, merge_replicates=False, **kwargs):
     """
-    Unified function for parsing input bam/bigwig files
+    Parses and processes input files for genomic coverage and read signal data. This function supports
+    various input types including BAM files and bigwig files, handles error checking, manages
+    chromosomal data filtering, and optionally merges replicate data.
 
     Parameters
     ----------
     output_dir : str
-        Path to write intermediate files
+        Directory where output files will be saved.
     output_prefix : str
-
-    filters : tuple/list/set
-
+        Prefix for output file names.
+    filters : dict
+        Dictionary containing filtering parameters for reads or coverage.
     pl_cov_target : list
-
+        List to store processed plus strand coverage data.
     mn_cov_target : list
-
+        List to store processed minus strand coverage data.
     rc_target : list
-
-    bam_files : list or None
-
-    bw_pl_files : list or None
-
-    bw_mn_files : list or None
-
-    kwargs
+        List to store read count data.
+    bam_files : list, optional
+        List of input BAM files for processing. Default is None.
+    bw_pl_files : list, optional
+        List of bigwig files representing plus strand coverage. Default is None.
+    bw_mn_files : list, optional
+        List of bigwig files representing minus strand coverage. Default is None.
+    merge_replicates : bool, optional
+        Flag indicating whether replicate data should be combined into a single dataset. Default is False.
+    **kwargs : dict, optional
+        Additional parameters for read signal parsing, such as 'bam_parser', 'chromosome_startswith',
+        or 'seq_rc'.
 
     Returns
     -------
-
+    None
+        Modifies pl_cov_target, mn_cov_target, and rc_target lists in-place.
     """
     global housekeeping_files
+
+    log_assert(
+        os.path.isdir(output_dir) and os.access(output_dir, os.W_OK),
+        "Output directory %s is not writable." % output_dir, logger
+    )
+
+    log_assert(
+        isinstance(pl_cov_target, list) and isinstance(mn_cov_target, list) and isinstance(rc_target, list),
+        "pl_cov_target, mn_cov_target, and rc_target must be lists.", logger
+    )
+
     if bam_files is not None:
         log_assert(kwargs.get("bam_parser", None) is not None,
                    "Please specify which type of experiment this data "
@@ -1609,6 +1649,7 @@ def parse_input_files(output_dir, output_prefix, filters, pl_cov_target, mn_cov_
             logger.info("Loading {0}...".format(bf))
             plc, mnc, rc = get_read_signal(input_bam=bf,
                                            loc_prime=kwargs["bam_parser"],
+                                           chromosome_startswith=kwargs.pop("chromosome_startswith", ""),
                                            reverse_complement=kwargs.get("seq_rc", False),
                                            output_dir=output_dir,
                                            output_prefix=output_prefix + "_%d" % i,
@@ -1640,6 +1681,18 @@ def parse_input_files(output_dir, output_prefix, filters, pl_cov_target, mn_cov_
             housekeeping_files.extend(plc.values())
             housekeeping_files.extend(mnc.values())
             logger.info("{0} and {1} loaded.".format(bw_pl, bw_mn_files[i]))
+
+    if merge_replicates and len(pl_cov_target) > 1:
+        pl_covs, mn_covs, pl_rc, mn_rc = merge_replicates_bw(pl_cov_target, mn_cov_target, output_dir,
+                                                             output_prefix + "_merged")
+        pl_cov_target[:] = pl_cov_target[:1]
+        mn_cov_target[:] = mn_cov_target[:1]
+        rc_target[:] = [pl_rc + mn_rc, ]
+        pl_cov_target[0] = pl_covs
+        mn_cov_target[0] = mn_covs
+        housekeeping_files.extend(pl_covs.values())
+        housekeeping_files.extend(mn_covs.values())
+        logger.info("Replicates merged")
 
 
 def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
