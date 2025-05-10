@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 # coding=utf-8
 
-#  PINTS: Peak Identifier for Nascent Transcripts Starts
-#  Copyright (c) 2019-2024 Yu Lab.
+#  PINTS: Peak Identifier for Nascent Transcript Starts
+#  Copyright (c) 2019-2025 Yu Lab.
 #
 #  This program is free software: you can redistribute it and/or modify
 #  it under the terms of the GNU General Public License as published by
@@ -82,6 +82,9 @@ if __name__ == "__main__":
                        required=False, default=False,
                        help="Set this switch if reads in this library represent the reverse complement of "
                             "RNAs, like PROseq")
+    group.add_argument("--dont-merge-reps", action="store_false", dest="merge_replicates",
+                       required=False, default=True,
+                       help="Don't merge replicates (this is the default setting for the previous versions)")
     group.add_argument("-f", "--filters", action="store", type=str, nargs="*", default=[],
                        help="reads from chromosomes whose names contain any matches in filters will be ignored")
 
@@ -109,7 +112,6 @@ if __name__ == "__main__":
                             "to run extra test")
     group.add_argument("--max-window-size", action="store", dest="window_size_threshold",
                        type=int, required=False, default=2000, help="max size of divergent windows")
-                       
     group.add_argument("--remove-sticks", action="store_false", dest="keep_sticks",
                        required=False, default=True,
                        help="Set this switch to remove stick-like peaks (signal on a single position)")
@@ -170,6 +172,17 @@ if __name__ == "__main__":
     group.add_argument("--disable-small", action="store_true", required=False, default=False,
                        help="Set this switch to prevent PINTS from reporting very short peaks"
                             "(shorter than --small-peak-threshold)")
+    group.add_argument("--sensitive", dest="sensitive", action="store_true", required=False,
+                       help="Set this switch to enable more sensitive peak calling")
+    group.add_argument("--fc", action="store", dest="fc_cutoff",
+                       type=float, required=False, default=1.5,
+                       help="When using the sensitive mode, this sets the cutoff for applying the likelihood ratio test.")
+    group.add_argument("--init-dens-cutoff", action="store", dest="init_dens_cutoff",
+                       type=float, required=False, default=0.25,
+                       help="Peaks with initiation density lower than this cutoff will not be tested in the sensitive mode.")
+    group.add_argument("--init-height-cutoff", action="store", dest="init_height_cutoff",
+                       type=int, required=False, default=4,
+                       help="Peaks with initiation summit lower than this cutoff will not be tested in the sensitive mode.")
 
     group = parser.add_argument_group("Other")
     group.add_argument("--epig-annotation", action="store", dest="epig_annotation", type=str, required=False,
@@ -178,7 +191,7 @@ if __name__ == "__main__":
     group.add_argument("--relaxed-fdr-target", action="store", dest="relaxed_fdr_target", default=0.2,
                        type=float, required=False, help="Relaxed FDR cutoff for TREs overlap with epigenomic annotations")
     group.add_argument("--chromosome-start-with", action="store", dest="chromosome_startswith",
-                       type=str, required=False, default="chr",
+                       type=str, required=False, default="",
                        help="Only keep reads mapped to chromosomes with this prefix")
     group.add_argument("--dont-output-chrom-size", action="store_false", dest="output_chrom_size",
                        required=False, default=True,

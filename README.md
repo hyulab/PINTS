@@ -1,4 +1,4 @@
-# PINTS: Peak Identifier for Nascent Transcripts Starts
+# PINTS: Peak Identifier for Nascent Transcript Starts
 
 ![Supported platforms](https://img.shields.io/badge/platform-linux%20%7C%20osx-lightgrey.svg)
 ![Supported Python versions](https://img.shields.io/badge/python-3.x-blue.svg)
@@ -31,7 +31,11 @@ PINTS can call peaks from either bigWig or BAM files. If you have signals for th
 two separate bigWig files (`path_to_pl.bw` and `path_to_mn.bw`), you can use command like the following to get the peaks:
 
 ```shell
-pints_caller --save-to output_dir --file-prefix output_prefix --bw-pl path_to_pl.bw --bw-mn path_to_mn.bw --thread 16
+pints_caller --save-to output_dir \
+  --file-prefix output_prefix \
+  --bw-pl path_to_pl.bw \
+  --bw-mn path_to_mn.bw \
+  --thread 16
 ```
 
 To call peaks from BAM files:
@@ -61,7 +65,11 @@ If reads represent the reverse complement of original RNAs, like PROseq, then yo
 One example for calling peaks from BAM file:
 
 ```shell
-pints_caller --bam-file input.bam --save-to output_dir --file-prefix output_prefix --thread 16 --exp-type PROcap
+pints_caller --bam-file input.bam \
+  --save-to output_dir \
+  --file-prefix output_prefix \
+  --thread 16 \
+  --exp-type PROcap
 ```
 
 > We have prepared several [case studies](https://pints.yulab.org/tre_calling) demonstrating steps 
@@ -130,25 +138,70 @@ For all three types of TREs, if a valid biosample name for `--epig-annotation` i
 
 ### Optional parameters
 
+* `--dont-merge-reps`: Starting with PINTS 1.2.x, the software automatically merges multiple replicates for a joint peak calling process. To call peaks individually for each sample, as in previous versions, use this option.
 * `--epig-annotation <biosample>`: Use this option together with the name of the biosample that the library was derived from, for example K562; then epigenomic annotations will be downloaded from the PINTS web server and used for annotating and augmenting TREs identified by PINTS **(for hg38 only)**;
 * `--relaxed-fdr-target <relaxed fdr>`: In the presence of `--epig-annotation`, peaks that do not pass the original FDR cutoff but pass this relaxed cutoff and have support from DNase-seq and H3K27ac ChIP-seq will also be included in final outputs. By default, 2*fdr;
 * `--mapq-threshold <min mapq>`: Minimum mapping quality, by default: 30 or `None`;
 * `--close-threshold <close distance>`: Distance threshold for two peaks (on opposite strands) to be merged, by default: 300;
 * `--fdr-target <fdr>`: FDR target for multiple testing, by default: 0.1;
-* `--chromosome-start-with <chromosome prefix>`: Only keep reads mapped to chromosomes with this prefix, if it's set to `None`, then all reads will be analyzed;
+* `--chromosome-start-with <chromosome prefix>`: Only keep reads mapped to chromosomes with this prefix. By default, all reads will be analyzed;
 * `--thread <n thread>`: Max number of threads the tool can create;
 * `--borrow-info-reps`: Borrow information from reps to refine calling of divergent elements;
-* `--output-diagnostic-plot`: Save diagnostic plots (independent filtering and pval dist) to local folder
+* `--sensitive`: Call peaks in a more sensitive mode (LRT+FC).
 
 More parameters can be seen by running `pints_caller -h`.
 
-## Other tools
+## Case Study: Identify Differentially Expressed TREs
+In this section, we try to identify differentially expressed TREs (promoters and enhancers) from two conditions.
+
+First, call peaks for each condition with `pints_caller`:
+```shell
+# control samples
+pints_caller --bw-pl DMSO_r1_pl.bw DMSO_r2_pl.bw \ 
+  --bw-mn DMSO_r1_mn.bw DMSO_r2_mn.bw \
+  --thread 16 --file-prefix DMSO
+# and treatment samples
+pints_caller --bw-pl E2_r1_pl.bw E2_r2_pl.bw \
+  --bw-mn E2_r1_mn.bw E2_r2_mn.bw \
+  --thread 16 --file-prefix E2
+```
+
+Second, build the counts table with `pints_counter`:
+```shell
+pints_counter -b DMSO_1_bidirectional_peaks.bed E2_1_bidirectional_peaks.bed \ 
+  -u DMSO_1_unidirectional_peaks.bed E2_1_unidirectional_peaks.bed \
+  -p DMSO_r1_pl.bw DMSO_r2_pl.bw E2_r1_pl.bw E2_r2_pl.bw \
+  -m DMSO_r1_mn.bw DMSO_r2_mn.bw E2_r1_mn.bw E2_r2_mn.bw \
+  -c DMSO DMSO E2 E2 \
+  -r 1 2 1 2 \
+  -s counts.csv
+```
+
+The counts table look like the following:
+```
+,DMSO_1,DMSO_2,E2_1,E2_2
+chr1:10609-10620,17,22,44,43
+chr1:629905-629938,169,13,224,82
+chr1:633956-634096,218,12,271,102
+chr1:778554-778929,1180,195,1327,495
+chr1:779719-779721,0,0,12,2
+chr1:779846-780119,6,0,30,6
+chr1:827199-827316,48,22,101,46
+chr1:827326-827736,634,88,752,318
+chr1:827742-827773,19,0,32,8
+```
+
+Third, feed DESeq2/edgeR with the counts table for differential expression analysis
+
+## Additional Tools
 
 * `pints_visualizer`: Generate bigwig files for the inputs.
-* `pints_counter`: Generate a count matrix for downstream usages (e.g. differential expression analysis).
-* `pints_boundary_extender`: Extend peaks from summits.
+* `pints_counter`: Generate count matrix for downstream usages (e.g. differential expression analysis).
 * `pints_normalizer`: Normalize inputs.
+* `pints_boundary_extender`: Extend peaks from summits.
 
-## Contact
+You can use `tool_name --help` to see parameters for each tool.
 
-Please submit an issue with any questions or if you experience any issues/bugs. If you use PINTS in your work, please cite: [https://www.nature.com/articles/s41587-022-01211-7](https://www.nature.com/articles/s41587-022-01211-7).
+## Links
+* Citation: If you use PINTS in your work, please cite: [https://www.nature.com/articles/s41587-022-01211-7](https://www.nature.com/articles/s41587-022-01211-7).
+* Support: Please submit an issue with any questions or if you experience any issues/bugs.
