@@ -161,7 +161,7 @@ class ZIP(StatModel):
         u_pmf = (1 - pi) * poisson.pmf(count, lamb)
         # handle the zero-inflation part correctly
         u_pmf[np.where(count == 0)] += pi
-        u_pmf[u_pmf < self.infinitesimal] = smallest
+        u_pmf[u_pmf < smallest] = smallest
         likelihood = (np.log(u_pmf) * count_numbers).sum()
         return likelihood
 
