@@ -1070,6 +1070,22 @@ def _indexed_call(i, func, args):
     return i, func(*args)
 
 
+def _element_definition_task(chrom_coverage, chromosome, sign, output_file, ce_donor, join_distance, ce_trigger,
+                             peak_width=None):
+    return unified_element_definition(chrom_coverage, chromosome, sign, output_file, ce_donor=ce_donor,
+                                      join_distance=join_distance, ce_trigger=ce_trigger, peak_width=peak_width)
+
+
+def _coverage_cost(coverage_dicts, chromosome):
+    """Scheduling weight of a chromosome: total on-disk size of its coverage tracks."""
+    total = 0
+    for d in coverage_dicts:
+        f = d.get(chromosome)
+        if isinstance(f, str) and os.path.exists(f):
+            total += os.path.getsize(f)
+    return total
+
+
 def evaluate_strand_jobs(jobs, fdr_target, pool=None, thread_n=1, **kwargs):
     """
     Evaluate candidate peaks for several (sample, strand) jobs at once.
@@ -2211,20 +2227,27 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
                                                           save_to=prefix + "_alpha.pdf")
             logger.info("Override the default for --donor-tolerance with {0}".format(kwargs["donor_tolerance"]))
 
+    # one persistent worker pool for all parallel stages (None -> everything runs inline, as before)
+    thread_n = kwargs.get("thread_n", 1)
+    pool = _make_pool(thread_n) if thread_n > 1 else None
+
+    ued_keys, ued_tasks, ued_costs = [], [], []
     for chromosome in chromosomes:
         for target_dict, chrom_coverage, sign, strand_short in zip((subpeak_pl_beds, subpeak_mn_beds),
                                                                    (chromosome_coverage_pl, chromosome_coverage_mn),
                                                                    ("+", "-"), ("pl", "mn")):
-            target_dict[chromosome] = unified_element_definition(chrom_coverage, chromosome, sign,
-                                                                 prefix + "_{0}.bed".format(strand_short),
-                                                                 ce_donor=kwargs.get("donor_tolerance", 0.3),
-                                                                 join_distance=kwargs.get("peak_distance", 1),
-                                                                 ce_trigger=kwargs.get("ce_trigger", 3),
-                                                                 peak_width=kwargs.get("peak_width", None))
-
-            if target_dict[chromosome] is not None:
-                housekeeping_files.append(target_dict[chromosome])
-                housekeeping_files.append(target_dict[chromosome] + ".csi")
+            ued_keys.append((target_dict, chromosome))
+            ued_tasks.append((chrom_coverage, chromosome, sign, prefix + "_{0}.bed".format(strand_short),
+                              kwargs.get("donor_tolerance", 0.3), kwargs.get("peak_distance", 1),
+                              kwargs.get("ce_trigger", 3), kwargs.get("peak_width", None)))
+            ued_costs.append(_coverage_cost(chrom_coverage, chromosome))
+    ued_res = _run_tasks(pool, _element_definition_task, ued_tasks, costs=ued_costs)
+    # results are consumed in the original (chromosome, strand) order
+    for (target_dict, chromosome), res in zip(ued_keys, ued_res):
+        target_dict[chromosome] = res
+        if res is not None:
+            housekeeping_files.append(res)
+            housekeeping_files.append(res + ".csi")
 
     parse_input_files(output_dir=output_dir, output_prefix="ct_" + output_prefix, filters=filters,
                       pl_cov_target=input_coverage_pl, mn_cov_target=input_coverage_mn,
@@ -2257,6 +2280,21 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
             housekeeping_files.extend(mnc.values())
 
     fdr_target = kwargs.pop("fdr_target", 0.1)
+    # window evaluation for every sample x strand at once (shared pool, longest tasks first)
+    precomputed = {}
+    if pool is not None:
+        eval_jobs, eval_keys = [], []
+        for rep, pl_cov_dict in enumerate(chromosome_coverage_pl):
+            sample_prefix = prefix + "_%d" % (rep + 1)
+            for cov_dict, label, spb, strand_sign in zip(
+                    (pl_cov_dict, chromosome_coverage_mn[rep]),
+                    ("pl", "mn"), (subpeak_pl_beds, subpeak_mn_beds), ("+", "-")):
+                if spb is None:
+                    continue
+                eval_jobs.append((cov_dict, sample_prefix + "_{0}.bed".format(label), spb, strand_sign))
+                eval_keys.append((rep, label))
+        for key, res in zip(eval_keys, evaluate_strand_jobs(eval_jobs, fdr_target, pool=pool, **kwargs)):
+            precomputed[key] = res
     # peak calling (IQR)
     for rep, pl_cov_dict in enumerate(chromosome_coverage_pl):
         logger.info("Working on sample %d" % (rep + 1))
@@ -2273,6 +2311,7 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
                                             shared_peak_definitions=spb,
                                             strand_sign=strand_sign,
                                             fdr_target=fdr_target,
+                                            precomputed=precomputed.get((rep, label)),
                                             **kwargs)
 
             peak_df = pd.read_csv(peaks_bed, sep="\t", header=None, names=COMMON_HEADER)
@@ -2360,4 +2399,7 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
     if is_borrow_info_from_reps and len(chromosome_coverage_pl) > 1:
         logger.info("Enhanced support for biological replicates is enabled.")
         inferring_elements_from_other_reps(prefix=prefix, n_samples=len(chromosome_coverage_pl))
+    if pool is not None:
+        pool.close()
+        pool.join()
     housekeeping(pybdt_tmp)
