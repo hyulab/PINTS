@@ -87,6 +87,95 @@ def _poisson_pmf(k, mu):
     return np.clip(np.exp(xlogy(k, mu_b) - gammaln(k + 1) - mu_b), 0, 1)
 
 
+# ---------------------------------------------------------------------------------------------------
+# Exact EM helpers. numpy reduces a contiguous float64 array in buffered blocks of 8192 elements, each
+# block summed pairwise (8 accumulators, blocks <= 128 unrolled, split point n/2 rounded down to a
+# multiple of 8), starting from 0.0. `_masked_sum` reproduces that summation tree for an array that is
+# `a` where mask is True and `b` elsewhere, without materialising it, so the result is bit-identical to
+# ``np.where(mask, a, b).sum()``.
+# ---------------------------------------------------------------------------------------------------
+try:
+    import numba as _nb
+
+    @_nb.njit(cache=True)
+    def _pw_masked(mask, lo, n, a, b):
+        if n < 8:
+            res = 0.0
+            for i in range(lo, lo + n):
+                res += a if mask[i] else b
+            return res
+        elif n <= 128:
+            r0 = a if mask[lo] else b
+            r1 = a if mask[lo + 1] else b
+            r2 = a if mask[lo + 2] else b
+            r3 = a if mask[lo + 3] else b
+            r4 = a if mask[lo + 4] else b
+            r5 = a if mask[lo + 5] else b
+            r6 = a if mask[lo + 6] else b
+            r7 = a if mask[lo + 7] else b
+            i = 8
+            m = n - (n % 8)
+            while i < m:
+                r0 += a if mask[lo + i] else b
+                r1 += a if mask[lo + i + 1] else b
+                r2 += a if mask[lo + i + 2] else b
+                r3 += a if mask[lo + i + 3] else b
+                r4 += a if mask[lo + i + 4] else b
+                r5 += a if mask[lo + i + 5] else b
+                r6 += a if mask[lo + i + 6] else b
+                r7 += a if mask[lo + i + 7] else b
+                i += 8
+            res = ((r0 + r1) + (r2 + r3)) + ((r4 + r5) + (r6 + r7))
+            while i < n:
+                res += a if mask[lo + i] else b
+                i += 1
+            return res
+        else:
+            n2 = n // 2
+            n2 -= n2 % 8
+            return _pw_masked(mask, lo, n2, a, b) + _pw_masked(mask, lo + n2, n - n2, a, b)
+
+    @_nb.njit(cache=True)
+    def _masked_sum(mask, a, b):
+        res = 0.0
+        n = mask.shape[0]
+        lo = 0
+        while lo < n:
+            m = min(8192, n - lo)
+            res += _pw_masked(mask, lo, m, a, b)
+            lo += m
+        return res
+
+    _HAS_NUMBA = True
+except ImportError:  # pragma: no cover
+    _HAS_NUMBA = False
+
+
+_EPS = np.finfo(float).eps
+
+
+class _LLCache:
+    """Per-fit invariants of the ZIP log-likelihood over the unique counts of a window."""
+    __slots__ = ("k", "logfact", "counts", "zero_first")
+
+    def __init__(self, u_ele, c_ele):
+        self.k = u_ele - np.asarray(0)   # same promotion as scipy's ``asarray(k) - asarray(loc)``
+        self.logfact = gammaln(self.k + 1)
+        self.counts = c_ele
+        self.zero_first = u_ele[0] == 0  # u_ele is sorted and unique
+
+    @staticmethod
+    def supported(u_ele):
+        return u_ele.ndim == 1 and u_ele.dtype.kind in "iu" and u_ele.shape[0] > 0 and u_ele[0] >= 0
+
+    def log_likelihood(self, pi, lamb):
+        """Bit-identical to ``ZIP._log_likelihood_core(u_ele, c_ele, pi, lamb)`` for lamb >= 0."""
+        u_pmf = (1 - pi) * np.minimum(np.exp(xlogy(self.k, lamb) - self.logfact - lamb), 1.)
+        if self.zero_first:
+            u_pmf[0] += pi
+        return (np.log(np.maximum(u_pmf, _EPS)) * self.counts).sum()
+
+
 class StatModel(ABC):
     def __init__(self, init_mu=None, init_variance=None, init_pi=None, max_iter=1000, stop_diff=0.0001, debug=False,
                  output_to=""):
@@ -291,6 +380,10 @@ class ZIP(StatModel):
         prev_likelihood = 0.
         likelihoods = []
         u_ele, c_ele = np.unique(window, return_counts=True)
+        if _HAS_NUMBA and not self.debug and window.ndim == 1:
+            fast = self._fit_fast(window, zero_elements, u_ele, c_ele, I, lamb, pi)
+            if fast is not None:
+                return fast
         while True:
             # expectation
             hat_z[zero_elements] = pi / (pi + np.exp(-lamb) * (1 - pi))
@@ -310,6 +403,39 @@ class ZIP(StatModel):
                         plt.xlabel('Iteration')
                         plt.tight_layout()
                         plt.savefig(self.output_to, bbox_inches="tight", transparent=True)
+                    return lamb, lamb, pi, likelihood, True
+                if n_iter > self.max_iter:
+                    return lamb, lamb, pi, likelihood, False
+            prev_likelihood = likelihood
+            n_iter += 1
+
+    def _fit_fast(self, window, zero_elements, u_ele, c_ele, I, lamb, pi):
+        """
+        Same EM iterations as `fit`, without materialising hat_z / indicator arrays.
+
+        hat_z is v on zero positions and 0 elsewhere, indicator = 1 - hat_z, so their sums are masked
+        sums with numpy's summation tree, and for 0 <= v <= 1 (indicator * window) equals the float64
+        cast of window bit for bit. Returns None (caller runs the original loop from the start) whenever
+        a precondition does not hold, so results are always identical to the original implementation.
+        """
+        sum_w = window.astype(np.float64).sum()
+        if not np.isfinite(sum_w) or not _LLCache.supported(u_ele):
+            return None
+        llc = _LLCache(u_ele, c_ele)
+        mask = np.ascontiguousarray(zero_elements)
+        n_iter = 0
+        prev_likelihood = 0.
+        while True:
+            v = pi / (pi + np.exp(-lamb) * (1 - pi))
+            if not (0. <= v <= 1.):
+                return None
+            pi = np.float64(_masked_sum(mask, float(v), 0.)) / I        # == hat_z.sum() / I
+            lamb = sum_w / np.float64(_masked_sum(mask, float(1 - v), 1.))  # == (ind * w).sum() / ind.sum()
+            if not (lamb >= 0):
+                return None
+            likelihood = llc.log_likelihood(pi, lamb)
+            if n_iter > 0:
+                if abs(likelihood - prev_likelihood) < self.stop_diff:
                     return lamb, lamb, pi, likelihood, True
                 if n_iter > self.max_iter:
                     return lamb, lamb, pi, likelihood, False
