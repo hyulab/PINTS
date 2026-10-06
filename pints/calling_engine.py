@@ -43,7 +43,7 @@ try:
     from pybedtools import BedTool
     from .stats_engine import Poisson, ZIP, pval_dist, bgIQR, pkIQR, \
         independent_filtering, get_elbow
-    from .io_engine import get_read_signal, get_coverage_bw, log_assert, normalize_using_input, \
+    from .io_engine import get_read_signal, get_coverage_bw, log_assert, normalize_using_input, is_zero_track, \
         index_bed_file, peak_bed_to_gtf, merge_replicates_bw
     from pints import __version__
 except ImportError as e:
@@ -259,9 +259,79 @@ def sliding_window(chromosome_coverage, window_size=100, step_size=100):
         end = start + window_size
 
 
+def window_sums(chromosome_coverage, window_size=100, step_size=100):
+    """
+    Vectorized equivalent of `sliding_window` for integer coverage arrays.
+
+    Returns the same window read counts (same dtype as ``np.sum`` of an integer slice, i.e. the
+    platform integer) and window start coordinates, without a Python-level loop.
+    Floating-point input falls back to per-window ``np.sum`` so that summation order is unchanged.
+
+    Returns
+    -------
+    sums : np.ndarray
+        Read counts per window
+    starts : np.ndarray
+        0-based start coordinates of the windows (ends are ``starts + window_size``)
+    """
+    if step_size < 1:
+        logger.error("step_size must >= 1")
+        raise ValueError("step_size must >= 1")
+    if len(chromosome_coverage) < 1:
+        logger.error("chromosome_coverage must >= 1")
+        raise ValueError("chromosome_coverage must >= 1")
+    total_bins = int(np.floor(chromosome_coverage.shape[0] / step_size - window_size / step_size + 1))
+    total_bins = max(total_bins, 0)
+    starts = np.arange(total_bins, dtype=np.int64) * step_size
+    cov = np.asarray(chromosome_coverage)
+    if total_bins == 0:
+        return np.zeros(0, dtype=np.sum(cov[:0]).dtype), starts
+    if not np.issubdtype(cov.dtype, np.integer):
+        sums = np.array([np.sum(cov[s:s + window_size]) for s in starts])
+        return sums, starts
+    acc = np.sum(cov[:0]).dtype  # accumulator dtype numpy uses for an integer sum (int64 / uint64)
+    if step_size == window_size:
+        sums = cov[:total_bins * window_size].reshape(total_bins, window_size).sum(axis=1, dtype=acc)
+    else:
+        cs = np.zeros(cov.shape[0] + 1, dtype=acc)
+        np.cumsum(cov, dtype=acc, out=cs[1:])
+        sums = cs[starts + window_size] - cs[starts]
+    return sums, starts
+
+
+def nonzero_window_regions(chromosome_coverage, window_size=100, step_size=100):
+    """
+    Regions formed by merging consecutive windows with positive read counts.
+
+    Equivalent to building a bed of windows with ``reads > 0`` (from `sliding_window`) and running
+    ``bedtools merge`` (overlapping / book-ended features are merged).
+
+    Returns
+    -------
+    regions : list of tuples
+        (start, end) of merged regions, sorted by start
+    """
+    sums, starts = window_sums(chromosome_coverage, window_size, step_size)
+    keep = sums > 0
+    if not keep.any():
+        return []
+    s = starts[keep]
+    e = s + window_size
+    # a new region starts when a window begins after the end of the previous window
+    breaks = np.ones(s.shape[0], dtype=bool)
+    if step_size >= window_size:
+        breaks[1:] = s[1:] > e[:-1]
+        idx = np.flatnonzero(breaks)
+        ends = np.maximum.reduceat(e, idx)
+        return [(int(a), int(b)) for a, b in zip(s[idx], ends)]
+    # overlapping windows: generic interval merge
+    return [tuple(x) for x in merge_intervals(list(zip(s.tolist(), e.tolist())))]
+
+
 def check_window(coord_start, coord_end, mu_peak, var_peak, pi_peak, chromosome_coverage, peak_in_bg_threshold,
                  mu_bkg_minimum, sp_bed_handler, chromosome_name, fdr_target, cache, small_window_threshold=5,
-                 flanking=(10000, 5000, 1000), disable_ler=False, enable_eler=True, top_peak_mu=None):
+                 flanking=(10000, 5000, 1000), disable_ler=False, enable_eler=True, top_peak_mu=None,
+                 compute_lrt=True):
     """
     Calculate p-value for a peak
 
@@ -301,6 +371,9 @@ def check_window(coord_start, coord_end, mu_peak, var_peak, pi_peak, chromosome_
         Set it to False to disable enhanced LER
     top_peak_mu : float
         Density threshold for peaks in local environments to be considered as potential true peaks
+    compute_lrt : bool
+        Whether to run the likelihood-ratio test. Its p-value is only consumed in sensitive mode,
+        so callers can skip it otherwise (the returned lrt_pval is then a 1.0 placeholder).
 
     Returns
     -------
@@ -350,8 +423,9 @@ def check_window(coord_start, coord_end, mu_peak, var_peak, pi_peak, chromosome_
                                                   peak_threshold=top_peak_mu)
 
         mu_, var_, pi_, _, _ = stat_tester.fit(bg)
-        w, pval = stat_tester.lrt(selected_window, bg)
-        lrt_pvals.append(pval)
+        if compute_lrt:
+            w, pval = stat_tester.lrt(selected_window, bg)
+            lrt_pvals.append(pval)
         mus.append(mu_)
         variances.append(var_)
         pis.append(pi_)
@@ -365,7 +439,7 @@ def check_window(coord_start, coord_end, mu_peak, var_peak, pi_peak, chromosome_
 
     pvalue = stat_tester.sf(mu_peak, var_peak, pi_peak, mu_0, var_0, pi_0)
 
-    return pvalue, window_value, mu_0, pi_0, ler_counts, np.mean(lrt_pvals), sig_dens
+    return pvalue, window_value, mu_0, pi_0, ler_counts, np.mean(lrt_pvals) if compute_lrt else 1., sig_dens
 
 
 def quasi_max_score_segment(candidates, donor_tolerance, ce_trigger, max_distance):
@@ -432,7 +506,7 @@ def quasi_max_score_segment(candidates, donor_tolerance, ce_trigger, max_distanc
     return fwd_search, rev_search
 
 
-def merge_covs(covs, chromosome_of_interest):
+def merge_covs(covs, chromosome_of_interest, skip_if_empty=False):
     """
     Merge coverage tracks
 
@@ -448,6 +522,8 @@ def merge_covs(covs, chromosome_of_interest):
     merged_coverage : np.ndarray
         merged coverage tracks
     """
+    if skip_if_empty and all(is_zero_track(cd[chromosome_of_interest]) for cd in covs):
+        return None
     merged_coverage = None
     for cd in covs:
         cov = np.load(cd[chromosome_of_interest])
@@ -759,7 +835,8 @@ def check_window_chromosome(rc_file, output_file, strand_sign, chromosome_name, 
                     peak_in_bg_threshold=peak_threshold, mu_bkg_minimum=bkg_mu_threshold,
                     sp_bed_handler=bed_handler, chromosome_name=chromosome_name,
                     fdr_target=fdr_target, cache=global_cache, disable_ler=disable_ler,
-                    enable_eler=enable_eler, top_peak_mu=empirical_true_peak_threshold)
+                    enable_eler=enable_eler, top_peak_mu=empirical_true_peak_threshold,
+                    compute_lrt=sensitive)
                 if wv > 0:
                     use_lrt = sensitive and pi_peak > 0. and pi_bg > 0. and (
                                 mu_bg / mu_peak < real_fc_cutoff) and sig_dens > init_dens_cutoff and peak_summit_val > init_height_cutoff
@@ -1238,34 +1315,26 @@ def unified_element_definition(coverage_dict, chromosome_of_interest, strand_sig
         file name for the subpeak bed file, or None if there's no peak
     """
     subpeak_bed = output_file.replace(".bed", __SUB_PEAK_TPL__ % chromosome_of_interest)
-    bins = []
-    merged_coverage = merge_covs(coverage_dict, chromosome_of_interest)
-
-    for window, coord in sliding_window(merged_coverage):
-        if window > 0:  # no reads in the bin
-            bins.append((chromosome_of_interest, coord[0], coord[1], window))
-
-    tmp_df = pd.DataFrame(bins, columns=("chromosome", "start", "end", "reads"))
-    tmp_df["name"] = "."
-    tmp_df["strand"] = strand_sign
-    tmp_df = tmp_df.loc[:, ("chromosome", "start", "end", "name", "reads", "strand")]
-    if tmp_df.shape[0] == 0:  # no hit
+    merged_coverage = merge_covs(coverage_dict, chromosome_of_interest, skip_if_empty=True)
+    if merged_coverage is None:  # all tracks are known to be empty for this chromosome
         return None
-    # merge windows in case peaks are split into different windows
-    bed_obj = BedTool(tmp_df.to_csv(sep="\t", index=False, header=False), from_string=True)
-    bed_obj = bed_obj.merge(c=(4, 5, 6), o=("distinct", "sum", "distinct"))
+
+    # windows with reads, merged when book-ended (same as bedtools merge on the window bed)
+    regions = nonzero_window_regions(merged_coverage)
+    if len(regions) == 0:  # no hit
+        return None
 
     with open(subpeak_bed, "w") as spb_fh:
         index = 1
-        for _, row in enumerate(bed_obj):
-            sub_peaks = cut_peaks(merged_coverage[row.start:row.end],
+        for row_start, row_end in regions:
+            sub_peaks = cut_peaks(merged_coverage[row_start:row_end],
                                   donor_tolerance=ce_donor,
                                   ce_trigger=ce_trigger,
                                   join_distance=join_distance,
                                   peak_width=peak_width)
             for sp in sub_peaks:
-                start = sp[0] + row.start
-                end = sp[1] + row.start
+                start = sp[0] + row_start
+                end = sp[1] + row_start
                 peak_region = merged_coverage[start:end]
                 summit_coord = start + np.argmax(peak_region)
                 spb_fh.write("%s\t%d\t%d\t%s-%d\t%d\n" % (chromosome_of_interest, start, end, chromosome_of_interest,
