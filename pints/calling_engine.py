@@ -2111,7 +2111,8 @@ def parse_input_files(output_dir, output_prefix, filters, pl_cov_target, mn_cov_
             plc, mnc, rc = get_coverage_bw(bw_pl=bw_pl, bw_mn=bw_mn_files[i],
                                            chromosome_startswith=kwargs.get("chromosome_startswith", ""),
                                            output_dir=output_dir,
-                                           output_prefix=output_prefix + "_%d" % i)
+                                           output_prefix=output_prefix + "_%d" % i,
+                                           threads=kwargs.get("thread_n", 1))
 
             pl_cov_target.append(plc)
             mn_cov_target.append(mnc)

@@ -298,7 +298,81 @@ def _get_coverage_bw(bw_file, chromosome_startswith, output_dir, output_prefix):
     return chromosome_coverage, read_counts
 
 
-def get_coverage_bw(bw_pl, bw_mn, chromosome_startswith, output_dir, output_prefix):
+_BW_BLOCK = 1 << 24  # bases per bigWig read in the parallel loader
+
+
+def _bw_chrom_worker(bw_file, chromosome, csize, data_type, npy_file, block=None):
+    """Load one chromosome of a bigWig exactly as `_get_coverage_bw` does; returns np.sum of the track."""
+    import pyBigWig
+    block = _BW_BLOCK if block is None else block
+    if os.path.exists(npy_file):
+        return np.load(npy_file).sum()
+    bw = pyBigWig.open(bw_file)
+    try:
+        if csize <= block:
+            cov = np.nan_to_num(bw.values(chromosome, 0, csize, numpy=True))
+            cov[cov < 0] *= -1
+            cov = cov.astype(data_type, copy=False)
+            np.save(npy_file, cov)
+            return np.sum(cov)
+        # element-wise identical transformation, block by block, into an .npy with the same header
+        out = np.lib.format.open_memmap(npy_file, mode="w+", dtype=data_type, shape=(int(csize),))
+        for a in range(0, csize, block):
+            b = min(csize, a + block)
+            v = np.nan_to_num(bw.values(chromosome, a, b, numpy=True))
+            v[v < 0] *= -1
+            out[a:b] = v.astype(data_type, copy=False)
+        out.flush()
+        del out
+    finally:
+        bw.close()
+    return np.sum(np.asarray(np.load(npy_file, mmap_mode="r")))
+
+
+def _get_coverage_bw_tasks(bw_file, chromosome_startswith, output_dir, output_prefix):
+    """Plan for the parallel loader: (data_type, [(chromosome, csize, npy_file)]) in file order."""
+    import pyBigWig
+    logger = logging.getLogger(__logger_name__)
+    bw = pyBigWig.open(bw_file)
+    log_assert(bw.isBigWig(), "BigWig file %s is not valid." % bw_file, logger)
+    bw_max = max(abs(bw.header()["maxVal"]), abs(bw.header()["minVal"]))
+    data_type = determine_data_type(bw_max)
+    tasks = []
+    for chromosome, csize in bw.chroms().items():
+        if chromosome.startswith(chromosome_startswith):
+            fn = os.path.join(output_dir, "%s_%s" % (output_prefix, chromosome))
+            tasks.append((chromosome, csize, fn + ".npy"))
+    bw.close()
+    return data_type, tasks
+
+
+def _get_coverage_bw_parallel(bw_files, chromosome_startswith, output_dir, prefixes, threads):
+    """Load several bigWigs with one process pool; same files, dicts (same order) and read counts."""
+    from multiprocessing import get_context
+    plans = [_get_coverage_bw_tasks(f, chromosome_startswith, output_dir, p) for f, p in zip(bw_files, prefixes)]
+    jobs, owners = [], []
+    for k, (f, (dt, tasks)) in enumerate(zip(bw_files, plans)):
+        for chromosome, csize, npy in tasks:
+            jobs.append((f, chromosome, csize, dt, npy))
+            owners.append(k)
+    order = sorted(range(len(jobs)), key=lambda i: -jobs[i][2])
+    sums = [None] * len(jobs)
+    if jobs:
+        with get_context("fork").Pool(max(1, min(threads, len(jobs)))) as pool:
+            for i, r in zip(order, pool.starmap(_bw_chrom_worker, [jobs[i] for i in order], chunksize=1)):
+                sums[i] = r
+    results = []
+    for k, (dt, tasks) in enumerate(plans):
+        coverage = {}
+        read_counts = 0
+        for (chromosome, csize, npy), (owner, s) in zip(tasks, [(o, x) for o, x in zip(owners, sums) if o == k]):
+            coverage[chromosome] = npy
+            read_counts += s  # accumulated in file order, as in the serial loader
+        results.append((coverage, read_counts))
+    return results
+
+
+def get_coverage_bw(bw_pl, bw_mn, chromosome_startswith, output_dir, output_prefix, threads=1):
     """
     Get 5' coverage
 
@@ -327,8 +401,12 @@ def get_coverage_bw(bw_pl, bw_mn, chromosome_startswith, output_dir, output_pref
         Number of total read counts
     """
     logger = logging.getLogger(__logger_name__)
-    pl, pc = _get_coverage_bw(bw_pl, chromosome_startswith, output_dir, output_prefix + "_pl")
-    mn, mc = _get_coverage_bw(bw_mn, chromosome_startswith, output_dir, output_prefix + "_mn")
+    if threads > 1:
+        (pl, pc), (mn, mc) = _get_coverage_bw_parallel((bw_pl, bw_mn), chromosome_startswith, output_dir,
+                                                       (output_prefix + "_pl", output_prefix + "_mn"), threads)
+    else:
+        pl, pc = _get_coverage_bw(bw_pl, chromosome_startswith, output_dir, output_prefix + "_pl")
+        mn, mc = _get_coverage_bw(bw_mn, chromosome_startswith, output_dir, output_prefix + "_mn")
 
     pl_chrs = set(pl.keys())
     mn_chrs = set(mn.keys())
