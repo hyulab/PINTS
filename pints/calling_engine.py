@@ -1070,6 +1070,10 @@ def _indexed_call(i, func, args):
     return i, func(*args)
 
 
+def _stratified_filtering_task(tmp_df, output_file, fdr_target, kwargs):
+    return stratified_filtering(tmp_df=tmp_df, output_file=output_file, fdr_target=fdr_target, **kwargs)
+
+
 def _phase(label, t0=[None]):
     """Wall-clock phase markers on stderr when PINTS_PHASE_TIMING is set (diagnostics only)."""
     import time
@@ -1329,7 +1333,7 @@ def stratified_filtering(tmp_df, output_file, fdr_target, dry_run=False, **kwarg
 
 
 def peaks_single_strand(per_base_cov, output_file, shared_peak_definitions, strand_sign, fdr_target,
-                        precomputed=None, **kwargs):
+                        precomputed=None, defer_filtering=False, **kwargs):
     """
     Calling peaks on one strand
 
@@ -1381,12 +1385,16 @@ def peaks_single_strand(per_base_cov, output_file, shared_peak_definitions, stra
                                            fdr_target, pool=pool, **kwargs)[0]
 
     sub_dfs = [sdf for sdf in sub_dfs if sdf is not None]
+    if defer_filtering and len(sub_dfs) == 0:
+        return None  # let the caller re-run inline so the failure surfaces at the original point
     log_assert(len(sub_dfs) > 0, "No signal found across all chromosomes!", logger)
     tmp_df = _concat_result_frames(sub_dfs)
 
     if kwargs.get("output_diagnostics", False):
         tmp_df.to_csv(output_file.replace(".bed", "_debug.csv"), index=False)
 
+    if defer_filtering:
+        return tmp_df
     return stratified_filtering(tmp_df=tmp_df, output_file=output_file, fdr_target=fdr_target, **kwargs)
 
 
@@ -2314,6 +2322,26 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
         for key, res in zip(eval_keys, evaluate_strand_jobs(eval_jobs, fdr_target, pool=pool, **kwargs)):
             precomputed[key] = res
     _phase("input normalisation/eval")
+    # stratified filtering (BH/independent filtering, sort, bgzip/tabix) of every sample x strand runs on the
+    # pool; the per-sample pairing below consumes the results in the original order
+    deferred_filtering = {}
+    if pool is not None:
+        for rep, pl_cov_dict in enumerate(chromosome_coverage_pl):
+            sample_prefix = prefix + "_%d" % (rep + 1)
+            for cov_dict, label, spb, strand_sign in zip(
+                    (pl_cov_dict, chromosome_coverage_mn[rep]),
+                    ("pl", "mn"), (subpeak_pl_beds, subpeak_mn_beds), ("+", "-")):
+                if spb is None:
+                    continue
+                out_file = sample_prefix + "_{0}.bed".format(label)
+                tmp_df = peaks_single_strand(per_base_cov=cov_dict, output_file=out_file,
+                                             shared_peak_definitions=spb, strand_sign=strand_sign,
+                                             fdr_target=fdr_target, precomputed=precomputed.get((rep, label)),
+                                             defer_filtering=True, **kwargs)
+                if tmp_df is not None:
+                    deferred_filtering[(rep, label)] = pool.apply_async(
+                        _stratified_filtering_task, (tmp_df, out_file, fdr_target, kwargs))
+                    precomputed.pop((rep, label), None)
     # peak calling (IQR)
     for rep, pl_cov_dict in enumerate(chromosome_coverage_pl):
         logger.info("Working on sample %d" % (rep + 1))
@@ -2325,13 +2353,16 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
                 ("pl", "mn"), (subpeak_pl_beds, subpeak_mn_beds), ("+", "-")):
             if spb is None:
                 continue
-            peaks_bed = peaks_single_strand(per_base_cov=cov_dict,
-                                            output_file=sample_prefix + "_{0}.bed".format(label),
-                                            shared_peak_definitions=spb,
-                                            strand_sign=strand_sign,
-                                            fdr_target=fdr_target,
-                                            precomputed=precomputed.get((rep, label)),
-                                            **kwargs)
+            if (rep, label) in deferred_filtering:
+                peaks_bed = deferred_filtering.pop((rep, label)).get()
+            else:
+                peaks_bed = peaks_single_strand(per_base_cov=cov_dict,
+                                                output_file=sample_prefix + "_{0}.bed".format(label),
+                                                shared_peak_definitions=spb,
+                                                strand_sign=strand_sign,
+                                                fdr_target=fdr_target,
+                                                precomputed=precomputed.get((rep, label)),
+                                                **kwargs)
 
             peak_df = pd.read_csv(peaks_bed, sep="\t", header=None, names=COMMON_HEADER)
             peak_df = peak_df.loc[peak_df["end"] - peak_df["start"] < kwargs.get("window_size_threshold", 2000), :]

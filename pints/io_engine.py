@@ -301,6 +301,37 @@ def _get_coverage_bw(bw_file, chromosome_startswith, output_dir, output_prefix):
 _BW_BLOCK = 1 << 24  # bases per bigWig read in the parallel loader
 
 
+def _bw_sparse_track(bw, chromosome, csize, data_type):
+    """Build the track from bigWig intervals instead of a dense float64 `values()` array.
+
+    Positions without data are NaN in `values()` and become 0 after `nan_to_num`; covered positions get the
+    interval value. The same element-wise transformation (nan_to_num, sign flip, astype) is applied to the
+    interval values, so the result equals the dense path. Returns None (caller uses the dense path) if the
+    intervals are not sorted, non-overlapping and inside the chromosome.
+    """
+    iv = bw.intervals(chromosome)
+    out = np.zeros(csize, dtype=data_type)
+    if not iv:
+        return out
+    arr = np.asarray(iv, dtype=np.float64)
+    st = arr[:, 0].astype(np.int64)
+    en = arr[:, 1].astype(np.int64)
+    if not (np.array_equal(st, arr[:, 0]) and np.array_equal(en, arr[:, 1])):
+        return None
+    if st[0] < 0 or en[-1] > csize or np.any(en <= st) or np.any(st[1:] < en[:-1]):
+        return None
+    v = np.nan_to_num(arr[:, 2])
+    v[v < 0] *= -1
+    v = v.astype(data_type, copy=False)
+    ln = en - st
+    if np.all(ln == 1):
+        out[st] = v
+    else:
+        offs = np.repeat(st - np.concatenate(([0], np.cumsum(ln)[:-1])), ln)
+        out[offs + np.arange(ln.sum())] = np.repeat(v, ln)
+    return out
+
+
 def _bw_chrom_worker(bw_file, chromosome, csize, data_type, npy_file, block=None):
     """Load one chromosome of a bigWig exactly as `_get_coverage_bw` does; returns np.sum of the track."""
     import pyBigWig
@@ -309,6 +340,10 @@ def _bw_chrom_worker(bw_file, chromosome, csize, data_type, npy_file, block=None
         return np.load(npy_file).sum()
     bw = pyBigWig.open(bw_file)
     try:
+        cov = _bw_sparse_track(bw, chromosome, int(csize), data_type)
+        if cov is not None:
+            np.save(npy_file, cov)
+            return np.sum(cov)
         if csize <= block:
             cov = np.nan_to_num(bw.values(chromosome, 0, csize, numpy=True))
             cov[cov < 0] *= -1
