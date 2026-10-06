@@ -29,6 +29,161 @@ GTF_HEADER = ["seqname", "source", "feature", "start", "end", "score",
               "strand", "frame"]
 __logger_name__ = "PINTS.IO-engine"
 
+# Paths of per-base coverage dumps (.npy) that are known to contain only zeros. They are written as
+# sparse files (no data blocks) and downstream steps can skip loading them. The registry is a pure
+# optimisation: consumers that do not consult it simply load the (all-zero) arrays as before.
+_ZERO_TRACKS = set()
+
+
+def save_zero_track(path, length, dtype=np.int8):
+    """Write an all-zero 1-D array as a sparse .npy file (same header as np.save) and register it."""
+    if not path.endswith(".npy"):
+        path = path + ".npy"
+    mm = np.lib.format.open_memmap(path, mode="w+", dtype=dtype, shape=(int(length),))
+    del mm
+    _ZERO_TRACKS.add(os.path.abspath(path))
+    return path
+
+
+def is_zero_track(path):
+    """True if `path` was written by this process (or its parent) as an all-zero coverage track."""
+    return isinstance(path, str) and os.path.abspath(path) in _ZERO_TRACKS
+
+
+def _smallest_int_dtype(max_value):
+    """Same dtype choice as the NP_DT_RANGE loops used when dumping coverage arrays."""
+    for k, v in enumerate(NP_DT_RANGE):
+        if v > max_value:
+            return NP_DT_NAME[k]
+    return None
+
+
+def _bam_contig_worker(task):
+    """
+    Count 5'/3' ends for one contig (exactly the per-read logic of BamParsers) and dump the npys.
+
+    Returns (contig, pl_path, mn_path, total_reads, n_records, pl_is_zero, mn_is_zero)
+    """
+    (input_bam, contig, length, mapq, layout, end, rc, pl_fn, mn_fn) = task
+    bam = pysam.AlignmentFile(input_bam, "rb")
+    pl_pos = []
+    mn_pos = []
+    total = 0
+    n_rec = 0
+    skip_r1 = layout == "R2"
+    skip_r2 = layout == "R1"
+    five = end == "5"
+    for read in bam.fetch(contig):
+        n_rec += 1
+        if skip_r2 and read.is_read2:
+            continue
+        if skip_r1 and read.is_read1:
+            continue
+        if read.mapq < mapq:
+            continue
+        total += 1
+        rev = read.is_reverse
+        if five:
+            pos = read.reference_end - 1 if rev else read.reference_start
+        else:
+            pos = read.reference_start if rev else read.reference_end - 1
+        if rev != rc:  # minus strand (after optional reverse complement)
+            mn_pos.append(pos)
+        else:
+            pl_pos.append(pos)
+    bam.close()
+
+    out = []
+    for positions, fn in ((pl_pos, pl_fn), (mn_pos, mn_fn)):
+        if len(positions) == 0:
+            out.append((save_zero_track(fn, length), True))
+            continue
+        uniq, cnt = np.unique(np.asarray(positions, dtype=np.int64), return_counts=True)
+        if uniq[0] < 0 or uniq[-1] >= length:
+            raise IndexError("index %d is out of bounds for axis 0 with size %d" % (
+                uniq[0] if uniq[0] < 0 else uniq[-1], length))
+        # original accumulates in uint32 before choosing the dump dtype
+        cnt = cnt.astype(np.uint32)
+        dt = _smallest_int_dtype(cnt.max())
+        arr = np.zeros(length, dtype=dt)
+        arr[uniq] = cnt.astype(dt)
+        np.save(fn, arr)
+        del arr
+        out.append((fn + ".npy", False))
+    return contig, out[0][0], out[1][0], total, n_rec, out[0][1], out[1][1]
+
+
+def parse_bam_by_contig(input_bam, contigs, mapq, layout, end, rc, output_dir, output_prefix, threads=1):
+    """
+    Index-based, contig-parallel equivalent of BamParsers + dtype conversion in get_read_signal.
+
+    Parameters
+    ----------
+    contigs : list of (name, length) in header order (already filtered)
+
+    Returns
+    -------
+    (result_pl, result_mn, total_reads) or None if the fast path cannot guarantee identical results
+    (no index, or index statistics do not match the records fetched), in which case callers must
+    fall back to the serial parser.
+    """
+    logger = logging.getLogger(__logger_name__)
+    try:
+        bam = pysam.AlignmentFile(input_bam, "rb")
+        if not bam.has_index():
+            bam.close()
+            return None
+        stats = {s.contig: s.total for s in bam.get_index_statistics()}
+        bam.close()
+    except Exception as ex:  # pragma: no cover - defensive
+        logger.debug("Contig-parallel BAM parsing unavailable (%s)" % ex)
+        return None
+
+    result_pl = {}
+    result_mn = {}
+    tasks = []
+    for name, length in contigs:
+        pl_fn = os.path.join(output_dir, output_prefix + "_pl_%s" % name)
+        mn_fn = os.path.join(output_dir, output_prefix + "_mn_%s" % name)
+        if stats.get(name, None) == 0:
+            result_pl[name] = save_zero_track(pl_fn, length)
+            result_mn[name] = save_zero_track(mn_fn, length)
+        else:
+            tasks.append((input_bam, name, length, mapq, layout, end, rc, pl_fn, mn_fn))
+    # longest-first scheduling
+    tasks.sort(key=lambda t: -stats.get(t[1], 0))
+    if threads > 1 and len(tasks) > 1:
+        from multiprocessing import Pool
+        with Pool(min(threads, len(tasks))) as pool:
+            results = pool.map(_bam_contig_worker, tasks, chunksize=1)
+    else:
+        results = [_bam_contig_worker(t) for t in tasks]
+
+    total_reads = 0
+    ok = True
+    for contig, pl_path, mn_path, total, n_rec, pl_zero, mn_zero in results:
+        if stats.get(contig, None) != n_rec:
+            ok = False
+        total_reads += total
+        result_pl[contig] = pl_path
+        result_mn[contig] = mn_path
+        if pl_zero:
+            _ZERO_TRACKS.add(os.path.abspath(pl_path))
+        if mn_zero:
+            _ZERO_TRACKS.add(os.path.abspath(mn_path))
+    if not ok:
+        logger.warning("BAM index statistics do not match fetched records; using the serial parser")
+        for d in (result_pl, result_mn):
+            for v in d.values():
+                _ZERO_TRACKS.discard(os.path.abspath(v))
+                if os.path.exists(v):
+                    os.remove(v)
+        return None
+    # keep header order in the returned dicts
+    result_pl = {name: result_pl[name] for name, _ in contigs}
+    result_mn = {name: result_mn[name] for name, _ in contigs}
+    return result_pl, result_mn, total_reads
+
 
 def log_assert(bool_, message, logger):
     """
@@ -524,9 +679,18 @@ def get_read_signal(input_bam, loc_prime, chromosome_startswith, output_dir, out
     load_cache_flag = 1 if lcf and lcf1 else 0
     read_counts = rc + rc1
 
+    fast = None
+    if not load_cache_flag and kwargs.get("fast_bam", True):
+        fast = parse_bam_by_contig(input_bam, [(c, chromosome_coverage_pl[c].shape[0]) for c in chromosome_coverage_pl],
+                                   mapq=mapq_threshold, layout=library_layout, end=interested_end,
+                                   rc=bool(reverse_complement), output_dir=output_dir, output_prefix=output_prefix,
+                                   threads=kwargs.get("thread_n", 1))
+
     if load_cache_flag:
         logger.info("Loading cache from previous result, if you want to re-parse the bam file, "
                     "please delete all files end with npy first.")
+    elif fast is not None:
+        result_pl, result_mn, read_counts = fast
     else:
         bam_parser = None
         parser_obj = BamParsers(bam_obj=bam, pl_cov=chromosome_coverage_pl,
@@ -624,7 +788,12 @@ def normalize_using_input(assay_pl, assay_mn, input_pl, input_mn, scale_factor, 
     def strand_atom(assay_coverage, input_coverage, sf=1., direction="pl"):
         results = {}
         for chrom_name, npy_dump in assay_coverage.items():
-            if chrom_name in input_coverage:
+            if chrom_name in input_coverage and is_zero_track(npy_dump) and np.isfinite(sf) and sf >= 0:
+                # exp == 0 everywhere, so max(exp - input * sf, 0) == 0 everywhere -> int8 zeros
+                length = np.load(npy_dump, mmap_mode="r").shape[0]
+                fn = os.path.join(output_dir, output_prefix + "_%s_%s" % (direction, chrom_name)) + ".npy"
+                results[chrom_name] = save_zero_track(fn, length, NP_DT_NAME[0])
+            elif chrom_name in input_coverage:
                 matched_input = np.load(input_coverage[chrom_name]) * sf
                 exp = np.load(npy_dump)
                 adjusted_signal = exp - matched_input
@@ -1028,6 +1197,13 @@ def merge_replicates_bw(per_sample_coverage_pls, per_sample_coverage_mns, output
         raise ValueError("Number of replicates for pl and mn must be greater than 1.")
     else:
         for chrom in shared_chromosomes:
+            pl_fn = os.path.join(output_dir, "%s_pl_%s.npy" % (output_prefix, chrom))
+            mn_fn = os.path.join(output_dir, "%s_mn_%s.npy" % (output_prefix, chrom))
+            if all(is_zero_track(d[chrom]) for d in per_sample_coverage_pls + per_sample_coverage_mns):
+                length = np.load(per_sample_coverage_pls[0][chrom], mmap_mode="r").shape[0]
+                merged_pl[chrom] = save_zero_track(pl_fn, length, determine_data_type(0))
+                merged_mn[chrom] = save_zero_track(mn_fn, length, determine_data_type(0))
+                continue
             # merge data
             merged_pl_data = merge_chromosome_data(per_sample_coverage_pls, chrom)
             pl_rc += np.sum(merged_pl_data)
