@@ -151,6 +151,10 @@ For all three types of TREs, if a valid biosample name for `--epig-annotation` i
 
 More parameters can be seen by running `pints_caller -h`.
 
+To see where a run spends its time, set the environment variable `PINTS_PHASE_TIMING=1`: PINTS then writes the
+wall time of each stage (input parsing, element definition, the two testing phases, filtering and pairing) to
+stderr as `[phase]` lines, each measured from the end of the previous one. It does not change any output.
+
 ## Case Study: Identify Differentially Expressed TREs
 In this section, we try to identify differentially expressed TREs (promoters and enhancers) from two conditions.
 
