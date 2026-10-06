@@ -21,7 +21,7 @@ try:
     import pysam
     import numpy as np
     from scipy.stats import poisson, chi2
-    from scipy.special import gamma, digamma, polygamma, gammaln, psi, factorial
+    from scipy.special import gamma, digamma, polygamma, gammaln, psi, factorial, xlogy
     from scipy.optimize import fmin_l_bfgs_b as BFGS
     from abc import ABC, abstractmethod
     from collections import defaultdict
@@ -65,6 +65,26 @@ def pval_dist(pval_list, logger, output_diagnostics=True, output_to=None):
         plt.savefig(output_to, transparent=True, bbox_inches="tight")
         plt.close()
         logger.info("Diagnostic plot for p-values was wrote to %s" % output_to)
+
+
+def _poisson_pmf(k, mu):
+    """Bit-exact replica of ``scipy.stats.poisson.pmf(k, mu)`` for integer ``k`` >= 0 and scalar ``mu``.
+
+    scipy's generic rv_discrete.pmf wrapper (argument parsing, support checks, argsreduce, place) costs
+    ~50 us per call; the arithmetic below is the identical sequence of ufunc calls
+    (k is promoted to int64 exactly as ``asarray(k) - asarray(loc)`` does in scipy).
+    Falls back to scipy for anything outside that contract.
+    """
+    k = np.asarray(k)
+    if k.ndim != 1 or k.dtype.kind not in "iu" or np.ndim(mu) != 0:
+        return poisson.pmf(k, mu)
+    k = k - np.asarray(0)
+    if not (mu >= 0):
+        return np.full(k.shape, np.nan)
+    if k.shape[0] == 0 or k.min() < 0:
+        return poisson.pmf(k, mu)
+    mu_b = np.broadcast_to(np.asarray(mu), k.shape).ravel()
+    return np.clip(np.exp(xlogy(k, mu_b) - gammaln(k + 1) - mu_b), 0, 1)
 
 
 class StatModel(ABC):
@@ -184,7 +204,7 @@ class ZIP(StatModel):
         smallest = np.finfo(float).eps
         # estimate log likelihood
         # compute the Poisson PMF scaled by the non-zero-inflation component (i.e., the "Poisson part").
-        u_pmf = (1 - pi) * poisson.pmf(count, lamb)
+        u_pmf = (1 - pi) * _poisson_pmf(count, lamb)
         # handle the zero-inflation part correctly
         u_pmf[np.where(count == 0)] += pi
         u_pmf[u_pmf < smallest] = smallest
