@@ -151,6 +151,15 @@ except ImportError:  # pragma: no cover
     _HAS_NUMBA = False
 
 
+def numba_warmup():
+    """Initialise/compile the Numba kernels once, so forked pool workers inherit them instead of each
+    paying the compiler start-up (~2-3 s per process). No effect on results."""
+    if _HAS_NUMBA:
+        m = np.zeros(300, dtype=bool)
+        m[::3] = True
+        _masked_sum(m, 0.5, 1.0)
+
+
 _EPS = np.finfo(float).eps
 
 

@@ -1050,6 +1050,8 @@ def _worker_init(model_name, iqr_name):
 
 def _make_pool(n):
     import multiprocessing as mp
+    from .stats_engine import numba_warmup
+    numba_warmup()
     try:
         ctx = mp.get_context("fork")
     except ValueError:  # pragma: no cover - platforms without fork
@@ -1079,6 +1081,17 @@ def _indexed_call(i, func, args):
 
 def _index_bed_task(path):
     index_bed_file(path, logger=logger)
+
+
+def _pair_task(sample_prefix, df_dict, fdr_target, stringent_only, kwargs):
+    """`pair` + the unidirectional-output reformat of `peak_calling`, for one sample (pool task)."""
+    (bid, div, unid), gc = pair(sample_prefix, df_dict=df_dict, fdr_target=fdr_target,
+                                stringent_only=stringent_only, **kwargs)
+    unid_df = pd.read_csv(unid, sep="\t", names=COMMON_HEADER)
+    unid_df[["chromosome", "start", "end", "name", "padj", "strand",
+             "reads", "summit", "summit_val"]].to_csv(
+        unid, sep="\t", header=False, index=False)
+    return (bid, div, unid), tuple(gc)  # gc is a locally defined namedtuple (not picklable); only iterated
 
 
 def _stratified_filtering_task(tmp_df, output_file, fdr_target, kwargs):
@@ -2366,12 +2379,48 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
                     deferred_filtering[(rep, label)] = pool.apply_async(
                         _stratified_filtering_task, (tmp_df, out_file, fdr_target, kwargs))
                     precomputed.pop((rep, label), None)
+    # pairing of every sample on the pool (only for the plain path: no epigenomic annotation / diagnostics,
+    # which re-use df_dict afterwards); results are consumed below in sample order
+    deferred_pairing = {}
+    epig_requested = kwargs.get("epig_annotation", "") not in (None, "")
+    all_deferred = all((rep, label) in deferred_filtering
+                       for rep in range(len(chromosome_coverage_pl)) for label in ("pl", "mn"))
+    if pool is not None and len(chromosome_coverage_pl) > 1 and all_deferred and not epig_requested \
+            and not kwargs.get("output_diagnostics", False):
+        for rep, pl_cov_dict in enumerate(chromosome_coverage_pl):
+            sample_prefix = prefix + "_%d" % (rep + 1)
+            df_dict = {}
+            n_significant = 0
+            for label in ("pl", "mn"):
+                peaks_bed = deferred_filtering.pop((rep, label)).get()
+                peak_df = pd.read_csv(peaks_bed, sep="\t", header=None, names=COMMON_HEADER)
+                peak_df = peak_df.loc[peak_df["end"] - peak_df["start"] < kwargs.get("window_size_threshold", 2000),
+                                      :]
+                n_significant += np.sum(peak_df["padj"] < fdr_target)
+                df_dict[label] = peak_df
+            deferred_pairing[rep] = (n_significant, pool.apply_async(
+                _pair_task, (sample_prefix, df_dict, fdr_target, kwargs.get("stringent_only", False), kwargs)))
     # peak calling (IQR)
     for rep, pl_cov_dict in enumerate(chromosome_coverage_pl):
         logger.info("Working on sample %d" % (rep + 1))
         sample_prefix = prefix + "_%d" % (rep + 1)
         df_dict = {}
         n_significant = 0
+        if rep in deferred_pairing:
+            n_significant, pair_res = deferred_pairing.pop(rep)
+            logger.info("Pairing peaks")
+            (bid, div, unid), gc = pair_res.get()
+            logger.info("Pairing finished on sample %d" % (rep + 1))
+            for g in gc:
+                housekeeping_files.append(g)
+            if not disable_qc:
+                on_the_fly_qc(
+                    sample_prefix,
+                    kwargs.get("min_mu_percent", 0.1),
+                    kwargs.get("top_peak_threshold", 0.75),
+                    n_significant,
+                    is_strict_mode=__STRICT_QC__)
+            continue
         for cov_dict, label, spb, strand_sign in zip(
                 (pl_cov_dict, chromosome_coverage_mn[rep]),
                 ("pl", "mn"), (subpeak_pl_beds, subpeak_mn_beds), ("+", "-")):
