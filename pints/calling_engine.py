@@ -843,7 +843,17 @@ def stratified_filtering(tmp_df, output_file, fdr_target, dry_run=False, **kwarg
             tmp_df = tmp_df.loc[big_peaks_probe, :]
             tmp_df_sm = None
         else:
-            tmp_df["pval"] = tmp_df.apply(cached_pois, axis=1)
+            if tmp_df.shape[0] > 0 and tmp_df["reads"].dtype.kind in "iuf":
+                # vectorised form of `cached_pois`: identical poisson.sf element-wise evaluations
+                lengths = tmp_df["end"] - tmp_df["start"]
+                small = (lengths <= small_peak_threshold).to_numpy()
+                pv = tmp_df["pval"].to_numpy(dtype=np.float64, copy=True)
+                if small.any():
+                    pv[small] = poisson.sf(tmp_df["reads"].to_numpy()[small],
+                                           (lamb_global * lengths).to_numpy()[small])
+                tmp_df["pval"] = pv
+            else:
+                tmp_df["pval"] = tmp_df.apply(cached_pois, axis=1)
 
             tmp_df_sm = independent_filtering(tmp_df.loc[small_peaks_probe, :], fdr_target=fdr_target,
                                               output_to=fn + "_idpf_sm.pdf",

@@ -903,33 +903,44 @@ def independent_filtering(df, fdr_target=0.1, output_to=None, logger=None, **kwa
         direct_padj = multipletests(df["pval"], alpha=fdr_target, method=adjust_method)[1]
     except ZeroDivisionError:
         direct_padj = df["pval"] * df.shape[0]
-    for quantile in np.arange(0, 1, 0.005):
-        threshold = df.reads.quantile(quantile)
-        tmp_probe = df["reads"] > threshold
-        filtered_df = df.loc[tmp_probe, :].copy()
-        try:
-            mult_res = multipletests(filtered_df["pval"], alpha=fdr_target, method=adjust_method)
-            read_out = mult_res[1]
-        except ZeroDivisionError:
-            # if we cannot run BH, then we use Bonferroni correction
-            read_out = filtered_df["pval"] * filtered_df.shape[0]
-        filtered_df["padj"] = read_out
-        # filtered_df.drop(columns="pval", inplace=True)
-        filtered_df["name"] = "."
-        filtered_df = filtered_df.loc[:, ("chromosome", "start", "end", "name", "padj", "strand", "reads")]
-        quantiles_tested.append(quantile)
-        windows_remain.append(filtered_df.shape[0])
-        windows_rejected.append(sum(read_out < fdr_target))
+    # Every quantile threshold defines a subset; identical thresholds give identical subsets, so the
+    # multiple-testing correction is computed once per distinct threshold. Only the selected subset is
+    # materialised as a DataFrame (same construction as before, so the result is identical).
+    def _materialise(probe, read_out):
+        filtered = df.loc[probe, :].copy()
+        filtered["padj"] = read_out
+        filtered["name"] = "."
+        return filtered.loc[:, ("chromosome", "start", "end", "name", "padj", "strand", "reads")]
 
-        if len(windows_rejected) > 0:
-            if windows_rejected[-1] >= max(windows_rejected):
-                adjusted_df = filtered_df
-                select_probe = tmp_probe
-                read_counts_threshold = threshold
-        else:
-            adjusted_df = filtered_df
+    reads_col = df["reads"]
+    pval_col = df["pval"]
+    per_threshold = {}
+    selected = None
+    for quantile in np.arange(0, 1, 0.005):
+        threshold = reads_col.quantile(quantile)
+        hit = per_threshold.get(threshold) if threshold == threshold else None
+        if hit is None:
+            tmp_probe = reads_col > threshold
+            sub_p = pval_col.loc[tmp_probe]
+            try:
+                read_out = multipletests(sub_p, alpha=fdr_target, method=adjust_method)[1]
+            except ZeroDivisionError:
+                # if we cannot run BH, then we use Bonferroni correction
+                read_out = sub_p * sub_p.shape[0]
+            hit = (tmp_probe, read_out, int(sub_p.shape[0]), sum(read_out < fdr_target))
+            if threshold == threshold:
+                per_threshold[threshold] = hit
+        tmp_probe, read_out, n_remain, n_rejected = hit
+        quantiles_tested.append(quantile)
+        windows_remain.append(n_remain)
+        windows_rejected.append(n_rejected)
+
+        if windows_rejected[-1] >= max(windows_rejected):
+            selected = (tmp_probe, read_out)
             select_probe = tmp_probe
             read_counts_threshold = threshold
+    if selected is not None:
+        adjusted_df = _materialise(*selected)
 
     optimized_threshold = np.argmax(windows_rejected)
     logger.info("Optimized filters from independent filtering: percentile %f, rejection %d" % (
