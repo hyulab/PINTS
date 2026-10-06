@@ -741,43 +741,144 @@ def check_window_chromosome(rc_file, output_file, strand_sign, chromosome_name, 
         Window bed in dataframe
     """
     global housekeeping_files
-    per_base_cov = np.load(rc_file, allow_pickle=True)
-    subpeak_bed = output_file.replace(".bed", __SUB_PEAK_TPL__ % chromosome_name)
-    if fc_cutoff > 0:
-        real_fc_cutoff = 1. / fc_cutoff
-    else:
-        real_fc_cutoff = 1.
+    ctx = _subpeak_phase1(rc_file, output_file, strand_sign, chromosome_name, subpeak_file,
+                          small_peak_threshold=small_peak_threshold, min_mu_percent=min_mu_percent,
+                          disable_qc=disable_qc, enable_eler=enable_eler, eler_min=eler_min)
     bins = []
+    if ctx["error"] is None:
+        bins, err = _check_window_block(rc_file, chromosome_name, ctx["lines"], ctx["lines"], ctx,
+                                        fdr_target, disable_ler, sensitive, fc_cutoff, init_dens_cutoff,
+                                        init_height_cutoff)
+        if err is not None:
+            logger.error(str(chromosome_name) + "\t" + str(subpeak_file))
+            logger.error(err)
+    return _bins_to_df(bins, strand_sign)
+
+# ---------------------------------------------------------------------------------------------------
+# Window evaluation engine (phase 1: subpeak statistics + thresholds; phase 2: local-environment tests)
+#
+# Phase 2 is sequential within a chromosome only through the LER cache, whose keys are (clipped)
+# coordinates of subpeaks overlapping the flanks (<= max(flanking) // 2 bp) of the tested peak. Two
+# runs of subpeaks separated by a gap of more than 2 * max flank can never share a cache key, so they
+# can be evaluated independently (each with a fresh cache) and concatenated in file order. This is
+# what allows splitting a chromosome into chunks without changing any output byte.
+# ---------------------------------------------------------------------------------------------------
+_FLANK_MAX_HALF = 10000 // 2
+_SEGMENT_GAP = 15000  # > 2 * _FLANK_MAX_HALF, conservative
+_MIN_P1_BLOCK = 500  # minimum subpeaks per phase-1 task (tests lower these to force splitting)
+_MIN_P2_CHUNK = 200  # minimum subpeaks per phase-2 chunk
+_RESULT_COLUMNS = ("chromosome", "start", "end", "name", "pval", "reads",
+                   "mu_0", "pi_0", "mu_1", "pi_1", "var_1", "summit", "summit_val",
+                   "ler_1", "ler_2", "ler_3", "non_zeros")
+
+
+def _load_coverage(rc_file):
+    """Read-only, page-cache-shared view of a coverage dump (same values/dtype as np.load)."""
+    try:
+        return np.asarray(np.load(rc_file, mmap_mode="r"))
+    except ValueError:
+        return np.load(rc_file, allow_pickle=True)
+
+
+class SubpeakIndex:
+    """
+    In-memory stand-in for ``pysam.TabixFile`` over one chromosome's subpeak bed.
+
+    ``fetch`` reproduces tabix semantics for 0-based half-open BED records: records with
+    ``start < query_end`` and ``end > query_start`` are returned in file order; an empty query
+    (``query_end <= query_start``) returns nothing. Records must be sorted by start and have positive
+    length (`is_supported`); otherwise callers keep using tabix.
+    """
+
+    def __init__(self, chromosome, lines):
+        from bisect import bisect_left, bisect_right
+        self._bl, self._br = bisect_left, bisect_right
+        self.chromosome = chromosome
+        self.fields = [ln.split("\t") for ln in lines]
+        self.starts = [int(f[1]) for f in self.fields]
+        self.ends = [int(f[2]) for f in self.fields]
+        self.prefix_max_end = []
+        m = -1
+        for e in self.ends:
+            m = e if e > m else m
+            self.prefix_max_end.append(m)
+
+    def is_supported(self):
+        st, en = self.starts, self.ends
+        # strictly increasing starts: then file order is the unique (chrom, start)-sorted order that
+        # `bedtools sort` (unstable for ties) produces for the tabix file
+        return all(e > s for s, e in zip(st, en)) and all(st[i] < st[i + 1] for i in range(len(st) - 1))
+
+    def indices(self, start, end):
+        if end <= start:
+            return range(0)
+        hi = self._bl(self.starts, end)
+        lo = self._br(self.prefix_max_end, start)
+        return [i for i in range(lo, hi) if self.ends[i] > start]
+
+    def fetch(self, chromosome, start, end, parser=None):
+        if chromosome != self.chromosome:
+            raise ValueError("could not create iterator for region '%s:%d-%d'" % (chromosome, start + 1, end))
+        if start < 0:
+            raise ValueError("start out of range (%d)" % start)
+        f = self.fields
+        return [f[i] for i in self.indices(start, end)]
+
+
+def _subpeak_block_stats(rc_file, chromosome_name, strand_sign, raw_lines, small_peak_threshold):
+    """Phase-1 worker: per-subpeak statistics, formatted exactly as the subpeak bed lines."""
+    per_base_cov = _load_coverage(rc_file)
+    out_lines = []
     all_peak_mus = []
     try:
-        with open(subpeak_bed, "w") as spb_fh, gzip.open(subpeak_file, "rt") as peak_obj:
-            for line in peak_obj:
-                items = line.strip().split("\t")
-                start = int(items[1])
-                end = int(items[2])
-                peak_region = per_base_cov[start:end]
-                window_value = peak_region.sum()
-                n_start_sizes = sum(peak_region > 0)  # if n start sizes is smaller than 3, then ZIP shouldn't be used
-                peak_len = end - start
-                if peak_len < small_peak_threshold \
-                        or window_value == 0 or n_start_sizes <= 3:
-                    mu_peak = window_value / peak_len
-                    var_peak = np.var(np.log2(peak_region + np.finfo(float).eps))
-                    pi_peak = 0
-                else:
-                    mu_peak, var_peak, pi_peak, _, _ = stat_tester.fit(peak_region)
-                    all_peak_mus.append(mu_peak)
-                x = np.argmax(peak_region)
-                summit_coord = start + x
-                non_zero_loci = (peak_region > 0).sum()
+        for line in raw_lines:
+            items = line.strip().split("\t")
+            start = int(items[1])
+            end = int(items[2])
+            peak_region = per_base_cov[start:end]
+            window_value = peak_region.sum()
+            n_start_sizes = sum(peak_region > 0)  # if n start sizes is smaller than 3, then ZIP shouldn't be used
+            peak_len = end - start
+            if peak_len < small_peak_threshold \
+                    or window_value == 0 or n_start_sizes <= 3:
+                mu_peak = window_value / peak_len
+                var_peak = np.var(np.log2(peak_region + np.finfo(float).eps))
+                pi_peak = 0
+            else:
+                mu_peak, var_peak, pi_peak, _, _ = stat_tester.fit(peak_region)
+                all_peak_mus.append(mu_peak)
+            x = np.argmax(peak_region)
+            summit_coord = start + x
+            non_zero_loci = (peak_region > 0).sum()
 
-                spb_fh.write("%s\t%d\t%d\t%s\t%f\t%s\t%s\t%f\t%d\t%d\t%d\n" % (
-                    chromosome_name, start, end, items[3], mu_peak, var_peak, strand_sign, pi_peak, non_zero_loci, 
-                    summit_coord, peak_region[x]))
+            out_lines.append("%s\t%d\t%d\t%s\t%f\t%s\t%s\t%f\t%d\t%d\t%d\n" % (
+                chromosome_name, start, end, items[3], mu_peak, var_peak, strand_sign, pi_peak, non_zero_loci,
+                summit_coord, peak_region[x]))
+    except TypeError as ex:
+        return out_lines, all_peak_mus, ex
+    return out_lines, all_peak_mus, None
 
+
+def _read_subpeak_input(subpeak_file):
+    with gzip.open(subpeak_file, "rt") as peak_obj:
+        return peak_obj.readlines()
+
+
+def _subpeak_thresholds(output_file, chromosome_name, subpeak_file, out_lines, all_peak_mus, error,
+                        min_mu_percent=0.1, disable_qc=False, enable_eler=True, eler_min=1.):
+    """Phase-1 reduce: write + index the subpeak bed and derive the per-chromosome thresholds."""
+    subpeak_bed = output_file.replace(".bed", __SUB_PEAK_TPL__ % chromosome_name)
+    ctx = {"lines": out_lines, "error": None, "chromosome": chromosome_name, "subpeak_file": subpeak_file,
+           "subpeak_bed": subpeak_bed}
+    with open(subpeak_bed, "w") as spb_fh:
+        spb_fh.writelines(out_lines)
+    if error is not None:
+        ctx["error"] = error
+        logger.error(str(chromosome_name) + "\t" + str(subpeak_file))
+        logger.error(error)
+        return ctx
+    try:
         index_bed_file(subpeak_bed, logger=logger)
-
-        bed_handler = pysam.TabixFile(subpeak_bed + ".gz", index=subpeak_bed + ".gz.csi")
         if len(all_peak_mus) == 0:
             peak_threshold = 1
             bkg_mu_threshold = 0
@@ -815,46 +916,257 @@ def check_window_chromosome(rc_file, output_file, strand_sign, chromosome_name, 
                     "background".format(
                         empirical_true_peak_threshold, chromosome_name)
                 )
-        global_cache = {}
-        with gzip.open(subpeak_bed + ".gz", "rt") as peak_obj:
-            for peak in peak_obj:
-                candidate_peak = peak.split("\t")
-                peak_start = int(candidate_peak[1])
-                peak_end = int(candidate_peak[2])
-                peak_id = candidate_peak[3]
-                mu_peak = float(candidate_peak[4])
-                peak_var = float(candidate_peak[5])
-                pi_peak = float(candidate_peak[7])
-                peak_non_zeros = int(candidate_peak[8])
-                peak_summit = int(candidate_peak[9])
-                peak_summit_val = int(candidate_peak[10])
-
-                pval, wv, mu_bg, pi_bg, lerc, lrtp, sig_dens = check_window(
-                    coord_start=peak_start, coord_end=peak_end, mu_peak=mu_peak,
-                    var_peak=peak_var, pi_peak=pi_peak, chromosome_coverage=per_base_cov,
-                    peak_in_bg_threshold=peak_threshold, mu_bkg_minimum=bkg_mu_threshold,
-                    sp_bed_handler=bed_handler, chromosome_name=chromosome_name,
-                    fdr_target=fdr_target, cache=global_cache, disable_ler=disable_ler,
-                    enable_eler=enable_eler, top_peak_mu=empirical_true_peak_threshold,
-                    compute_lrt=sensitive)
-                if wv > 0:
-                    use_lrt = sensitive and pi_peak > 0. and pi_bg > 0. and (
-                                mu_bg / mu_peak < real_fc_cutoff) and sig_dens > init_dens_cutoff and peak_summit_val > init_height_cutoff
-                    bins.append(
-                        (chromosome_name, peak_start, peak_end, peak_id, lrtp if use_lrt else pval,
-                         wv, mu_bg, pi_bg, mu_peak, pi_peak, peak_var, peak_summit, peak_summit_val,
-                         lerc[0], lerc[1], lerc[2], peak_non_zeros))
     except TypeError as ex:
+        ctx["error"] = ex
         logger.error(str(chromosome_name) + "\t" + str(subpeak_file))
         logger.error(ex)
-    result_df = pd.DataFrame(bins, columns=("chromosome", "start", "end", "name", "pval", "reads",
-                                            "mu_0", "pi_0", "mu_1", "pi_1", "var_1", "summit", "summit_val",
-                                            "ler_1", "ler_2", "ler_3", "non_zeros"))
+        return ctx
+    ctx.update(peak_threshold=peak_threshold, bkg_mu_threshold=bkg_mu_threshold,
+               empirical_true_peak_threshold=empirical_true_peak_threshold, enable_eler=enable_eler)
+    return ctx
+
+
+def _subpeak_phase1(rc_file, output_file, strand_sign, chromosome_name, subpeak_file, small_peak_threshold=5,
+                    min_mu_percent=0.1, disable_qc=False, enable_eler=True, eler_min=1.):
+    raw = _read_subpeak_input(subpeak_file)
+    out_lines, mus, err = _subpeak_block_stats(rc_file, chromosome_name, strand_sign, raw, small_peak_threshold)
+    return _subpeak_thresholds(output_file, chromosome_name, subpeak_file, out_lines, mus, err,
+                               min_mu_percent=min_mu_percent, disable_qc=disable_qc, enable_eler=enable_eler,
+                               eler_min=eler_min)
+
+
+def _check_window_block(rc_file, chromosome_name, peak_lines, context_lines, ctx, fdr_target, disable_ler=False,
+                        sensitive=False, fc_cutoff=1.5, init_dens_cutoff=0.25, init_height_cutoff=4,
+                        chromosome_coverage=None):
+    """
+    Phase-2 worker: evaluate `peak_lines` (consecutive subpeak bed lines) with a fresh LER cache.
+
+    `context_lines` must contain every subpeak overlapping the flanks of the tested peaks (in file
+    order). Returns (bins, error) where error is a caught TypeError (as in the original loop) or None.
+    """
+    per_base_cov = _load_coverage(rc_file) if chromosome_coverage is None else chromosome_coverage
+    if fc_cutoff > 0:
+        real_fc_cutoff = 1. / fc_cutoff
+    else:
+        real_fc_cutoff = 1.
+    index = SubpeakIndex(chromosome_name, context_lines)
+    if index.is_supported():
+        bed_handler = index
+    else:  # ties / unsorted / empty records: use the tabix file itself
+        bed_handler = pysam.TabixFile(ctx["subpeak_bed"] + ".gz", index=ctx["subpeak_bed"] + ".gz.csi")
+    peak_threshold = ctx["peak_threshold"]
+    bkg_mu_threshold = ctx["bkg_mu_threshold"]
+    enable_eler = ctx["enable_eler"]
+    empirical_true_peak_threshold = ctx["empirical_true_peak_threshold"]
+    bins = []
+    global_cache = {}
+    try:
+        for peak in peak_lines:
+            candidate_peak = peak.split("\t")
+            peak_start = int(candidate_peak[1])
+            peak_end = int(candidate_peak[2])
+            peak_id = candidate_peak[3]
+            mu_peak = float(candidate_peak[4])
+            peak_var = float(candidate_peak[5])
+            pi_peak = float(candidate_peak[7])
+            peak_non_zeros = int(candidate_peak[8])
+            peak_summit = int(candidate_peak[9])
+            peak_summit_val = int(candidate_peak[10])
+
+            pval, wv, mu_bg, pi_bg, lerc, lrtp, sig_dens = check_window(
+                coord_start=peak_start, coord_end=peak_end, mu_peak=mu_peak,
+                var_peak=peak_var, pi_peak=pi_peak, chromosome_coverage=per_base_cov,
+                peak_in_bg_threshold=peak_threshold, mu_bkg_minimum=bkg_mu_threshold,
+                sp_bed_handler=bed_handler, chromosome_name=chromosome_name,
+                fdr_target=fdr_target, cache=global_cache, disable_ler=disable_ler,
+                enable_eler=enable_eler, top_peak_mu=empirical_true_peak_threshold,
+                compute_lrt=sensitive)
+            if wv > 0:
+                use_lrt = sensitive and pi_peak > 0. and pi_bg > 0. and (
+                        mu_bg / mu_peak < real_fc_cutoff) and sig_dens > init_dens_cutoff and \
+                          peak_summit_val > init_height_cutoff
+                bins.append(
+                    (chromosome_name, peak_start, peak_end, peak_id, lrtp if use_lrt else pval,
+                     wv, mu_bg, pi_bg, mu_peak, pi_peak, peak_var, peak_summit, peak_summit_val,
+                     lerc[0], lerc[1], lerc[2], peak_non_zeros))
+    except TypeError as ex:
+        return bins, ex
+    return bins, None
+
+
+def _bins_to_df(bins, strand_sign):
+    result_df = pd.DataFrame(bins, columns=_RESULT_COLUMNS)
     result_df["strand"] = strand_sign
     result_df = result_df.loc[:, ("chromosome", "start", "end", "name", "pval", "strand", "reads",
                                   "mu_0", "pi_0", "mu_1", "pi_1", "var_1",
                                   "summit", "summit_val", "ler_1", "ler_2", "ler_3", "non_zeros")]
     return result_df
+
+
+def _segment_chunks(lines, target):
+    """
+    Split subpeak lines (file order) into chunks of whole independent segments (gap >= _SEGMENT_GAP)
+    with roughly `target` lines each. Returns list of (lo, hi) line-index ranges.
+    """
+    if target <= 0 or len(lines) <= target:
+        return [(0, len(lines))]
+    chunks = []
+    lo = 0
+    max_end = None
+    for i, ln in enumerate(lines):
+        f = ln.split("\t", 3)
+        s, e = int(f[1]), int(f[2])
+        if max_end is not None and s - max_end >= _SEGMENT_GAP and i - lo >= target:
+            chunks.append((lo, i))
+            lo = i
+        max_end = e if max_end is None or e > max_end else max_end
+    chunks.append((lo, len(lines)))
+    return chunks
+
+
+def _context_for(index, lines, lo, hi):
+    """Lines overlapping the flanks of lines[lo:hi] (superset of anything LER may query)."""
+    st = index.starts[lo:hi]
+    en = index.prefix_max_end[hi - 1]
+    q0 = max(min(st) - _FLANK_MAX_HALF - 2, 0)
+    q1 = en + _FLANK_MAX_HALF + 2
+    return [lines[i] for i in index.indices(q0, q1)]
+
+
+def _worker_init(model_name, iqr_name):
+    """Pool initializer: make the statistical model/IQR strategy available in every worker (spawn-safe)."""
+    global stat_tester, iqr_obj
+    from . import stats_engine as _se
+    stat_tester = getattr(_se, model_name)() if model_name else None
+    iqr_obj = getattr(_se, iqr_name)() if iqr_name else None
+
+
+def _make_pool(n):
+    import multiprocessing as mp
+    try:
+        ctx = mp.get_context("fork")
+    except ValueError:  # pragma: no cover - platforms without fork
+        ctx = mp.get_context()
+    init_args = (type(stat_tester).__name__ if stat_tester is not None else None,
+                 type(iqr_obj).__name__ if iqr_obj is not None else None)
+    return ctx.Pool(n, initializer=_worker_init, initargs=init_args)
+
+
+def _run_tasks(pool, func, tasks, costs=None):
+    """Run star-tasks (ordered results) on `pool` (or inline when pool is None), longest first."""
+    if pool is None or len(tasks) <= 1:
+        return [func(*t) for t in tasks]
+    order = list(range(len(tasks)))
+    if costs is not None:
+        order.sort(key=lambda i: -costs[i])
+    out = [None] * len(tasks)
+    res = pool.starmap(_indexed_call, [(i, func, tasks[i]) for i in order], chunksize=1)
+    for i, r in res:
+        out[i] = r
+    return out
+
+
+def _indexed_call(i, func, args):
+    return i, func(*args)
+
+
+def evaluate_strand_jobs(jobs, fdr_target, pool=None, thread_n=1, **kwargs):
+    """
+    Evaluate candidate peaks for several (sample, strand) jobs at once.
+
+    Parameters
+    ----------
+    jobs : list of tuples
+        (per_base_cov, output_file, shared_peak_definitions, strand_sign) as in `peaks_single_strand`
+    fdr_target : float
+    pool : multiprocessing pool or None
+    thread_n : int
+        Used for chunk sizing only
+
+    Returns
+    -------
+    sub_dfs : list of lists of pd.DataFrame
+        For every job, the per-chromosome result frames (in per_base_cov order), identical to the
+        frames produced by `check_window_chromosome`.
+    """
+    small_peak_threshold = kwargs.get("small_peak_threshold", 5)
+    min_mu_percent = kwargs.get("min_mu_percent", 0.1)
+    disable_qc = kwargs.get("disable_qc", False)
+    disable_ler = kwargs.get("disable_ler", False)
+    enable_eler = kwargs.get("enable_eler", True)
+    eler_min = kwargs.get("eler_lower_bound", 1.)
+    sensitive = kwargs.get("sensitive", False)
+    fc_cutoff = kwargs.get("fc_cutoff", 1.5)
+    init_dens_cutoff = kwargs.get("init_dens_cutoff", 0.25)
+    init_height_cutoff = kwargs.get("init_height_cutoff", 4)
+
+    units = []  # (job index, chromosome, rc_file, output_file, strand, subpeak_file)
+    for j, (per_base_cov, output_file, spd, strand_sign) in enumerate(jobs):
+        for chrom, pbc_npy in per_base_cov.items():
+            if spd[chrom] is None:
+                continue
+            units.append((j, chrom, pbc_npy, output_file, strand_sign, spd[chrom]))
+
+    # ---- phase 1: per-subpeak statistics, in blocks
+    raws = [_read_subpeak_input(u[5]) for u in units]
+    total = sum(len(r) for r in raws)
+    workers = max(1, thread_n if pool is not None else 1)
+    block = max(_MIN_P1_BLOCK, total // (workers * 4) + 1) if pool is not None else 0
+    p1_tasks, p1_owner = [], []
+    for ui, (u, raw) in enumerate(zip(units, raws)):
+        if block <= 0 or len(raw) <= block:
+            ranges = [(0, len(raw))]
+        else:
+            ranges = [(a, min(a + block, len(raw))) for a in range(0, len(raw), block)]
+        for a, b in ranges:
+            p1_tasks.append((u[2], u[1], u[4], raw[a:b], small_peak_threshold))
+            p1_owner.append(ui)
+    p1_res = _run_tasks(pool, _subpeak_block_stats, p1_tasks, costs=[len(t[3]) for t in p1_tasks])
+
+    ctxs = []
+    for ui, u in enumerate(units):
+        out_lines, mus, err = [], [], None
+        for owner, (ol, m, e) in zip(p1_owner, p1_res):
+            if owner != ui or err is not None:
+                continue
+            out_lines.extend(ol)
+            mus.extend(m)
+            err = e
+        ctxs.append(_subpeak_thresholds(u[3], u[1], u[5], out_lines, mus, err, min_mu_percent=min_mu_percent,
+                                        disable_qc=disable_qc, enable_eler=enable_eler, eler_min=eler_min))
+
+    # ---- phase 2: local-environment tests, in independent chunks
+    total2 = sum(len(c["lines"]) for c in ctxs if c["error"] is None)
+    target = max(_MIN_P2_CHUNK, total2 // (workers * 8) + 1) if pool is not None else 0
+    p2_tasks, p2_owner = [], []
+    for ui, (u, c) in enumerate(zip(units, ctxs)):
+        if c["error"] is not None:
+            continue
+        lines = c["lines"]
+        index = SubpeakIndex(u[1], lines)
+        slim = {k: v for k, v in c.items() if k != "lines"}
+        for lo, hi in (_segment_chunks(lines, target) if index.is_supported() else [(0, len(lines))]):
+            context = lines if (lo == 0 and hi == len(lines)) else _context_for(index, lines, lo, hi)
+            p2_tasks.append((u[2], u[1], lines[lo:hi], context, slim, fdr_target, disable_ler, sensitive,
+                             fc_cutoff, init_dens_cutoff, init_height_cutoff))
+            p2_owner.append(ui)
+    p2_res = _run_tasks(pool, _check_window_block, p2_tasks, costs=[len(t[2]) for t in p2_tasks])
+
+    per_unit_bins = [[] for _ in units]
+    stopped = [False] * len(units)
+    for ui, (bins, err) in zip(p2_owner, p2_res):
+        if stopped[ui]:
+            continue
+        per_unit_bins[ui].extend(bins)
+        if err is not None:  # original loop stops at the first TypeError of a chromosome
+            stopped[ui] = True
+            logger.error(str(units[ui][1]) + "\t" + str(units[ui][5]))
+            logger.error(err)
+
+    sub_dfs = [[] for _ in jobs]
+    for ui, u in enumerate(units):
+        sub_dfs[u[0]].append(_bins_to_df(per_unit_bins[ui], u[4]))
+    return sub_dfs
 
 
 def stratified_filtering(tmp_df, output_file, fdr_target, dry_run=False, **kwargs):
@@ -987,7 +1299,7 @@ def stratified_filtering(tmp_df, output_file, fdr_target, dry_run=False, **kwarg
 
 
 def peaks_single_strand(per_base_cov, output_file, shared_peak_definitions, strand_sign, fdr_target,
-                        **kwargs):
+                        precomputed=None, **kwargs):
     """
     Calling peaks on one strand
 
@@ -1028,16 +1340,15 @@ def peaks_single_strand(per_base_cov, output_file, shared_peak_definitions, stra
         housekeeping_files.append(sub_peaks_name + ".gz")
         housekeeping_files.append(sub_peaks_name + ".gz.csi")
 
-    if kwargs.get("thread_n", 1) == 1:
-        # for debugging
-        sub_dfs = []
-        for arg_i in args:
-            sub_dfs.append(
-                check_window_chromosome(*arg_i)
-            )
+    if precomputed is not None:
+        sub_dfs = precomputed
+    elif kwargs.get("thread_n", 1) == 1:
+        sub_dfs = evaluate_strand_jobs([(per_base_cov, output_file, shared_peak_definitions, strand_sign)],
+                                       fdr_target, pool=None, **kwargs)[0]
     else:
-        with Pool(kwargs.get("thread_n", 1)) as pool:
-            sub_dfs = pool.starmap(check_window_chromosome, args)
+        with _make_pool(kwargs.get("thread_n", 1)) as pool:
+            sub_dfs = evaluate_strand_jobs([(per_base_cov, output_file, shared_peak_definitions, strand_sign)],
+                                           fdr_target, pool=pool, **kwargs)[0]
 
     sub_dfs = [sdf for sdf in sub_dfs if sdf is not None]
     log_assert(len(sub_dfs) > 0, "No signal found across all chromosomes!", logger)
