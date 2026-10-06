@@ -865,8 +865,12 @@ def _read_subpeak_input(subpeak_file):
 
 
 def _subpeak_thresholds(output_file, chromosome_name, subpeak_file, out_lines, all_peak_mus, error,
-                        min_mu_percent=0.1, disable_qc=False, enable_eler=True, eler_min=1.):
-    """Phase-1 reduce: write + index the subpeak bed and derive the per-chromosome thresholds."""
+                        min_mu_percent=0.1, disable_qc=False, enable_eler=True, eler_min=1., indexer=None):
+    """Phase-1 reduce: write + index the subpeak bed and derive the per-chromosome thresholds.
+
+    `indexer`, if given, is called instead of `index_bed_file` (used to compress/index on the pool while the
+    parent continues; the compressed file is only read by the tabix fallback and by housekeeping).
+    """
     subpeak_bed = output_file.replace(".bed", __SUB_PEAK_TPL__ % chromosome_name)
     ctx = {"lines": out_lines, "error": None, "chromosome": chromosome_name, "subpeak_file": subpeak_file,
            "subpeak_bed": subpeak_bed}
@@ -878,7 +882,10 @@ def _subpeak_thresholds(output_file, chromosome_name, subpeak_file, out_lines, a
         logger.error(error)
         return ctx
     try:
-        index_bed_file(subpeak_bed, logger=logger)
+        if indexer is None:
+            index_bed_file(subpeak_bed, logger=logger)
+        else:
+            indexer(subpeak_bed)
         if len(all_peak_mus) == 0:
             peak_threshold = 1
             bkg_mu_threshold = 0
@@ -1070,6 +1077,10 @@ def _indexed_call(i, func, args):
     return i, func(*args)
 
 
+def _index_bed_task(path):
+    index_bed_file(path, logger=logger)
+
+
 def _stratified_filtering_task(tmp_df, output_file, fdr_target, kwargs):
     return stratified_filtering(tmp_df=tmp_df, output_file=output_file, fdr_target=fdr_target, **kwargs)
 
@@ -1155,6 +1166,11 @@ def evaluate_strand_jobs(jobs, fdr_target, pool=None, thread_n=1, **kwargs):
     _phase("phase1 stats")
 
     ctxs = []
+    pending_index = []
+    indexer = None
+    if pool is not None:
+        def indexer(path):
+            pending_index.append(pool.apply_async(_index_bed_task, (path,)))
     for ui, u in enumerate(units):
         out_lines, mus, err = [], [], None
         for owner, (ol, m, e) in zip(p1_owner, p1_res):
@@ -1164,7 +1180,8 @@ def evaluate_strand_jobs(jobs, fdr_target, pool=None, thread_n=1, **kwargs):
             mus.extend(m)
             err = e
         ctxs.append(_subpeak_thresholds(u[3], u[1], u[5], out_lines, mus, err, min_mu_percent=min_mu_percent,
-                                        disable_qc=disable_qc, enable_eler=enable_eler, eler_min=eler_min))
+                                        disable_qc=disable_qc, enable_eler=enable_eler, eler_min=eler_min,
+                                        indexer=indexer))
 
     _phase("phase1 thresholds")
     # ---- phase 2: local-environment tests, in independent chunks
@@ -1176,6 +1193,10 @@ def evaluate_strand_jobs(jobs, fdr_target, pool=None, thread_n=1, **kwargs):
             continue
         lines = c["lines"]
         index = SubpeakIndex(u[1], lines)
+        if not index.is_supported():  # tabix fallback reads the compressed subpeak bed
+            for r in pending_index:
+                r.get()
+            pending_index = []
         slim = {k: v for k, v in c.items() if k != "lines"}
         for lo, hi in (_segment_chunks(lines, target) if index.is_supported() else [(0, len(lines))]):
             context = lines if (lo == 0 and hi == len(lines)) else _context_for(index, lines, lo, hi)
@@ -1185,6 +1206,8 @@ def evaluate_strand_jobs(jobs, fdr_target, pool=None, thread_n=1, **kwargs):
     _phase("phase2 setup")
     p2_res = _run_tasks(pool, _check_window_block, p2_tasks, costs=[len(t[2]) for t in p2_tasks])
     _phase("phase2 tests")
+    for r in pending_index:
+        r.get()
 
     per_unit_bins = [[] for _ in units]
     stopped = [False] * len(units)
@@ -2145,7 +2168,8 @@ def parse_input_files(output_dir, output_prefix, filters, pl_cov_target, mn_cov_
 
     if merge_replicates and len(pl_cov_target) > 1:
         pl_covs, mn_covs, pl_rc, mn_rc = merge_replicates_bw(pl_cov_target, mn_cov_target, output_dir,
-                                                             output_prefix + "_merged")
+                                                             output_prefix + "_merged",
+                                                             threads=kwargs.get("thread_n", 1))
         pl_cov_target[:] = pl_cov_target[:1]
         mn_cov_target[:] = mn_cov_target[:1]
         rc_target[:] = [pl_rc + mn_rc, ]
@@ -2297,7 +2321,7 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
                                              scale_factor=scale_factor,
                                              output_dir=output_dir,
                                              output_prefix=output_prefix + "_inputnorm_%d" % i,
-                                             logger=logger)
+                                             logger=logger, threads=thread_n)
             chromosome_coverage_pl[i] = plc
             chromosome_coverage_mn[i] = mnc
             logger.info("Signals adjusted.")

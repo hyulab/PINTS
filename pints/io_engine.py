@@ -867,7 +867,23 @@ def get_read_signal(input_bam, loc_prime, chromosome_startswith, output_dir, out
     return result_pl, result_mn, read_counts
 
 
-def normalize_using_input(assay_pl, assay_mn, input_pl, input_mn, scale_factor, output_dir, output_prefix, logger):
+def _normalize_chrom_worker(npy_dump, input_npy, sf, fn):
+    """One chromosome of `normalize_using_input` (non-zero-track branch); returns fn or None."""
+    matched_input = np.load(input_npy) * sf
+    exp = np.load(npy_dump)
+    adjusted_signal = exp - matched_input
+    adjusted_signal[adjusted_signal < 0] = 0
+    chrom_max = np.max(adjusted_signal)
+    for k, v in enumerate(NP_DT_RANGE):
+        if v > chrom_max:
+            adjusted_signal = adjusted_signal.astype(NP_DT_NAME[k], copy=False)
+            np.save(fn, adjusted_signal)
+            return fn
+    return None
+
+
+def normalize_using_input(assay_pl, assay_mn, input_pl, input_mn, scale_factor, output_dir, output_prefix, logger,
+                          threads=1):
     """
     Normalize signal using input/control
 
@@ -923,9 +939,35 @@ def normalize_using_input(assay_pl, assay_mn, input_pl, input_mn, scale_factor, 
                 logger.warning("%s doesn't have paired input/control" % chrom_name)
         return results
 
-    coverage_pl = strand_atom(assay_pl, input_pl, sf=scale_factor, direction="pl")
-    coverage_mn = strand_atom(assay_mn, input_mn, sf=scale_factor, direction="mn")
-    return coverage_pl, coverage_mn
+    if threads <= 1:
+        coverage_pl = strand_atom(assay_pl, input_pl, sf=scale_factor, direction="pl")
+        coverage_mn = strand_atom(assay_mn, input_mn, sf=scale_factor, direction="mn")
+        return coverage_pl, coverage_mn
+
+    # parallel form: identical per-chromosome operations; dict order, zero tracks and warnings as above
+    plan, tasks = [], []
+    for assay_coverage, input_coverage, direction in ((assay_pl, input_pl, "pl"), (assay_mn, input_mn, "mn")):
+        for chrom_name, npy_dump in assay_coverage.items():
+            fn = os.path.join(output_dir, output_prefix + "_%s_%s" % (direction, chrom_name)) + ".npy"
+            sf = scale_factor
+            if chrom_name in input_coverage and is_zero_track(npy_dump) and np.isfinite(sf) and sf >= 0:
+                plan.append((direction, chrom_name, "zero", npy_dump, fn))
+            elif chrom_name in input_coverage:
+                plan.append((direction, chrom_name, len(tasks), npy_dump, fn))
+                tasks.append((npy_dump, input_coverage[chrom_name], sf, fn))
+            else:
+                plan.append((direction, chrom_name, "missing", npy_dump, fn))
+    res = _fork_pool_map(_normalize_chrom_worker, tasks, threads, costs=[_npy_cost(t[0]) for t in tasks])
+    out = {"pl": {}, "mn": {}}
+    for direction, chrom_name, how, npy_dump, fn in plan:
+        if how == "zero":
+            length = np.load(npy_dump, mmap_mode="r").shape[0]
+            out[direction][chrom_name] = save_zero_track(fn, length, NP_DT_NAME[0])
+        elif how == "missing":
+            logger.warning("%s doesn't have paired input/control" % chrom_name)
+        elif res[how] is not None:
+            out[direction][chrom_name] = res[how]
+    return out["pl"], out["mn"]
 
 
 def get_coverage(input_bam, library_type, chromosome_startswith, output_dir, output_prefix, **kwargs):
@@ -1238,7 +1280,45 @@ def peak_bed_to_gtf(pl_df, mn_df, save_to, version=""):
     index_bed_file(save_to)
 
 
-def merge_replicates_bw(per_sample_coverage_pls, per_sample_coverage_mns, output_dir, output_prefix):
+def _merge_rep_chrom_worker(pl_files, mn_files, pl_fn, mn_fn):
+    """One chromosome of `merge_replicates_bw` (same operations, same order); returns (pl_sum, mn_sum)."""
+    def merge_chromosome_data(files):
+        merged = np.load(files[0]).astype(np.int32)
+        for f in files[1:]:
+            merged += np.load(f)
+        return merged
+
+    merged_pl_data = merge_chromosome_data(pl_files)
+    pl_s = np.sum(merged_pl_data)
+    merged_mn_data = merge_chromosome_data(mn_files)
+    mn_s = np.sum(merged_mn_data)
+    data_type = determine_data_type(np.max(merged_pl_data))
+    np.save(pl_fn, merged_pl_data.astype(data_type, copy=False))
+    data_type = determine_data_type(np.max(merged_mn_data))
+    np.save(mn_fn, merged_mn_data.astype(data_type, copy=False))
+    return pl_s, mn_s
+
+
+def _fork_pool_map(func, tasks, threads, costs=None):
+    """Order-preserving starmap on a short-lived fork pool (inline when threads <= 1 or a single task)."""
+    if threads <= 1 or len(tasks) <= 1:
+        return [func(*t) for t in tasks]
+    from multiprocessing import get_context
+    order = list(range(len(tasks)))
+    if costs is not None:
+        order.sort(key=lambda i: -costs[i])
+    out = [None] * len(tasks)
+    with get_context("fork").Pool(min(threads, len(tasks))) as pool:
+        for i, r in zip(order, pool.starmap(func, [tasks[i] for i in order], chunksize=1)):
+            out[i] = r
+    return out
+
+
+def _npy_cost(path):
+    return os.path.getsize(path) if isinstance(path, str) and os.path.exists(path) else 0
+
+
+def merge_replicates_bw(per_sample_coverage_pls, per_sample_coverage_mns, output_dir, output_prefix, threads=1):
     """
     Merge replicate files for 'plus' and 'minus' strand coverage into a consolidated format and save the
     merged data to disk. This function processes chromosome-specific coverage files for each replicate,
@@ -1308,6 +1388,26 @@ def merge_replicates_bw(per_sample_coverage_pls, per_sample_coverage_mns, output
         merged_mn = per_sample_coverage_mns[0]
     elif len(per_sample_coverage_pls) == 0:
         raise ValueError("Number of replicates for pl and mn must be greater than 1.")
+    elif threads > 1:
+        # same chromosome iteration order (set order), same per-chromosome operations, run on a pool
+        tasks, keys = [], []
+        for chrom in shared_chromosomes:
+            pl_fn = os.path.join(output_dir, "%s_pl_%s.npy" % (output_prefix, chrom))
+            mn_fn = os.path.join(output_dir, "%s_mn_%s.npy" % (output_prefix, chrom))
+            if all(is_zero_track(d[chrom]) for d in per_sample_coverage_pls + per_sample_coverage_mns):
+                length = np.load(per_sample_coverage_pls[0][chrom], mmap_mode="r").shape[0]
+                merged_pl[chrom] = save_zero_track(pl_fn, length, determine_data_type(0))
+                merged_mn[chrom] = save_zero_track(mn_fn, length, determine_data_type(0))
+                continue
+            merged_pl[chrom] = pl_fn
+            merged_mn[chrom] = mn_fn
+            tasks.append(([d[chrom] for d in per_sample_coverage_pls], [d[chrom] for d in per_sample_coverage_mns],
+                          pl_fn, mn_fn))
+        sums = _fork_pool_map(_merge_rep_chrom_worker, tasks, threads,
+                              costs=[sum(_npy_cost(f) for f in t[0]) for t in tasks])
+        for pl_s, mn_s in sums:
+            pl_rc += pl_s
+            mn_rc += mn_s
     else:
         for chrom in shared_chromosomes:
             pl_fn = os.path.join(output_dir, "%s_pl_%s.npy" % (output_prefix, chrom))
