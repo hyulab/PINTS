@@ -50,6 +50,55 @@ def is_zero_track(path):
     return isinstance(path, str) and os.path.abspath(path) in _ZERO_TRACKS
 
 
+# ---------------------------------------------------------------------------------------------------
+# Block-wise access to 1-D .npy coverage dumps. Readers use plain file reads (no memory map, so pages
+# are not kept resident) and writers put the data behind the exact header np.save would write.
+# ---------------------------------------------------------------------------------------------------
+NPY_BLOCK = 8_000_000  # bases per block (a multiple of the 100-bp element-definition window)
+
+
+def npy_layout(path):
+    """(data_offset, dtype, length) of a plain 1-D, non-object .npy file; None for anything else."""
+    try:
+        with open(path, "rb") as fh:
+            version = np.lib.format.read_magic(fh)
+            if version == (1, 0):
+                shape, fortran, dtype = np.lib.format.read_array_header_1_0(fh)
+            elif version == (2, 0):
+                shape, fortran, dtype = np.lib.format.read_array_header_2_0(fh)
+            else:
+                return None
+            off = fh.tell()
+    except Exception:
+        return None
+    if dtype.hasobject or len(shape) != 1 or dtype.itemsize == 0:
+        return None
+    if os.path.getsize(path) < off + shape[0] * dtype.itemsize:
+        return None
+    return off, dtype, int(shape[0])
+
+
+def npy_read(fh, layout, a, b):
+    """Elements [a, b) of the .npy opened as `fh` (binary) with `layout` from `npy_layout`."""
+    off, dt, n = layout
+    out = np.empty(b - a, dtype=dt)
+    if b > a:
+        fh.seek(off + a * dt.itemsize)
+        if fh.readinto(out.view(np.uint8)) != (b - a) * dt.itemsize:
+            raise IOError("short read")
+    return out
+
+
+def _npy_create(path, dtype, length):
+    """Create `path` with np.save's header for a 1-D array (data region left as zeros); returns its layout."""
+    dtype = np.dtype(dtype)
+    header = {"descr": np.lib.format.dtype_to_descr(dtype), "fortran_order": False, "shape": (int(length),)}
+    with open(path, "wb") as fh:
+        np.lib.format.write_array_header_1_0(fh, header)  # what np.save writes for a 1-D array
+        fh.truncate(fh.tell() + int(length) * dtype.itemsize)  # sparse, zero-filled data region
+    return npy_layout(path)
+
+
 def _smallest_int_dtype(max_value):
     """Same dtype choice as the NP_DT_RANGE loops used when dumping coverage arrays."""
     for k, v in enumerate(NP_DT_RANGE):
@@ -332,6 +381,56 @@ def _bw_sparse_track(bw, chromosome, csize, data_type):
     return out
 
 
+_BW_IV_BLOCK = 1 << 22  # bases per bw.intervals() query in the block-wise sparse loader
+
+
+def _bw_blockwise_sparse(bw, chromosome, csize, data_type, npy_file, block=None):
+    """Block-wise form of `_bw_sparse_track` + `np.save`: same file bytes, same returned sum.
+
+    The track is written block by block (`intervals(chrom, a, b)` clipped to [a, b)) behind a header that is
+    identical to np.save's, so only one block of intervals / output is ever held in memory. Returns the
+    track sum (same scalar type as `np.sum(track)`), or None if the intervals are unusable (overlapping,
+    unsorted within a block, non-integer or out-of-range coordinates); the caller then uses the dense path,
+    which rewrites the file from scratch.
+    """
+    block = _BW_IV_BLOCK if block is None else int(block)
+    if csize <= 0:
+        return None
+    layout = _npy_create(npy_file, data_type, csize)
+    off, dt = layout[0], layout[1]
+    acc = np.sum(np.zeros(0, dtype=data_type)).dtype  # numpy's accumulator type for an integer sum
+    sums = []
+    with open(npy_file, "r+b") as fh:
+        for a in range(0, csize, block):
+            b = min(csize, a + block)
+            out = np.zeros(b - a, dtype=data_type)
+            iv = bw.intervals(chromosome, a, b)
+            if iv:
+                arr = np.asarray(iv, dtype=np.float64)
+                st = arr[:, 0].astype(np.int64)
+                en = arr[:, 1].astype(np.int64)
+                if not (np.array_equal(st, arr[:, 0]) and np.array_equal(en, arr[:, 1])):
+                    return None
+                if st.min() < 0 or en.max() > csize or np.any(en <= st) or np.any(st[1:] < en[:-1]) \
+                        or np.any(en <= a) or np.any(st >= b):
+                    return None
+                v = np.nan_to_num(arr[:, 2])
+                v[v < 0] *= -1
+                v = v.astype(data_type, copy=False)
+                cs = np.maximum(st, a) - a
+                ln = np.minimum(en, b) - a - cs
+                if np.all(ln == 1):
+                    out[cs] = v
+                else:
+                    offs = np.repeat(cs - np.concatenate(([0], np.cumsum(ln)[:-1])), ln)
+                    out[offs + np.arange(ln.sum())] = np.repeat(v, ln)
+            fh.seek(off + a * dt.itemsize)
+            fh.write(out.view(np.uint8))
+            sums.append(np.sum(out))
+    # wrap-around (if any) is modular, as in a single np.sum over the whole track
+    return np.sum(np.array(sums, dtype=acc))
+
+
 def _bw_chrom_worker(bw_file, chromosome, csize, data_type, npy_file, block=None):
     """Load one chromosome of a bigWig exactly as `_get_coverage_bw` does; returns np.sum of the track."""
     import pyBigWig
@@ -340,10 +439,9 @@ def _bw_chrom_worker(bw_file, chromosome, csize, data_type, npy_file, block=None
         return np.load(npy_file).sum()
     bw = pyBigWig.open(bw_file)
     try:
-        cov = _bw_sparse_track(bw, chromosome, int(csize), data_type)
-        if cov is not None:
-            np.save(npy_file, cov)
-            return np.sum(cov)
+        s = _bw_blockwise_sparse(bw, chromosome, int(csize), data_type, npy_file)
+        if s is not None:
+            return s
         if csize <= block:
             cov = np.nan_to_num(bw.values(chromosome, 0, csize, numpy=True))
             cov[cov < 0] *= -1
@@ -867,8 +965,38 @@ def get_read_signal(input_bam, loc_prime, chromosome_startswith, output_dir, out
     return result_pl, result_mn, read_counts
 
 
-def _normalize_chrom_worker(npy_dump, input_npy, sf, fn):
-    """One chromosome of `normalize_using_input` (non-zero-track branch); returns fn or None."""
+def _normalize_chrom_worker(npy_dump, input_npy, sf, fn, block=None):
+    """One chromosome of `normalize_using_input` (non-zero-track branch); returns fn or None.
+
+    Two block-wise passes over the same element-wise expression: the first finds the chromosome maximum
+    (max is exact and NaN-propagating, so the max of block maxima equals the global max), the second writes
+    the chosen dtype behind np.save's header. Inputs that are not plain 1-D numeric .npy files of equal
+    length use the original whole-array code.
+    """
+    block = NPY_BLOCK if block is None else int(block)
+    le, li = npy_layout(npy_dump), npy_layout(input_npy)
+    if le is not None and li is not None and le[2] == li[2] and le[2] > 0 \
+            and le[1].kind in "biuf" and li[1].kind in "biuf":
+        n = le[2]
+        with open(npy_dump, "rb") as fe, open(input_npy, "rb") as fi:
+            def adjusted(a, b):
+                matched_input = npy_read(fi, li, a, b) * sf
+                exp = npy_read(fe, le, a, b)
+                adjusted_signal = exp - matched_input
+                adjusted_signal[adjusted_signal < 0] = 0
+                return adjusted_signal
+
+            chrom_max = np.max(np.array([np.max(adjusted(a, min(n, a + block))) for a in range(0, n, block)]))
+            for k, v in enumerate(NP_DT_RANGE):
+                if v > chrom_max:
+                    layout = _npy_create(fn, NP_DT_NAME[k], n)
+                    with open(fn, "r+b") as fo:
+                        for a in range(0, n, block):
+                            out = adjusted(a, min(n, a + block)).astype(NP_DT_NAME[k], copy=False)
+                            fo.seek(layout[0] + a * layout[1].itemsize)
+                            fo.write(np.ascontiguousarray(out).view(np.uint8))
+                    return fn
+        return None
     matched_input = np.load(input_npy) * sf
     exp = np.load(npy_dump)
     adjusted_signal = exp - matched_input

@@ -44,6 +44,7 @@ try:
     from .stats_engine import Poisson, ZIP, pval_dist, bgIQR, pkIQR, \
         independent_filtering, get_elbow
     from .io_engine import get_read_signal, get_coverage_bw, log_assert, normalize_using_input, is_zero_track, \
+        npy_layout, npy_read, NPY_BLOCK, \
         index_bed_file, peak_bed_to_gtf, merge_replicates_bw
     from pints import __version__
 except ImportError as e:
@@ -1671,6 +1672,120 @@ def show_parameter_info(input_bam, **kwargs):
             logger.info("%s: %s" % (k, v))
 
 
+def _release_free_heap():
+    """Return freed heap memory to the OS (glibc only; no-op elsewhere).
+
+    The block buffers are a few tens of MB; once glibc's dynamic mmap threshold has grown, such buffers come
+    from the heap and stay mapped in the (long-lived) worker after they are freed.
+    """
+    global _MALLOC_TRIM
+    if _MALLOC_TRIM is None:
+        try:
+            import ctypes
+            _MALLOC_TRIM = ctypes.CDLL("libc.so.6").malloc_trim
+        except (OSError, AttributeError):
+            _MALLOC_TRIM = False
+    if _MALLOC_TRIM:
+        _MALLOC_TRIM(0)
+
+
+_MALLOC_TRIM = None
+
+
+def _blockwise_element_definition(coverage_dict, chromosome_of_interest, subpeak_bed, join_distance, ce_donor,
+                                  ce_trigger, block=None):
+    """Block-wise form of the body of `unified_element_definition` (same file, same return value).
+
+    The merged int32 track is built one block at a time (``zeros(int32)`` then ``+=`` per replicate, the same
+    element-wise operations as `merge_covs`) instead of for the whole chromosome. Windows never straddle a
+    block (blocks are multiples of the window and start at multiples of it), and a region that touches the
+    end of a block is carried into the next buffer, so regions, sub-peaks and summits are exactly those of
+    the whole-chromosome computation. Returns False when the inputs are not plain 1-D integer .npy files of
+    one common length (the caller then runs the original code).
+    """
+    window = 100
+    block = NPY_BLOCK if block is None else int(block)
+    block = max(window, block // window * window)
+    tracks = []
+    n = None
+    for cd in coverage_dict:
+        path = cd[chromosome_of_interest]
+        lay = npy_layout(path)
+        if lay is None or lay[1].kind not in "biu":
+            return False
+        if n is None:
+            n = lay[2]
+        elif lay[2] != n:
+            return False
+        if not is_zero_track(path):  # adding an all-zero track is a no-op
+            tracks.append((path, lay))
+    if n is None or n < 1:
+        return False
+
+    fhs = [open(p, "rb") for p, _ in tracks]
+    spb_fh = None
+    index = 1
+    try:
+        def merged_slice(a, b):
+            m = np.zeros(b - a, dtype=np.int32)
+            for fh, (_, lay) in zip(fhs, tracks):
+                m += npy_read(fh, lay, a, b)
+            return m
+
+        buf_start = 0
+        buf = None
+        pos = 0
+        while pos < n:
+            nxt = min(n, pos + block)
+            if n - nxt < window:  # final buffer extends to the end of the chromosome (partial window included)
+                nxt = n
+            fresh = merged_slice(pos, nxt)
+            buf = fresh if buf is None else np.concatenate((buf, fresh))
+            pos = nxt
+            final = pos >= n
+            regions = nonzero_window_regions(buf) if buf.shape[0] >= window else []
+            carry_from = None
+            if regions and not final and regions[-1][1] == buf.shape[0]:
+                carry_from = regions.pop()[0]  # may continue in the next block
+            for row_start, row_end in regions:
+                if spb_fh is None:
+                    spb_fh = open(subpeak_bed, "w")
+                sub_peaks = cut_peaks(buf[row_start:row_end],
+                                      donor_tolerance=ce_donor,
+                                      ce_trigger=ce_trigger,
+                                      join_distance=join_distance)
+                for sp in sub_peaks:
+                    start = sp[0] + row_start
+                    end = sp[1] + row_start
+                    if end <= buf.shape[0] or final:
+                        peak_region = buf[start:end]
+                    else:
+                        peak_region = merged_slice(buf_start + start, min(n, buf_start + end))
+                    summit_coord = start + np.argmax(peak_region)
+                    spb_fh.write("%s\t%d\t%d\t%s-%d\t%d\n" % (
+                        chromosome_of_interest, start + buf_start, end + buf_start, chromosome_of_interest,
+                        index, summit_coord + buf_start))
+                    index += 1
+            if carry_from is None:
+                buf = None
+                buf_start = pos
+            else:
+                buf = buf[carry_from:].copy()
+                buf_start += carry_from
+    finally:
+        for fh in fhs:
+            fh.close()
+        if spb_fh is not None:
+            spb_fh.close()
+        buf = fresh = None
+        _release_free_heap()
+
+    if index > 1:
+        index_bed_file(subpeak_bed, logger=logger)
+        return subpeak_bed + ".gz"
+    return None
+
+
 def unified_element_definition(coverage_dict, chromosome_of_interest, strand_sign, output_file,
                                join_distance=1, ce_donor=1.0, ce_trigger=3, peak_width=None):
     """
@@ -1700,6 +1815,12 @@ def unified_element_definition(coverage_dict, chromosome_of_interest, strand_sig
         file name for the subpeak bed file, or None if there's no peak
     """
     subpeak_bed = output_file.replace(".bed", __SUB_PEAK_TPL__ % chromosome_of_interest)
+    if all(is_zero_track(cd[chromosome_of_interest]) for cd in coverage_dict):
+        return None
+    blockwise = _blockwise_element_definition(coverage_dict, chromosome_of_interest, subpeak_bed,
+                                              join_distance, ce_donor, ce_trigger)
+    if blockwise is not False:
+        return blockwise
     merged_coverage = merge_covs(coverage_dict, chromosome_of_interest, skip_if_empty=True)
     if merged_coverage is None:  # all tracks are known to be empty for this chromosome
         return None
@@ -2312,6 +2433,7 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
             housekeeping_files.append(res)
             housekeeping_files.append(res + ".csi")
 
+    _phase("subpeak bookkeeping")
     parse_input_files(output_dir=output_dir, output_prefix="ct_" + output_prefix, filters=filters,
                       pl_cov_target=input_coverage_pl, mn_cov_target=input_coverage_mn,
                       rc_target=ircs, bam_files=kwargs.get("ct_bam", None),
@@ -2342,6 +2464,7 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
             housekeeping_files.extend(plc.values())
             housekeeping_files.extend(mnc.values())
 
+    _phase("control parsing+normalisation")
     fdr_target = kwargs.pop("fdr_target", 0.1)
     # window evaluation for every sample x strand at once (shared pool, longest tasks first)
     precomputed = {}
