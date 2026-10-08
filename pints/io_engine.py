@@ -54,7 +54,11 @@ def is_zero_track(path):
 # Block-wise access to 1-D .npy coverage dumps. Readers use plain file reads (no memory map, so pages
 # are not kept resident) and writers put the data behind the exact header np.save would write.
 # ---------------------------------------------------------------------------------------------------
-NPY_BLOCK = 8_000_000  # bases per block (a multiple of the 100-bp element-definition window)
+# bases per block (a multiple of the 100-bp element-definition window). Kept small enough that a float64
+# block (16 MB) stays below glibc's 32 MiB mmap threshold: larger temporaries are mmap'd and munmap'd on every
+# block, which costs page faults and, in sandboxes that reclaim freed pages lazily (gVisor), lets freed
+# memory pile up across concurrent workers.
+NPY_BLOCK = 2_000_000
 
 
 def npy_layout(path):
