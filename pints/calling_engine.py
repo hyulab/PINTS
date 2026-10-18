@@ -948,12 +948,26 @@ def peaks_single_strand(per_base_cov, output_file, shared_peak_definitions, stra
 
     sub_dfs = [sdf for sdf in sub_dfs if sdf is not None]
     log_assert(len(sub_dfs) > 0, "No signal found across all chromosomes!", logger)
-    tmp_df = pd.concat(sub_dfs)
+    tmp_df = _concat_result_frames(sub_dfs)
 
     if kwargs.get("output_diagnostics", False):
         tmp_df.to_csv(output_file.replace(".bed", "_debug.csv"), index=False)
 
     return stratified_filtering(tmp_df=tmp_df, output_file=output_file, fdr_target=fdr_target, **kwargs)
+
+
+def _concat_result_frames(sub_dfs):
+    """
+    Concatenate per-chromosome result frames, leaving out empty ones.
+
+    A chromosome without any testable peak yields an empty frame whose columns are all object dtype.
+    Concatenating it with the other frames upcasts every integer column (start, end, reads, ...) to
+    object, which makes the quantiles in `independent_filtering` run on object arrays (tens of times
+    slower). Empty frames contribute no rows, so leaving them out changes only the dtypes, not the
+    values or their order.
+    """
+    non_empty = [sdf for sdf in sub_dfs if sdf.shape[0] > 0]
+    return pd.concat(non_empty if non_empty else sub_dfs)
 
 
 def merge_opposite_peaks(sig_peak_bed, peak_candidate_bed, divergent_output_bed, bidirectional_output_bed,
