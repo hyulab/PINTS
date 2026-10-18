@@ -895,11 +895,21 @@ class PeakBedIndex:
         return [lines[i][:-1].split("\t") for i in range(lo, hi) if ends[i] > start]
 
 
-def open_peak_index(path):
-    """`PeakBedIndex` for `path` when supported, else a pysam.TabixFile over the same file."""
-    idx = PeakBedIndex.from_file(path)
-    if idx is not None:
-        return idx
+_PEAK_INDEX_BYTES_PER_QUERY = 2000
+
+
+def open_peak_index(path, n_queries=None):
+    """
+    `PeakBedIndex` for `path` when supported and worthwhile, else a pysam.TabixFile over the same file.
+
+    Building the index costs ~1.2 us per record and a tabix query ~0.15 ms, so tabix is kept when there
+    are few queries relative to the file (compressed size is ~15-22 bytes per record). Either object
+    returns the same records, so this choice affects speed only.
+    """
+    if n_queries is None or n_queries * _PEAK_INDEX_BYTES_PER_QUERY >= os.path.getsize(path):
+        idx = PeakBedIndex.from_file(path)
+        if idx is not None:
+            return idx
     return pysam.TabixFile(path, index=path + ".csi")
 
 
@@ -1558,7 +1568,9 @@ def merge_opposite_peaks(sig_peak_bed, peak_candidate_bed, divergent_output_bed,
     -------
 
     """
-    tbx = open_peak_index(peak_candidate_bed)
+    with open(sig_peak_bed, "r") as sig_fh:
+        n_queries = sum(1 for _ in sig_fh)
+    tbx = open_peak_index(peak_candidate_bed, n_queries=n_queries)
     fh = open(sig_peak_bed, "r")
     div_fh = open(divergent_output_bed, "w")
     bid_fh = open(bidirectional_output_bed, "w")
