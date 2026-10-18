@@ -826,6 +826,83 @@ class SubpeakIndex:
         return [f[i] for i in self.indices(start, end)]
 
 
+class PeakBedIndex:
+    """
+    In-memory stand-in for ``pysam.TabixFile(path).fetch(chrom, start, end, parser=pysam.asTuple())``
+    over a bgzipped BED file written by `stratified_filtering` (sorted by chromosome, then start).
+
+    Lines are read from the very file that tabix indexes, so file order (including ties in start) is
+    the order tabix returns. ``fetch`` returns the tab-split fields of records with
+    ``start < query_end`` and ``end > query_start`` in file order; argument errors and unknown
+    chromosomes raise ValueError and empty regions return nothing, as with pysam. `open_peak_index`
+    only uses this class when every record has positive length, starts are non-decreasing within each
+    chromosome, each chromosome is one contiguous block, and there are no header/comment lines or
+    carriage returns; otherwise it falls back to tabix.
+    """
+
+    def __init__(self, blocks):
+        from bisect import bisect_left, bisect_right
+        self._bl, self._br = bisect_left, bisect_right
+        self._blocks = blocks  # chromosome -> (lines, starts, ends, prefix_max_end)
+
+    @classmethod
+    def from_file(cls, path):
+        """Return a PeakBedIndex, or None when the file is outside the supported subset."""
+        blocks = {}
+        chrom, lines, starts, ends, pme, m = None, None, None, None, None, -1
+        with gzip.open(path, "rt", newline="") as fh:  # bgzip output is multi-member gzip
+            for line in fh:
+                if not line.endswith("\n") or "\r" in line or line.startswith("#"):
+                    return None
+                parts = line.split("\t", 3)
+                if len(parts) < 4:
+                    return None
+                if not (parts[1].isascii() and parts[1].isdigit() and parts[2].isascii() and parts[2].isdigit()):
+                    return None
+                s, e = int(parts[1]), int(parts[2])
+                if parts[0] != chrom:
+                    if parts[0] in blocks:
+                        return None  # chromosome not contiguous
+                    chrom, lines, starts, ends, pme, m = parts[0], [], [], [], [], -1
+                    blocks[chrom] = (lines, starts, ends, pme)
+                elif s < starts[-1]:
+                    return None
+                if e <= s or s < 0:
+                    return None
+                lines.append(line)
+                starts.append(s)
+                ends.append(e)
+                m = e if e > m else m
+                pme.append(m)
+        return cls(blocks)
+
+    def fetch(self, chromosome, start, end, parser=None):
+        # argument checks in pysam's order: end, start, start > end, empty region, then the contig
+        if end < 0:
+            raise ValueError("end out of range (%d)" % end)
+        if start < 0:
+            raise ValueError("start out of range (%d)" % start)
+        if start > end:
+            raise ValueError("start (%d) >= end (%d)" % (start, end))
+        if start == end:
+            return []
+        block = self._blocks.get(chromosome)
+        if block is None:
+            raise ValueError("could not create iterator for region '%s:%d-%d'" % (chromosome, start + 1, end))
+        lines, starts, ends, pme = block
+        hi = self._bl(starts, end)
+        lo = self._br(pme, start)
+        return [lines[i][:-1].split("\t") for i in range(lo, hi) if ends[i] > start]
+
+
+def open_peak_index(path):
+    """`PeakBedIndex` for `path` when supported, else a pysam.TabixFile over the same file."""
+    idx = PeakBedIndex.from_file(path)
+    if idx is not None:
+        return idx
+    return pysam.TabixFile(path, index=path + ".csi")
+
+
 def _subpeak_block_stats(rc_file, chromosome_name, strand_sign, raw_lines, small_peak_threshold):
     """Phase-1 worker: per-subpeak statistics, formatted exactly as the subpeak bed lines."""
     per_base_cov = _load_coverage(rc_file)
@@ -1481,7 +1558,7 @@ def merge_opposite_peaks(sig_peak_bed, peak_candidate_bed, divergent_output_bed,
     -------
 
     """
-    tbx = pysam.TabixFile(peak_candidate_bed, index=peak_candidate_bed + ".csi")
+    tbx = open_peak_index(peak_candidate_bed)
     fh = open(sig_peak_bed, "r")
     div_fh = open(divergent_output_bed, "w")
     bid_fh = open(bidirectional_output_bed, "w")
