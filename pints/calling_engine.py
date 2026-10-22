@@ -1690,6 +1690,39 @@ def merge_opposite_peaks(sig_peak_bed, peak_candidate_bed, divergent_output_bed,
     sfp_fh.close()
 
 
+_background_deletions = []
+
+
+def release_coverage_files(old_dicts, live_dicts=()):
+    """
+    Delete, on a background thread, the coverage dumps in `old_dicts` that no dict in `live_dicts` still
+    uses. They stay in `housekeeping_files`; `housekeeping` waits for the thread before its own pass.
+
+    Parameters
+    ----------
+    old_dicts : iterable of dict
+        chromosome -> .npy path maps that are no longer needed
+    live_dicts : iterable of dict
+        maps that are still in use (their paths are kept)
+    """
+    import threading
+    live = {os.path.abspath(f) for d in live_dicts for f in d.values() if isinstance(f, str)}
+    paths = sorted({f for d in old_dicts for f in d.values()
+                    if isinstance(f, str) and f.endswith(".npy") and os.path.abspath(f) not in live})
+
+    def _remove():
+        for f in paths:
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+
+    if paths:
+        t = threading.Thread(target=_remove, name="pints-release", daemon=True)
+        t.start()
+        _background_deletions.append(t)
+
+
 def housekeeping(pybedtools_prefix=""):
     """
     Delete intermediate files
@@ -1699,6 +1732,8 @@ def housekeeping(pybedtools_prefix=""):
 
     """
     global housekeeping_files
+    while _background_deletions:
+        _background_deletions.pop().join()
     try:
         for hf in housekeeping_files:
             if os.path.exists(hf):
@@ -2394,6 +2429,8 @@ def parse_input_files(output_dir, output_prefix, filters, pl_cov_target, mn_cov_
         pl_covs, mn_covs, pl_rc, mn_rc = merge_replicates_bw(pl_cov_target, mn_cov_target, output_dir,
                                                              output_prefix + "_merged",
                                                              threads=kwargs.get("thread_n", 1))
+        # the per-replicate dumps are not read again once merged
+        release_coverage_files(pl_cov_target + mn_cov_target, (pl_covs, mn_covs))
         pl_cov_target[:] = pl_cov_target[:1]
         mn_cov_target[:] = mn_cov_target[:1]
         rc_target[:] = [pl_rc + mn_rc, ]
@@ -2530,6 +2567,7 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
                       bw_pl_files=kwargs.get("ct_bw_pl", None), bw_mn_files=kwargs.get("ct_bw_mn", None), **kwargs)
 
     if len(ircs) > 0:
+        pre_norm = chromosome_coverage_pl + chromosome_coverage_mn
         if len(ircs) == 1 and len(rcs) > 1:
             logger.info("Only one input sample is provided, it will be shared among all treatment libraries")
             for _ in range(len(rcs) - len(ircs)):
@@ -2553,6 +2591,9 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
 
             housekeeping_files.extend(plc.values())
             housekeeping_files.extend(mnc.values())
+        # un-normalised experiment and control dumps are not read again
+        release_coverage_files(pre_norm + input_coverage_pl + input_coverage_mn,
+                               chromosome_coverage_pl + chromosome_coverage_mn)
 
     _phase("control parsing+normalisation")
     fdr_target = kwargs.pop("fdr_target", 0.1)
@@ -2598,6 +2639,9 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
     epig_requested = kwargs.get("epig_annotation", "") not in (None, "")
     all_deferred = all((rep, label) in deferred_filtering
                        for rep in range(len(chromosome_coverage_pl)) for label in ("pl", "mn"))
+    if pool is not None and all_deferred:
+        # every strand is evaluated and its filtering dispatched: nothing reads the coverage dumps again
+        release_coverage_files(chromosome_coverage_pl + chromosome_coverage_mn)
     if pool is not None and len(chromosome_coverage_pl) > 1 and all_deferred and not epig_requested \
             and not kwargs.get("output_diagnostics", False):
         for rep, pl_cov_dict in enumerate(chromosome_coverage_pl):
