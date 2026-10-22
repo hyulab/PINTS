@@ -320,3 +320,74 @@ def test_blockwise_normalize_shape_mismatch_falls_back():
         ref[ref < 0] = 0
         np.save(os.path.join(d, "r.npy"), ref.astype(np.int8))
         assert open(r, "rb").read() == open(os.path.join(d, "r.npy"), "rb").read()
+
+
+# ------------------------------------------------------------------ replicate merging
+@FAST
+@given(st.integers(0, 2 ** 31 - 1), st.sampled_from([1, 2, 100, 1000, 7, 4096]),
+       st.lists(st.sampled_from(DTYPES), min_size=2, max_size=3),
+       st.sampled_from([None, 63, 64, 127, 128, 16383, 32767, 32768, 2 ** 31 - 1, 2 ** 31]),
+       st.integers(1, 5000))
+def test_blockwise_merge_equals_reference(seed, block, dts, peak, L):
+    rng = np.random.default_rng(seed)
+    with tempfile.TemporaryDirectory() as d:
+        pls, mns = [], []
+        for i, dt in enumerate(dts):
+            hi = int(np.iinfo(dt).max)
+            for tag, out in (("p", pls), ("m", mns)):
+                v = np.where(rng.random(L) < 0.2, rng.integers(0, min(hi, 300) + 1, L), 0).astype(np.int64)
+                if peak is not None and peak <= hi and tag == "p":
+                    v[int(rng.integers(0, L))] = peak  # output dtype boundary, int32 wrap-around for 2**31
+                fn = os.path.join(d, "%s%d.npy" % (tag, i))
+                np.save(fn, v.astype(dt))
+                out.append({"c": fn})
+        os.makedirs(os.path.join(d, "a")); os.makedirs(os.path.join(d, "b"))
+        fa = [os.path.join(d, "a", "m_%s_c.npy" % s) for s in ("pl", "mn")]
+        with np.errstate(over="ignore"):
+            sa = io._merge_rep_chrom_worker([x["c"] for x in pls], [x["c"] for x in mns], fa[0], fa[1], block=block)
+            rb = rio.merge_replicates_bw(pls, mns, os.path.join(d, "b"), "m")
+        assert sa == (rb[2], rb[3]) and type(sa[0]) == type(rb[2]) and type(sa[1]) == type(rb[3])
+        assert file_bytes(fa[0]) == file_bytes(rb[0]["c"]) and file_bytes(fa[1]) == file_bytes(rb[1]["c"])
+
+
+def test_blockwise_merge_serial_path_equals_reference():
+    rng = np.random.default_rng(7)
+    chroms = {"chr1": 5000, "chr2": 3001, "chrZ": 1}
+    with tempfile.TemporaryDirectory() as d:
+        pls, mns = [], []
+        for i in range(3):
+            for tag, out in (("p", pls), ("m", mns)):
+                dd = {}
+                for c, L in chroms.items():
+                    fn = os.path.join(d, "%s%d_%s.npy" % (tag, i, c))
+                    np.save(fn, rng.integers(0, 200, L).astype(np.int16))
+                    dd[c] = fn
+                out.append(dd)
+        os.makedirs(os.path.join(d, "a")); os.makedirs(os.path.join(d, "b"))
+        old = io.NPY_BLOCK
+        io.NPY_BLOCK = 333
+        try:
+            a = io.merge_replicates_bw(pls, mns, os.path.join(d, "a"), "m", threads=1)
+        finally:
+            io.NPY_BLOCK = old
+        b = rio.merge_replicates_bw(pls, mns, os.path.join(d, "b"), "m")
+        assert a[2] == b[2] and a[3] == b[3] and type(a[2]) == type(b[2])
+        for k in (0, 1):
+            assert list(a[k]) == list(b[k])
+            for c in a[k]:
+                assert file_bytes(a[k][c]) == file_bytes(b[k][c])
+
+
+def test_blockwise_merge_length_mismatch_falls_back():
+    with tempfile.TemporaryDirectory() as d:
+        np.save(os.path.join(d, "a.npy"), np.arange(10, dtype=np.int16))
+        np.save(os.path.join(d, "b.npy"), np.arange(1, dtype=np.int16))  # broadcasts in the original code
+        assert io._merge_rep_strand([os.path.join(d, "a.npy"), os.path.join(d, "b.npy")],
+                                    os.path.join(d, "o.npy"), block=3) is None
+        s = io._merge_rep_chrom_worker([os.path.join(d, "a.npy"), os.path.join(d, "b.npy")],
+                                       [os.path.join(d, "a.npy"), os.path.join(d, "a.npy")],
+                                       os.path.join(d, "p.npy"), os.path.join(d, "q.npy"), block=3)
+        ref = np.arange(10, dtype=np.int16).astype(np.int32) + np.arange(1, dtype=np.int16)
+        assert s[0] == ref.sum() and s[1] == 2 * np.arange(10).sum()
+        np.save(os.path.join(d, "r.npy"), ref.astype(np.int8))
+        assert open(os.path.join(d, "p.npy"), "rb").read() == open(os.path.join(d, "r.npy"), "rb").read()

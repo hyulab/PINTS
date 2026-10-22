@@ -1422,13 +1422,63 @@ def peak_bed_to_gtf(pl_df, mn_df, save_to, version=""):
     index_bed_file(save_to)
 
 
-def _merge_rep_chrom_worker(pl_files, mn_files, pl_fn, mn_fn):
-    """One chromosome of `merge_replicates_bw` (same operations, same order); returns (pl_sum, mn_sum)."""
+def _merge_rep_strand(files, fn, block=None):
+    """Merge one strand of one chromosome block by block; returns its sum, or None if the inputs need the
+    whole-array code.
+
+    Each block repeats the original element-wise operations (first replicate cast to int32, the others
+    added in place). Integer sums and maxima are exact, so the block totals equal the whole-array ones; a
+    first pass finds the maximum (and the sum), a second writes the chosen dtype behind np.save's header.
+    """
+    block = NPY_BLOCK if block is None else int(block)
+    layouts = [npy_layout(f) for f in files]
+    if any(lay is None or lay[1].kind not in "biu" for lay in layouts) or len({lay[2] for lay in layouts}) != 1 \
+            or layouts[0][2] == 0:
+        return None
+    n = layouts[0][2]
+    handles = [open(f, "rb") for f in files]
+    try:
+        def merged(a, b):
+            out = npy_read(handles[0], layouts[0], a, b).astype(np.int32)
+            for fh, lay in zip(handles[1:], layouts[1:]):
+                out += npy_read(fh, lay, a, b)
+            return out
+
+        total, chrom_max = None, None
+        for a in range(0, n, block):
+            m = merged(a, min(n, a + block))
+            s, x = np.sum(m), np.max(m)
+            total = s if total is None else total + s
+            chrom_max = x if chrom_max is None else max(chrom_max, x)
+        data_type = determine_data_type(chrom_max)
+        layout = _npy_create(fn, data_type, n)
+        with open(fn, "r+b") as fo:
+            for a in range(0, n, block):
+                out = merged(a, min(n, a + block)).astype(data_type, copy=False)
+                fo.seek(layout[0] + a * layout[1].itemsize)
+                fo.write(np.ascontiguousarray(out).view(np.uint8))
+        return total
+    finally:
+        for fh in handles:
+            fh.close()
+
+
+def _merge_rep_chrom_worker(pl_files, mn_files, pl_fn, mn_fn, block=None):
+    """One chromosome of `merge_replicates_bw` (same operations, same order); returns (pl_sum, mn_sum).
+
+    Runs block by block (see `_merge_rep_strand`), so a worker holds a few blocks instead of whole-chromosome
+    arrays; inputs that are not plain 1-D integer .npy files of equal length use the original code.
+    """
     def merge_chromosome_data(files):
         merged = np.load(files[0]).astype(np.int32)
         for f in files[1:]:
             merged += np.load(f)
         return merged
+
+    pl_s = _merge_rep_strand(pl_files, pl_fn, block)
+    mn_s = _merge_rep_strand(mn_files, mn_fn, block) if pl_s is not None else None
+    if pl_s is not None and mn_s is not None:
+        return pl_s, mn_s
 
     merged_pl_data = merge_chromosome_data(pl_files)
     pl_s = np.sum(merged_pl_data)
@@ -1518,12 +1568,6 @@ def merge_replicates_bw(per_sample_coverage_pls, per_sample_coverage_mns, output
     if len(per_sample_coverage_pls) != len(per_sample_coverage_mns):
         raise ValueError("Number of replicates for pl and mn must be the same")
 
-    def merge_chromosome_data(sample_data_list, chromosome):
-        merged = np.load(sample_data_list[0][chromosome]).astype(np.int32)
-        for replicate in sample_data_list[1:]:
-            merged += np.load(replicate[chromosome])
-        return merged
-
     # no need to merge if there is only one replicate
     if len(per_sample_coverage_pls) == 1:
         merged_pl = per_sample_coverage_pls[0]
@@ -1559,23 +1603,12 @@ def merge_replicates_bw(per_sample_coverage_pls, per_sample_coverage_mns, output
                 merged_pl[chrom] = save_zero_track(pl_fn, length, determine_data_type(0))
                 merged_mn[chrom] = save_zero_track(mn_fn, length, determine_data_type(0))
                 continue
-            # merge data
-            merged_pl_data = merge_chromosome_data(per_sample_coverage_pls, chrom)
-            pl_rc += np.sum(merged_pl_data)
-            merged_mn_data = merge_chromosome_data(per_sample_coverage_mns, chrom)
-            mn_rc += np.sum(merged_mn_data)
-
-            # merged file paths
-            pl_fn = os.path.join(output_dir, "%s_pl_%s.npy" % (output_prefix, chrom))
-            mn_fn = os.path.join(output_dir, "%s_mn_%s.npy" % (output_prefix, chrom))
+            # merge data (block-wise, same per-chromosome operations as the original loop)
+            pl_s, mn_s = _merge_rep_chrom_worker([d[chrom] for d in per_sample_coverage_pls],
+                                                 [d[chrom] for d in per_sample_coverage_mns], pl_fn, mn_fn)
+            pl_rc += pl_s
+            mn_rc += mn_s
 
             merged_pl[chrom] = pl_fn
             merged_mn[chrom] = mn_fn
-
-            # dump data with appropriate data types
-            data_type = determine_data_type(np.max(merged_pl_data))
-            np.save(pl_fn, merged_pl_data.astype(data_type, copy=False))
-
-            data_type = determine_data_type(np.max(merged_mn_data))
-            np.save(mn_fn, merged_mn_data.astype(data_type, copy=False))
     return merged_pl, merged_mn, pl_rc, mn_rc
