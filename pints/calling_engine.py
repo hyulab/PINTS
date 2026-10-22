@@ -1186,6 +1186,111 @@ def _stratified_filtering_task(tmp_df, output_file, fdr_target, kwargs):
     return stratified_filtering(tmp_df=tmp_df, output_file=output_file, fdr_target=fdr_target, **kwargs)
 
 
+_BGZF_EOF = bytes.fromhex("1f8b08040000000000ff0600424302001b0003000000000000000000")
+_BGZF_BLOCK = 0xff00  # uncompressed bytes per BGZF block, as in htslib
+_PARALLEL_WRITE_MIN_ROWS = 1  # empty tables are written by `stratified_filtering` itself
+
+
+def bgzf_compress(data, level=6):
+    """BGZF blocks (no EOF marker) holding `data`; any concatenation of these, plus _BGZF_EOF, is a BGZF file."""
+    import struct
+    import zlib
+    out = []
+    for a in range(0, len(data), _BGZF_BLOCK):
+        chunk = data[a:a + _BGZF_BLOCK]
+        c = zlib.compressobj(level, zlib.DEFLATED, -15)
+        cdata = c.compress(chunk) + c.flush()
+        if len(cdata) > 65536 - 26:  # incompressible: store
+            c = zlib.compressobj(0, zlib.DEFLATED, -15)
+            cdata = c.compress(chunk) + c.flush()
+        out.append(struct.pack("<4BI2BH2BHH", 31, 139, 8, 4, 0, 0, 255, 6, 66, 67, 2, len(cdata) + 25))
+        out.append(cdata)
+        out.append(struct.pack("<2I", zlib.crc32(chunk), len(chunk)))
+    return b"".join(out)
+
+
+def _filter_frame_task(tmp_df, output_file, fdr_target, kwargs):
+    """
+    Pool task: the stratified-filtering table, returned for `_ParallelIndexedBed` to write when the file can be
+    produced without bedtools sort, else written and indexed here exactly as `stratified_filtering` does.
+
+    index_bed_file sorts with `bedtools sort` (chromosome, then start; ties in no guaranteed order). The table
+    is already sorted by the same keys, so when no (chromosome, start) pair repeats, the sorted file is the
+    table as written.
+    """
+    result_df = _stratified_frame(tmp_df, output_file, fdr_target, **kwargs)
+    if result_df.shape[0] >= _PARALLEL_WRITE_MIN_ROWS and not result_df.duplicated(["chromosome", "start"]).any():
+        return "frame", result_df
+    result_df.to_csv(output_file, sep="\t", index=False, header=False)
+    index_bed_file(output_file, logger=logger)
+    return "path", output_file + ".gz"
+
+
+def _bed_chunk_task(chunk):
+    """Pool task: rows of the filtering table as `to_csv` writes them, BGZF-compressed."""
+    return bgzf_compress(chunk.to_csv(sep="\t", index=False, header=False).encode("utf-8"))
+
+
+def _bed_assemble_task(path, parts):
+    """Pool task: concatenate BGZF parts into `path` and build its CSI index (same index as index_bed_file)."""
+    with open(path, "wb") as fh:
+        for part in parts:
+            fh.write(part)
+        fh.write(_BGZF_EOF)
+    pysam.tabix_index(path, preset="bed", force=True, csi=True)
+    return path
+
+
+class _ParallelIndexedBed:
+    """
+    Stand-in for the AsyncResult of `_stratified_filtering_task`: get() returns the same .gz path, holding the
+    same lines. Filtering runs on one worker, then the table is formatted and compressed in row chunks across
+    the pool and indexed. Each step is submitted from the previous one's callback, so strands overlap.
+    """
+
+    def __init__(self, pool, tmp_df, output_file, fdr_target, kwargs, n_chunks):
+        import threading
+        self._pool, self._gz, self._n_chunks = pool, output_file + ".gz", max(1, n_chunks)
+        self._done = threading.Event()
+        self._value = self._error = None
+        pool.apply_async(_filter_frame_task, (tmp_df, output_file, fdr_target, kwargs),
+                         callback=self._filtered, error_callback=self._fail)
+
+    def _filtered(self, res):
+        try:
+            kind, payload = res
+            if kind == "path":
+                return self._finish(payload)
+            n = payload.shape[0]
+            step = -(-n // self._n_chunks)
+            chunks = [(payload.iloc[a:a + step],) for a in range(0, n, step)]
+            self._pool.starmap_async(_bed_chunk_task, chunks, chunksize=1,
+                                     callback=self._compressed, error_callback=self._fail)
+        except Exception as ex:
+            self._fail(ex)
+
+    def _compressed(self, parts):
+        try:
+            self._pool.apply_async(_bed_assemble_task, (self._gz, parts),
+                                   callback=self._finish, error_callback=self._fail)
+        except Exception as ex:
+            self._fail(ex)
+
+    def _finish(self, path):
+        self._value = path
+        self._done.set()
+
+    def _fail(self, ex):
+        self._error = ex
+        self._done.set()
+
+    def get(self):
+        self._done.wait()
+        if self._error is not None:
+            raise self._error
+        return self._value
+
+
 def _phase(label, t0=[None]):
     """Wall-clock phase markers on stderr when PINTS_PHASE_TIMING is set (diagnostics only)."""
     import time
@@ -1348,6 +1453,14 @@ def stratified_filtering(tmp_df, output_file, fdr_target, dry_run=False, **kwarg
     result_df : str
         Path to a compressed and indexed bed file
     """
+    result_df = _stratified_frame(tmp_df, output_file, fdr_target, dry_run=dry_run, **kwargs)
+    result_df.to_csv(output_file, sep="\t", index=False, header=False)
+    index_bed_file(output_file, logger=logger)
+    return output_file + ".gz"
+
+
+def _stratified_frame(tmp_df, output_file, fdr_target, dry_run=False, **kwargs):
+    """The table `stratified_filtering` writes (same operations), sorted by chromosome and start."""
     if dry_run:
         result_df = tmp_df.copy()
         result_df["padj"] = result_df["pval"]
@@ -1450,10 +1563,8 @@ def stratified_filtering(tmp_df, output_file, fdr_target, dry_run=False, **kwarg
             result_df = tmp_df_bg
 
         result_df = result_df.loc[:, COMMON_HEADER]
-    result_df.sort_values(by=['chromosome', 'start'], inplace=True)
-    result_df.to_csv(output_file, sep="\t", index=False, header=False)
-    index_bed_file(output_file, logger=logger)
-    return output_file + ".gz"
+    result_df = result_df.sort_values(by=['chromosome', 'start'])
+    return result_df
 
 
 def peaks_single_strand(per_base_cov, output_file, shared_peak_definitions, strand_sign, fdr_target,
@@ -2630,8 +2741,8 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
                                              fdr_target=fdr_target, precomputed=precomputed.get((rep, label)),
                                              defer_filtering=True, **kwargs)
                 if tmp_df is not None:
-                    deferred_filtering[(rep, label)] = pool.apply_async(
-                        _stratified_filtering_task, (tmp_df, out_file, fdr_target, kwargs))
+                    deferred_filtering[(rep, label)] = _ParallelIndexedBed(pool, tmp_df, out_file, fdr_target,
+                                                                           kwargs, n_chunks=thread_n)
                     precomputed.pop((rep, label), None)
     # pairing of every sample on the pool (only for the plain path: no epigenomic annotation / diagnostics,
     # which re-use df_dict afterwards); results are consumed below in sample order
