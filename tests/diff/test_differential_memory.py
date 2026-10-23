@@ -391,3 +391,20 @@ def test_blockwise_merge_length_mismatch_falls_back():
         assert s[0] == ref.sum() and s[1] == 2 * np.arange(10).sum()
         np.save(os.path.join(d, "r.npy"), ref.astype(np.int8))
         assert open(os.path.join(d, "p.npy"), "rb").read() == open(os.path.join(d, "r.npy"), "rb").read()
+
+
+@pytest.mark.parametrize("values, expect", [((100, 20), np.int8),    # fits the inputs' dtype: one pass
+                                            ((100, 28), np.int16)])  # exceeds it: rewritten as int16
+def test_blockwise_merge_dtype_guess(values, expect):
+    with tempfile.TemporaryDirectory() as d:
+        files = []
+        for i, v in enumerate(values):
+            a = np.zeros(1000, dtype=np.int8)
+            a[500] = v
+            files.append(os.path.join(d, "r%d.npy" % i))
+            np.save(files[-1], a)
+        s = io._merge_rep_strand(files, os.path.join(d, "o.npy"), block=64)
+        ref = np.load(files[0]).astype(np.int32) + np.load(files[1])
+        np.save(os.path.join(d, "ref.npy"), ref.astype(expect))
+        assert s == ref.sum() and np.load(os.path.join(d, "o.npy")).dtype == expect
+        assert file_bytes(os.path.join(d, "o.npy")) == file_bytes(os.path.join(d, "ref.npy"))

@@ -1427,8 +1427,10 @@ def _merge_rep_strand(files, fn, block=None):
     whole-array code.
 
     Each block repeats the original element-wise operations (first replicate cast to int32, the others
-    added in place). Integer sums and maxima are exact, so the block totals equal the whole-array ones; a
-    first pass finds the maximum (and the sum), a second writes the chosen dtype behind np.save's header.
+    added in place). Integer sums and maxima are exact, so the block totals equal the whole-array ones. The
+    output dtype depends on the maximum, which is known only at the end, so the blocks are written in a
+    guessed dtype (the widest input's: coverage is non-negative, so the merge is rarely wider) while the
+    maximum is taken; if the dtype chosen from it differs, a second pass rewrites the file in that dtype.
     """
     block = NPY_BLOCK if block is None else int(block)
     layouts = [npy_layout(f) for f in files]
@@ -1436,6 +1438,8 @@ def _merge_rep_strand(files, fn, block=None):
             or layouts[0][2] == 0:
         return None
     n = layouts[0][2]
+    in_types = [lay[1] for lay in layouts]
+    guess = max(in_types, key=lambda t: t.itemsize) if all(t in NP_DT_NAME for t in in_types) else None
     handles = [open(f, "rb") for f in files]
     try:
         def merged(a, b):
@@ -1444,19 +1448,34 @@ def _merge_rep_strand(files, fn, block=None):
                 out += npy_read(fh, lay, a, b)
             return out
 
+        def write_block(fo, layout, a, m, data_type):
+            out = m.astype(data_type, copy=False)
+            fo.seek(layout[0] + a * layout[1].itemsize)
+            fo.write(np.ascontiguousarray(out).view(np.uint8))
+
         total, chrom_max = None, None
-        for a in range(0, n, block):
-            m = merged(a, min(n, a + block))
-            s, x = np.sum(m), np.max(m)
-            total = s if total is None else total + s
-            chrom_max = x if chrom_max is None else max(chrom_max, x)
+        fo = None
+        if guess is not None:
+            layout = _npy_create(fn, guess, n)
+            fo = open(fn, "r+b")
+        try:
+            for a in range(0, n, block):
+                m = merged(a, min(n, a + block))
+                s, x = np.sum(m), np.max(m)
+                total = s if total is None else total + s
+                chrom_max = x if chrom_max is None else max(chrom_max, x)
+                if fo is not None:
+                    write_block(fo, layout, a, m, guess)
+        finally:
+            if fo is not None:
+                fo.close()
         data_type = determine_data_type(chrom_max)
+        if guess is not None and np.dtype(data_type) == guess:
+            return total
         layout = _npy_create(fn, data_type, n)
         with open(fn, "r+b") as fo:
             for a in range(0, n, block):
-                out = merged(a, min(n, a + block)).astype(data_type, copy=False)
-                fo.seek(layout[0] + a * layout[1].itemsize)
-                fo.write(np.ascontiguousarray(out).view(np.uint8))
+                write_block(fo, layout, a, merged(a, min(n, a + block)), data_type)
         return total
     finally:
         for fh in handles:
