@@ -27,3 +27,21 @@ def test_release_missing_files_is_silent(tmp_path):
     ce.release_coverage_files([{"c": str(tmp_path / "gone.npy")}])
     ce.housekeeping()
     assert not ce._background_deletions
+
+
+def test_deferred_release_waits_for_start(tmp_path):
+    p = str(tmp_path / "rep0_c1.npy")
+    np.save(p, np.arange(10))
+    ce.release_coverage_files([{"c1": p}], defer=True)
+    assert os.path.exists(p) and not ce._background_deletions
+    ce.start_deferred_releases()
+    ce.housekeeping()
+    assert not os.path.exists(p) and not ce._deferred_deletions
+
+
+def test_housekeeping_drops_unstarted_deferred_releases(tmp_path):
+    p = str(tmp_path / "rep0_c1.npy")
+    np.save(p, np.arange(10))
+    ce.release_coverage_files([{"c1": p}], defer=True)
+    ce.housekeeping()
+    assert not ce._deferred_deletions and not ce._background_deletions

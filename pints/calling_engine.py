@@ -1410,6 +1410,8 @@ def evaluate_strand_jobs(jobs, fdr_target, pool=None, thread_n=1, **kwargs):
                              fc_cutoff, init_dens_cutoff, init_height_cutoff))
             p2_owner.append(ui)
     _phase("phase2 setup")
+    if pool is not None:
+        start_deferred_releases()  # the tests below write no files
     p2_res = _run_tasks(pool, _check_window_block, p2_tasks, costs=[len(t[2]) for t in p2_tasks])
     _phase("phase2 tests")
     for r in pending_index:
@@ -1802,9 +1804,10 @@ def merge_opposite_peaks(sig_peak_bed, peak_candidate_bed, divergent_output_bed,
 
 
 _background_deletions = []
+_deferred_deletions = []
 
 
-def release_coverage_files(old_dicts, live_dicts=()):
+def release_coverage_files(old_dicts, live_dicts=(), defer=False):
     """
     Delete, on a background thread, the coverage dumps in `old_dicts` that no dict in `live_dicts` still
     uses. They stay in `housekeeping_files`; `housekeeping` waits for the thread before its own pass.
@@ -1815,11 +1818,29 @@ def release_coverage_files(old_dicts, live_dicts=()):
         chromosome -> .npy path maps that are no longer needed
     live_dicts : iterable of dict
         maps that are still in use (their paths are kept)
+    defer : bool
+        Only queue the files; `start_deferred_releases` deletes them. Unlinking tens of GB of cached dumps
+        slows down processes that write files at the same time, so the pool path starts the deletion when
+        the workers only compute.
     """
-    import threading
     live = {os.path.abspath(f) for d in live_dicts for f in d.values() if isinstance(f, str)}
     paths = sorted({f for d in old_dicts for f in d.values()
                     if isinstance(f, str) and f.endswith(".npy") and os.path.abspath(f) not in live})
+    if defer:
+        _deferred_deletions.extend(paths)
+    else:
+        _remove_in_background(paths)
+
+
+def start_deferred_releases():
+    """Start deleting the files queued by `release_coverage_files(..., defer=True)`."""
+    paths = list(_deferred_deletions)
+    del _deferred_deletions[:]
+    _remove_in_background(paths)
+
+
+def _remove_in_background(paths):
+    import threading
 
     def _remove():
         for f in paths:
@@ -1843,6 +1864,7 @@ def housekeeping(pybedtools_prefix=""):
 
     """
     global housekeeping_files
+    del _deferred_deletions[:]  # still in housekeeping_files
     while _background_deletions:
         _background_deletions.pop().join()
     try:
@@ -2541,7 +2563,8 @@ def parse_input_files(output_dir, output_prefix, filters, pl_cov_target, mn_cov_
                                                              output_prefix + "_merged",
                                                              threads=kwargs.get("thread_n", 1))
         # the per-replicate dumps are not read again once merged
-        release_coverage_files(pl_cov_target + mn_cov_target, (pl_covs, mn_covs))
+        release_coverage_files(pl_cov_target + mn_cov_target, (pl_covs, mn_covs),
+                               defer=kwargs.get("thread_n", 1) > 1)
         pl_cov_target[:] = pl_cov_target[:1]
         mn_cov_target[:] = mn_cov_target[:1]
         rc_target[:] = [pl_rc + mn_rc, ]
@@ -2704,7 +2727,7 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
             housekeeping_files.extend(mnc.values())
         # un-normalised experiment and control dumps are not read again
         release_coverage_files(pre_norm + input_coverage_pl + input_coverage_mn,
-                               chromosome_coverage_pl + chromosome_coverage_mn)
+                               chromosome_coverage_pl + chromosome_coverage_mn, defer=pool is not None)
 
     _phase("control parsing+normalisation")
     fdr_target = kwargs.pop("fdr_target", 0.1)
@@ -2752,6 +2775,7 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
                        for rep in range(len(chromosome_coverage_pl)) for label in ("pl", "mn"))
     if pool is not None and all_deferred:
         # every strand is evaluated and its filtering dispatched: nothing reads the coverage dumps again
+        start_deferred_releases()
         release_coverage_files(chromosome_coverage_pl + chromosome_coverage_mn)
     if pool is not None and len(chromosome_coverage_pl) > 1 and all_deferred and not epig_requested \
             and not kwargs.get("output_diagnostics", False):
