@@ -106,6 +106,53 @@ def test_get_read_signal_contig_parallel(rr, lib, rc, threads, filters):
         assert io.is_zero_track(a[0]["chrEmpty"]) and io.is_zero_track(a[1]["chrEmpty"])
 
 
+@SLOW
+@given(mixed_reads(), st.sampled_from(["R_5", "R_3", "R1_5", "R2_3", "PROseq"]), st.booleans(),
+       st.sampled_from([2, 3, 8]), st.sampled_from([300, 1000, 4000]), st.integers(0, 2 ** 31 - 1))
+def test_contig_regions_equal_reference(rr, lib, rc, threads, span, seed):
+    """Contigs split into regions (reads straddling region bounds, placed unmapped reads) give the same files."""
+    contigs, reads = rr
+    rng = np.random.default_rng(seed)
+    for c, L in contigs[:1]:
+        for b in range(span, L, span):  # reads across, starting at, and ending at region bounds
+            for pos in (b - 25, b - 1, b, b - 30):
+                reads.append(dict(contig=c, pos=pos, cigar="30M", reverse=bool(rng.random() < 0.5), mapq=60))
+        reads.append(dict(contig=c, pos=int(rng.integers(0, L - 40)), cigar="30M", unmapped=True, mapq=0))
+    old = io.BAM_SPLIT_MIN_SPAN
+    io.BAM_SPLIT_MIN_SPAN = span
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            bam = make_bam(os.path.join(d, "x.bam"), contigs, reads)
+            os.makedirs(os.path.join(d, "a")); os.makedirs(os.path.join(d, "b"))
+            layout, end = {"PROseq": ("R", "5")}.get(lib, lib.split("_"))
+            rc_ = True if lib == "PROseq" else rc
+            fast = io.parse_bam_by_contig(bam, contigs, 30, layout, end, rc_, os.path.join(d, "a"), "p",
+                                          threads=threads)
+            assert fast is not None  # the region path was taken, not the serial fallback
+            b = rio.get_read_signal(bam, lib, "", os.path.join(d, "b"), "p", reverse_complement=rc)
+            assert list(fast[0]) == list(b[0]) and list(fast[1]) == list(b[1])
+            assert fast[2] == b[2] and type(fast[2]) == type(b[2])
+            for k in (0, 1):
+                for c in fast[k]:
+                    assert file_bytes(fast[k][c]) == file_bytes(b[k][c]), (k, c)
+    finally:
+        io.BAM_SPLIT_MIN_SPAN = old
+
+
+def test_bam_regions_cover_the_contig():
+    old = io.BAM_SPLIT_MIN_SPAN
+    io.BAM_SPLIT_MIN_SPAN = 100
+    try:
+        assert io._bam_regions(1000, 10, 100) is None            # few records: one task
+        assert io._bam_regions(150, 10 ** 6, 1) is None          # too short to split
+        r = io._bam_regions(1001, 5000, 1000)
+        assert len(r) == 5 and r[0][0] == 0 and r[-1][1] == 1001
+        assert all(a[1] == b[0] for a, b in zip(r, r[1:]))
+        assert len(io._bam_regions(1000, 10 ** 6, 1)) == 10      # capped by the minimum span
+    finally:
+        io.BAM_SPLIT_MIN_SPAN = old
+
+
 def test_get_read_signal_without_index_falls_back():
     rng = np.random.default_rng(7)
     contigs = [("chr1", 5000), ("chr2", 3000)]

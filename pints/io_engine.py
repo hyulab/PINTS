@@ -111,13 +111,14 @@ def _smallest_int_dtype(max_value):
     return None
 
 
-def _bam_contig_worker(task):
+def _count_read_ends(input_bam, contig, mapq, layout, end, rc, start=None, stop=None):
     """
-    Count 5'/3' ends for one contig (exactly the per-read logic of BamParsers) and dump the npys.
+    5'/3' end positions of the reads of one contig (exactly the per-read logic of BamParsers), as
+    (pl_positions, mn_positions, total_reads, n_records).
 
-    Returns (contig, pl_path, mn_path, total_reads, n_records, pl_is_zero, mn_is_zero)
+    With `start`/`stop`, only the records whose alignment starts in [start, stop) are read (and counted in
+    n_records), so the regions of a contig together see every record once.
     """
-    (input_bam, contig, length, mapq, layout, end, rc, pl_fn, mn_fn) = task
     bam = pysam.AlignmentFile(input_bam, "rb")
     pl_pos = []
     mn_pos = []
@@ -126,7 +127,10 @@ def _bam_contig_worker(task):
     skip_r1 = layout == "R2"
     skip_r2 = layout == "R1"
     five = end == "5"
-    for read in bam.fetch(contig):
+    region = start is not None
+    for read in (bam.fetch(contig, start, stop) if region else bam.fetch(contig)):
+        if region and read.reference_start < start:  # overlaps the region but starts before it
+            continue
         n_rec += 1
         if skip_r2 and read.is_read2:
             continue
@@ -145,30 +149,105 @@ def _bam_contig_worker(task):
         else:
             pl_pos.append(pos)
     bam.close()
+    return pl_pos, mn_pos, total, n_rec
 
-    out = []
-    for positions, fn in ((pl_pos, pl_fn), (mn_pos, mn_fn)):
-        if len(positions) == 0:
-            out.append((save_zero_track(fn, length), True))
-            continue
-        uniq, cnt = np.unique(np.asarray(positions, dtype=np.int64), return_counts=True)
-        if uniq[0] < 0 or uniq[-1] >= length:
-            raise IndexError("index %d is out of bounds for axis 0 with size %d" % (
-                uniq[0] if uniq[0] < 0 else uniq[-1], length))
-        # original accumulates in uint32 before choosing the dump dtype
-        cnt = cnt.astype(np.uint32)
-        dt = _smallest_int_dtype(cnt.max())
-        arr = np.zeros(length, dtype=dt)
-        arr[uniq] = cnt.astype(dt)
-        np.save(fn, arr)
-        del arr
-        out.append((fn + ".npy", False))
+
+def _save_end_counts(parts, length, fn):
+    """
+    Dump the per-base counts of one strand, given as (unique positions, counts) parts, with the dtype
+    choice of get_read_signal; returns (path, is_zero_track).
+    """
+    parts = [(u, c) for u, c in parts if len(u)]
+    if not parts:
+        return save_zero_track(fn, length), True
+    lo = min(int(u[0]) for u, _ in parts)
+    hi = max(int(u[-1]) for u, _ in parts)
+    if lo < 0 or hi >= length:
+        raise IndexError("index %d is out of bounds for axis 0 with size %d" % (lo if lo < 0 else hi, length))
+    if len(parts) == 1:
+        uniq, cnt = parts[0]
+    else:  # the same position can come from several parts: sum its counts
+        uniq = np.concatenate([u for u, _ in parts])
+        cnt = np.concatenate([c.astype(np.uint32) for _, c in parts])
+        order = np.argsort(uniq, kind="stable")
+        uniq, cnt = uniq[order], cnt[order]
+        first = np.flatnonzero(np.concatenate(([True], uniq[1:] != uniq[:-1])))
+        uniq, cnt = uniq[first], np.add.reduceat(cnt, first)  # uint32 sums wrap like the original's counters
+    # original accumulates in uint32 before choosing the dump dtype
+    cnt = cnt.astype(np.uint32)
+    dt = _smallest_int_dtype(cnt.max())
+    arr = np.zeros(length, dtype=dt)
+    arr[uniq] = cnt.astype(dt)
+    np.save(fn, arr)
+    del arr
+    return fn + ".npy", False
+
+
+def _unique_counts(positions):
+    if len(positions) == 0:
+        return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64)
+    return np.unique(np.asarray(positions, dtype=np.int64), return_counts=True)
+
+
+def _bam_contig_worker(task):
+    """
+    Count 5'/3' ends for one contig and dump the npys.
+
+    Returns (contig, pl_path, mn_path, total_reads, n_records, pl_is_zero, mn_is_zero)
+    """
+    (input_bam, contig, length, mapq, layout, end, rc, pl_fn, mn_fn) = task
+    pl_pos, mn_pos, total, n_rec = _count_read_ends(input_bam, contig, mapq, layout, end, rc)
+    out = [_save_end_counts([_unique_counts(positions)], length, fn) for positions, fn in ((pl_pos, pl_fn),
+                                                                                           (mn_pos, mn_fn))]
     return contig, out[0][0], out[1][0], total, n_rec, out[0][1], out[1][1]
+
+
+def _bam_region_worker(task):
+    """
+    Count 5'/3' ends of the reads starting in one region of a contig.
+
+    Returns (contig, (pl_unique_positions, pl_counts), (mn_unique_positions, mn_counts), total_reads, n_records)
+    """
+    (input_bam, contig, start, stop, mapq, layout, end, rc) = task
+    pl_pos, mn_pos, total, n_rec = _count_read_ends(input_bam, contig, mapq, layout, end, rc, start, stop)
+    # 5' ends of reverse reads can lie past the region, so positions span the contig; int32 holds any
+    # position of a contig below 2**31 bases and halves what goes back to the parent
+    pdt = np.int32 if stop <= np.iinfo(np.int32).max else np.int64
+    packed = []
+    for positions in (pl_pos, mn_pos):
+        u, c = _unique_counts(positions)
+        packed.append((u.astype(pdt), c.astype(np.uint32)))
+    return contig, packed[0], packed[1], total, n_rec
+
+
+def _bam_assemble_worker(task):
+    """Sum the region counts of one contig and dump the npys; returns (contig, pl_path, mn_path, pl_is_zero,
+    mn_is_zero)."""
+    (contig, length, pl_parts, mn_parts, pl_fn, mn_fn) = task
+    pl = _save_end_counts(pl_parts, length, pl_fn)
+    mn = _save_end_counts(mn_parts, length, mn_fn)
+    return contig, pl[0], mn[0], pl[1], mn[1]
+
+
+# contigs are split into regions of at least this many bases when one contig would hold up the others
+BAM_SPLIT_MIN_SPAN = 2_000_000
+
+
+def _bam_regions(length, n_records, records_per_task):
+    """Equal-length regions [start, stop) of a contig, enough that each holds about records_per_task records."""
+    n = min(-(-n_records // records_per_task), length // BAM_SPLIT_MIN_SPAN)
+    if n < 2:
+        return None
+    bounds = [length * i // n for i in range(n + 1)]
+    return list(zip(bounds[:-1], bounds[1:]))
 
 
 def parse_bam_by_contig(input_bam, contigs, mapq, layout, end, rc, output_dir, output_prefix, threads=1):
     """
     Index-based, contig-parallel equivalent of BamParsers + dtype conversion in get_read_signal.
+
+    With several threads, contigs with many more records than an even share are split into regions; their
+    counts are summed per contig before the dump.
 
     Parameters
     ----------
@@ -195,20 +274,53 @@ def parse_bam_by_contig(input_bam, contigs, mapq, layout, end, rc, output_dir, o
     result_pl = {}
     result_mn = {}
     tasks = []
+    split = {}  # contig -> (length, pl_fn, mn_fn)
+    region_tasks = []
+    busy = [(name, length) for name, length in contigs if stats.get(name, None) != 0]
+    per_task = max(1, sum(stats.get(name, 0) for name, _ in busy) // (threads * 4)) if threads > 1 else None
     for name, length in contigs:
         pl_fn = os.path.join(output_dir, output_prefix + "_pl_%s" % name)
         mn_fn = os.path.join(output_dir, output_prefix + "_mn_%s" % name)
         if stats.get(name, None) == 0:
             result_pl[name] = save_zero_track(pl_fn, length)
             result_mn[name] = save_zero_track(mn_fn, length)
-        else:
+            continue
+        regions = _bam_regions(length, stats.get(name, 0), per_task) if per_task is not None else None
+        if regions is None:
             tasks.append((input_bam, name, length, mapq, layout, end, rc, pl_fn, mn_fn))
-    # longest-first scheduling
+        else:
+            split[name] = (length, pl_fn, mn_fn)
+            region_tasks.extend((input_bam, name, a, b, mapq, layout, end, rc) for a, b in regions)
+    # longest-first scheduling (a region's share of its contig's records stands in for its size)
     tasks.sort(key=lambda t: -stats.get(t[1], 0))
-    if threads > 1 and len(tasks) > 1:
+    if threads > 1 and len(tasks) + len(region_tasks) > 1:
         from multiprocessing import Pool
-        with Pool(min(threads, len(tasks))) as pool:
-            results = pool.map(_bam_contig_worker, tasks, chunksize=1)
+        n_regions = {c: 0 for c in split}
+        for t in region_tasks:
+            n_regions[t[1]] += 1
+        jobs = [(_bam_region_worker, t, stats.get(t[1], 0) / n_regions[t[1]]) for t in region_tasks] + \
+               [(_bam_contig_worker, t, stats.get(t[1], 0)) for t in tasks]
+        jobs.sort(key=lambda j: -j[2])
+        with Pool(min(threads, len(jobs))) as pool:
+            pending = [(f, pool.apply_async(f, (t,))) for f, t, _ in jobs]
+            results, parts, assembly = [], {c: [] for c in split}, []
+            for f, r in pending:  # in submission order; each contig is assembled once its last region is in
+                res = r.get()
+                if f is _bam_contig_worker:
+                    results.append(res)
+                    continue
+                contig = res[0]
+                ps = parts[contig]
+                ps.append(res)
+                if len(ps) == n_regions[contig]:
+                    length, pl_fn, mn_fn = split[contig]
+                    task = (contig, length, [p[1] for p in ps], [p[2] for p in ps], pl_fn, mn_fn)
+                    assembly.append((contig, sum(p[3] for p in ps), sum(p[4] for p in ps),
+                                     pool.apply_async(_bam_assemble_worker, (task,))))
+                    del task, ps[:]
+            for contig, total, n_rec, r in assembly:
+                c, pl_path, mn_path, pl_zero, mn_zero = r.get()
+                results.append((contig, pl_path, mn_path, total, n_rec, pl_zero, mn_zero))
     else:
         results = [_bam_contig_worker(t) for t in tasks]
 
