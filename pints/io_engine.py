@@ -1168,37 +1168,9 @@ def normalize_using_input(assay_pl, assay_mn, input_pl, input_mn, scale_factor, 
 
     """
 
-    def strand_atom(assay_coverage, input_coverage, sf=1., direction="pl"):
-        results = {}
-        for chrom_name, npy_dump in assay_coverage.items():
-            if chrom_name in input_coverage and is_zero_track(npy_dump) and np.isfinite(sf) and sf >= 0:
-                # exp == 0 everywhere, so max(exp - input * sf, 0) == 0 everywhere -> int8 zeros
-                length = np.load(npy_dump, mmap_mode="r").shape[0]
-                fn = os.path.join(output_dir, output_prefix + "_%s_%s" % (direction, chrom_name)) + ".npy"
-                results[chrom_name] = save_zero_track(fn, length, NP_DT_NAME[0])
-            elif chrom_name in input_coverage:
-                matched_input = np.load(input_coverage[chrom_name]) * sf
-                exp = np.load(npy_dump)
-                adjusted_signal = exp - matched_input
-                adjusted_signal[adjusted_signal < 0] = 0
-                chrom_max = np.max(adjusted_signal)
-                for k, v in enumerate(NP_DT_RANGE):
-                    if v > chrom_max:
-                        adjusted_signal = adjusted_signal.astype(NP_DT_NAME[k], copy=False)
-                        fn = os.path.join(output_dir, output_prefix + "_%s_%s" % (direction, chrom_name)) + ".npy"
-                        np.save(fn, adjusted_signal)
-                        results[chrom_name] = fn
-                        break
-            else:
-                logger.warning("%s doesn't have paired input/control" % chrom_name)
-        return results
-
-    if threads <= 1:
-        coverage_pl = strand_atom(assay_pl, input_pl, sf=scale_factor, direction="pl")
-        coverage_mn = strand_atom(assay_mn, input_mn, sf=scale_factor, direction="mn")
-        return coverage_pl, coverage_mn
-
-    # parallel form: identical per-chromosome operations; dict order, zero tracks and warnings as above
+    # per chromosome: zero assay track -> int8 zeros; otherwise max(exp - input * sf, 0) in the smallest dtype
+    # that holds its max (block-wise, see _normalize_chrom_worker); no control -> warning. Dict order and
+    # warnings follow assay_pl then assay_mn; with threads <= 1 the tasks run inline.
     plan, tasks = [], []
     for assay_coverage, input_coverage, direction in ((assay_pl, input_pl, "pl"), (assay_mn, input_mn, "mn")):
         for chrom_name, npy_dump in assay_coverage.items():
