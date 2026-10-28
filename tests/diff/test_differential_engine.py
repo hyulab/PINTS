@@ -184,3 +184,67 @@ def test_tabix_fallback_path_equals_ref(monkeypatch, tiny_chunks):
     covs = _covs(5)
     with tempfile.TemporaryDirectory() as da, tempfile.TemporaryDirectory() as db:
         same(_run_pss(ce, da, covs, "+", dict(thread_n=3)), _run_pss(rce, db, covs, "+", dict(thread_n=1)))
+
+
+# ------------------------------------------------------------------ subpeak beds kept in memory
+def _subpeak_files(d, prefix):
+    return sorted(f for f in os.listdir(d) if f.startswith(prefix + "_subpeaks_"))
+
+
+@pytest.mark.parametrize("threads", [1, 3])
+def test_supported_subpeak_beds_are_not_written(tiny_chunks, threads):
+    """Phase 1 writes, compresses and indexes a subpeak bed only for the tabix fallback."""
+    _globals()
+    covs = _covs(7)
+    with tempfile.TemporaryDirectory() as d:
+        files = _write(d, covs)
+        spd = _spd(ce, d, files, "+")
+        out = os.path.join(d, "o_pl.bed")
+        if threads == 1:
+            ce.evaluate_strand_jobs([(files, out, spd, "+")], 0.1, pool=None, thread_n=1)
+        else:
+            with ce._make_pool(threads) as pool:
+                ce.evaluate_strand_jobs([(files, out, spd, "+")], 0.1, pool=pool, thread_n=threads)
+        assert _subpeak_files(d, "o_pl") == []
+
+
+@pytest.mark.parametrize("threads", [1, 3])
+def test_unsupported_subpeak_beds_are_still_indexed(monkeypatch, tiny_chunks, threads):
+    _globals()
+    monkeypatch.setattr(ce.SubpeakIndex, "is_supported", lambda self: False)
+    covs = _covs(5)
+    with tempfile.TemporaryDirectory() as d:
+        files = _write(d, covs)
+        spd = _spd(ce, d, files, "+")
+        out = os.path.join(d, "o_pl.bed")
+        if threads == 1:
+            ce.evaluate_strand_jobs([(files, out, spd, "+")], 0.1, pool=None, thread_n=1)
+        else:
+            with ce._make_pool(threads) as pool:
+                ce.evaluate_strand_jobs([(files, out, spd, "+")], 0.1, pool=pool, thread_n=threads)
+        n = sum(v is not None for v in spd.values())
+        got = _subpeak_files(d, "o_pl")
+        assert len(got) == 2 * n and all(f.endswith((".bed.gz", ".bed.gz.csi")) for f in got)
+
+
+@pytest.mark.parametrize("seed", [3, 5, 11])
+def test_plain_element_definition_equals_compressed(seed):
+    """compress=False leaves the same lines uncompressed, and phase 1 reads either form identically."""
+    _globals()
+    covs = _covs(seed)
+    with tempfile.TemporaryDirectory() as d:
+        files = _write(d, covs)
+        for c in files:
+            gz = ce.unified_element_definition([files], c, "+", os.path.join(d, "g_pl.bed"))
+            plain = ce.unified_element_definition([files], c, "+", os.path.join(d, "p_pl.bed"), compress=False)
+            assert (gz is None) == (plain is None)
+            if gz is None:
+                continue
+            assert plain.endswith(".bed") and not os.path.exists(plain + ".gz")
+            assert ce._read_subpeak_input(plain) == ce._read_subpeak_input(gz)
+            with open(plain, "rb") as fh:
+                assert fh.read() == file_bytes(gz)
+            a = ce._subpeak_phase1(files[c], os.path.join(d, "a_pl.bed"), "+", c, gz)
+            b = ce._subpeak_phase1(files[c], os.path.join(d, "b_pl.bed"), "+", c, plain)
+            assert a["lines"] == b["lines"]
+            assert all(a[k] == b[k] for k in ("bkg_mu_threshold", "empirical_true_peak_threshold", "enable_eler"))
