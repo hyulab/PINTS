@@ -249,7 +249,7 @@ from helpers import make_bigwig
 
 @SLOW
 @given(st.integers(0, 2 ** 31 - 1), st.sampled_from([3, 100, 30000, 3_000_000]), st.sampled_from([7, 333, 4096]),
-       st.sampled_from(["", "chr"]), st.sampled_from([2, 5]), st.booleans())
+       st.sampled_from(["", "chr"]), st.sampled_from([1, 2, 5]), st.booleans())
 def test_get_coverage_bw_parallel(seed, vmax, block, prefix_filter, threads, fractional):
     rng = np.random.default_rng(seed)
     chroms = [("chr1", 9000), ("chr2", 2000), ("ctgX", 777), ("chrM", 16)]
@@ -284,6 +284,23 @@ def test_get_coverage_bw_parallel(seed, vmax, block, prefix_filter, threads, fra
             assert type(a2[2]) == type(b[2]) and a2[2] == b[2]
     finally:
         io._BW_BLOCK = old
+
+
+def test_get_coverage_bw_one_thread_without_numpy_uses_original(monkeypatch):
+    """pyBigWig built without numpy: the 1-thread loader keeps the original values() path."""
+    import pyBigWig
+    calls = []
+    orig = io._get_coverage_bw
+    monkeypatch.setattr(io, "_get_coverage_bw", lambda *a: calls.append(a) or orig(*a))
+    monkeypatch.setattr(pyBigWig, "numpy", 0)
+    chroms = [("chr1", 300)]
+    with tempfile.TemporaryDirectory() as d:
+        p = make_bigwig(os.path.join(d, "p.bw"), chroms, {"chr1": np.where(np.arange(300) % 7 == 0, 3.0, 0.0)})
+        m = make_bigwig(os.path.join(d, "m.bw"), chroms, {"chr1": np.where(np.arange(300) % 5 == 0, -2.0, 0.0)})
+        os.makedirs(os.path.join(d, "a")); os.makedirs(os.path.join(d, "b"))
+        a = io.get_coverage_bw(p, m, "", os.path.join(d, "a"), "q")
+        b = rio.get_coverage_bw(p, m, "", os.path.join(d, "b"), "q")
+    assert len(calls) == 2 and type(a[2]) == type(b[2]) and a[2] == b[2]
 
 
 @SLOW

@@ -606,7 +606,8 @@ def _get_coverage_bw_tasks(bw_file, chromosome_startswith, output_dir, output_pr
 
 
 def _get_coverage_bw_parallel(bw_files, chromosome_startswith, output_dir, prefixes, threads):
-    """Load several bigWigs with one process pool; same files, dicts (same order) and read counts."""
+    """Load several bigWigs with one process pool (inline, in file order, when threads <= 1); same files, dicts
+    (same order) and read counts."""
     from multiprocessing import get_context
     plans = [_get_coverage_bw_tasks(f, chromosome_startswith, output_dir, p) for f, p in zip(bw_files, prefixes)]
     jobs, owners = [], []
@@ -616,7 +617,9 @@ def _get_coverage_bw_parallel(bw_files, chromosome_startswith, output_dir, prefi
             owners.append(k)
     order = sorted(range(len(jobs)), key=lambda i: -jobs[i][2])
     sums = [None] * len(jobs)
-    if jobs:
+    if threads <= 1:
+        sums = [_bw_chrom_worker(*j) for j in jobs]
+    elif jobs:
         with get_context("fork").Pool(max(1, min(threads, len(jobs)))) as pool:
             for i, r in zip(order, pool.starmap(_bw_chrom_worker, [jobs[i] for i in order], chunksize=1)):
                 sums[i] = r
@@ -660,7 +663,12 @@ def get_coverage_bw(bw_pl, bw_mn, chromosome_startswith, output_dir, output_pref
         Number of total read counts
     """
     logger = logging.getLogger(__logger_name__)
-    if threads > 1:
+    try:
+        import pyBigWig
+        blockwise = bool(pyBigWig.numpy)  # the loader's dense fallback reads values(numpy=True)
+    except ImportError:
+        blockwise = False  # the original loader reports the missing package
+    if threads > 1 or blockwise:
         (pl, pc), (mn, mc) = _get_coverage_bw_parallel((bw_pl, bw_mn), chromosome_startswith, output_dir,
                                                        (output_prefix + "_pl", output_prefix + "_mn"), threads)
     else:
