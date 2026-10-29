@@ -266,12 +266,18 @@ def _run_chrom(mod, d, cov_list, strand, fl):
     sp = mod.unified_element_definition(files, CHR, strand, out, ce_donor=fl["donor"])
     if sp is None:
         return None, None, None
+    sp_bytes = file_bytes(sp)  # before phase 1, which reuses the file name here (the pipeline's names differ)
     df = mod.check_window_chromosome(files[0][CHR], out, strand, CHR, sp, 0.1,
                                      small_peak_threshold=fl["small"], min_mu_percent=fl["min_mu_percent"],
                                      disable_qc=fl["disable_qc"], disable_ler=fl["disable_ler"],
                                      enable_eler=fl["enable_eler"], sensitive=fl["sensitive"])
+    if mod is ce:  # phase 1 writes the subpeak bed only for the tabix fallback: compare its lines
+        ctx = ce._subpeak_phase1(files[0][CHR], os.path.join(d, "p1_x.bed"), strand, CHR, sp,
+                                 small_peak_threshold=fl["small"], min_mu_percent=fl["min_mu_percent"],
+                                 disable_qc=fl["disable_qc"], enable_eler=fl["enable_eler"])
+        return sp_bytes, df, "".join(ctx["lines"]).encode()
     spb = out.replace(".bed", ce.__SUB_PEAK_TPL__ % CHR) + ".gz"
-    return file_bytes(sp), df, file_bytes(spb)
+    return sp_bytes, df, file_bytes(spb)
 
 
 @SLOW
