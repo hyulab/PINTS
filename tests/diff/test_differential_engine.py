@@ -65,6 +65,56 @@ def test_subpeak_index_rejects_ties_and_unsorted():
     assert not ce.SubpeakIndex("chrZ", mk([(1, 1)])).is_supported()           # zero length
 
 
+# ------------------------------------------------------------------ array-backed chunking == line parsing
+def _old_segment_chunks(lines, target):
+    """`_segment_chunks` before it used the index's arrays (perf/subpeak-mem 49b9dcb)."""
+    if target <= 0 or len(lines) <= target:
+        return [(0, len(lines))]
+    chunks, lo, max_end = [], 0, None
+    for i, ln in enumerate(lines):
+        f = ln.split("\t", 3)
+        s, e = int(f[1]), int(f[2])
+        if max_end is not None and s - max_end >= ce._SEGMENT_GAP and i - lo >= target:
+            chunks.append((lo, i))
+            lo = i
+        max_end = e if max_end is None or e > max_end else max_end
+    chunks.append((lo, len(lines)))
+    return chunks
+
+
+def _old_context_for(lines, lo, hi):
+    """`_context_for` before it used the index's arrays: a linear scan with the same overlap rule."""
+    st = [int(l.split("\t")[1]) for l in lines]
+    en = [int(l.split("\t")[2]) for l in lines]
+    q0 = max(min(st[lo:hi]) - ce._FLANK_MAX_HALF - 2, 0)
+    q1 = max(en[:hi]) + ce._FLANK_MAX_HALF + 2
+    return [lines[i] for i in range(len(lines)) if st[i] < q1 and en[i] > q0]
+
+
+@FAST
+@given(st.integers(0, 2 ** 31 - 1), st.integers(1, 80), st.integers(0, 12))
+def test_array_chunking_matches_line_parsing(seed, n, target):
+    rng = np.random.default_rng(seed)
+    gaps = rng.choice([1, 50, 5_000, ce._SEGMENT_GAP - 1, ce._SEGMENT_GAP, ce._SEGMENT_GAP + 1, 40_000], n)
+    starts = np.cumsum(gaps)
+    lens = rng.integers(1, rng.choice([5, 300, 20_000]), n)  # long records can bridge later gaps
+    lines = ["chrZ\t%d\t%d\tp%d\t1.0\t0\t+\t0\t1\t%d\t1\n" % (s, s + l, i, s)
+             for i, (s, l) in enumerate(zip(starts, lens))]
+    bounds = (starts.astype(np.int64), (starts + lens).astype(np.int64))
+    for idx in (ce.SubpeakIndex("chrZ", lines), ce.SubpeakIndex("chrZ", lines, *bounds)):
+        assert idx.is_supported()
+        chunks = ce._segment_chunks(lines, target, idx)
+        assert chunks == _old_segment_chunks(lines, target) == ce._segment_chunks(lines, target)
+        for lo, hi in chunks:
+            ctx, (cs, cn) = ce._context_for(idx, lines, lo, hi)
+            assert list(ctx) == _old_context_for(lines, lo, hi)
+            assert cs.tolist() == [int(l.split("\t")[1]) for l in ctx]
+            assert cn.tolist() == [int(l.split("\t")[2]) for l in ctx]
+        for qs, qe in zip(rng.integers(0, int(starts[-1]) + 30_000, 20), rng.integers(0, 30_000, 20)):
+            qs, qe = int(qs), int(qs + qe)
+            assert idx.overlapping(qs, qe).tolist() == list(idx.indices(qs, qe))
+
+
 # ------------------------------------------------------------------ forced chunking under a pool
 def _clustered_cov(rng, n_clusters=7, dtype=np.int16):
     """Clusters of signal separated by gaps that are sometimes >= _SEGMENT_GAP and sometimes not."""

@@ -749,7 +749,8 @@ def check_window_chromosome(rc_file, output_file, strand_sign, chromosome_name, 
     if ctx["error"] is None:
         bins, err = _check_window_block(rc_file, chromosome_name, ctx["lines"], ctx["lines"], ctx,
                                         fdr_target, disable_ler, sensitive, fc_cutoff, init_dens_cutoff,
-                                        init_height_cutoff)
+                                        init_height_cutoff,
+                                        context_bounds=(ctx["index"].start_arr, ctx["index"].end_arr))
         if err is not None:
             logger.error(str(chromosome_name) + "\t" + str(subpeak_file))
             logger.error(err)
@@ -789,41 +790,69 @@ class SubpeakIndex:
     ``start < query_end`` and ``end > query_start`` are returned in file order; an empty query
     (``query_end <= query_start``) returns nothing. Records must be sorted by start and have positive
     length (`is_supported`); otherwise callers keep using tabix.
+
+    `starts`/`ends` (the lines' start and end columns, e.g. from the phase-1 worker that wrote them) spare
+    parsing the lines. The main process only needs the arrays (support check, chunking, contexts), so the
+    split fields and list copies that `fetch` uses are built on the first query.
     """
 
-    def __init__(self, chromosome, lines):
+    def __init__(self, chromosome, lines, starts=None, ends=None):
         from bisect import bisect_left, bisect_right
         self._bl, self._br = bisect_left, bisect_right
         self.chromosome = chromosome
-        self.fields = [ln.split("\t") for ln in lines]
-        self.starts = [int(f[1]) for f in self.fields]
-        self.ends = [int(f[2]) for f in self.fields]
-        self.prefix_max_end = []
-        m = -1
-        for e in self.ends:
-            m = e if e > m else m
-            self.prefix_max_end.append(m)
+        self.lines = lines
+        if starts is None:
+            starts, ends = _line_bounds(lines)
+        self.start_arr = np.asarray(starts, dtype=np.int64)
+        self.end_arr = np.asarray(ends, dtype=np.int64)
+        self.prefix_max_end_arr = np.maximum.accumulate(self.end_arr)
+        self._supported = None
+        self._query = None
 
     def is_supported(self):
-        st, en = self.starts, self.ends
-        # strictly increasing starts: then file order is the unique (chrom, start)-sorted order that
-        # `bedtools sort` (unstable for ties) produces for the tabix file
-        return all(e > s for s, e in zip(st, en)) and all(st[i] < st[i + 1] for i in range(len(st) - 1))
+        if self._supported is None:
+            st, en = self.start_arr, self.end_arr
+            # strictly increasing starts: then file order is the unique (chrom, start)-sorted order that
+            # `bedtools sort` (unstable for ties) produces for the tabix file
+            self._supported = bool((en > st).all() and (st[1:] > st[:-1]).all())
+        return self._supported
+
+    def _query_state(self):
+        if self._query is None:
+            self._query = ([ln.split("\t") for ln in self.lines], self.start_arr.tolist(), self.end_arr.tolist(),
+                           self.prefix_max_end_arr.tolist())
+        return self._query
 
     def indices(self, start, end):
         if end <= start:
             return range(0)
-        hi = self._bl(self.starts, end)
-        lo = self._br(self.prefix_max_end, start)
-        return [i for i in range(lo, hi) if self.ends[i] > start]
+        _, starts, ends, prefix_max_end = self._query_state()
+        hi = self._bl(starts, end)
+        lo = self._br(prefix_max_end, start)
+        return [i for i in range(lo, hi) if ends[i] > start]
+
+    def overlapping(self, start, end):
+        """`indices` as an int array, without building the query state (sorted starts only)."""
+        if end <= start:
+            return np.empty(0, dtype=np.intp)
+        hi = int(np.searchsorted(self.start_arr, end, side="left"))
+        lo = int(np.searchsorted(self.prefix_max_end_arr, start, side="right"))
+        return np.flatnonzero(self.end_arr[lo:hi] > start) + lo
 
     def fetch(self, chromosome, start, end, parser=None):
         if chromosome != self.chromosome:
             raise ValueError("could not create iterator for region '%s:%d-%d'" % (chromosome, start + 1, end))
         if start < 0:
             raise ValueError("start out of range (%d)" % start)
-        f = self.fields
+        f = self._query_state()[0]
         return [f[i] for i in self.indices(start, end)]
+
+
+def _line_bounds(lines):
+    """Start and end columns of BED lines, as int64 arrays."""
+    fields = [ln.split("\t", 3) for ln in lines]
+    return (np.array([int(f[1]) for f in fields], dtype=np.int64),
+            np.array([int(f[2]) for f in fields], dtype=np.int64))
 
 
 class PeakBedIndex:
@@ -914,9 +943,10 @@ def open_peak_index(path, n_queries=None):
 
 
 def _subpeak_block_stats(rc_file, chromosome_name, strand_sign, raw_lines, small_peak_threshold):
-    """Phase-1 worker: per-subpeak statistics, formatted exactly as the subpeak bed lines."""
+    """Phase-1 worker: per-subpeak statistics, formatted exactly as the subpeak bed lines, and their bounds."""
     per_base_cov = _load_coverage(rc_file)
     out_lines = []
+    starts, ends = [], []
     all_peak_mus = []
     try:
         for line in raw_lines:
@@ -942,9 +972,15 @@ def _subpeak_block_stats(rc_file, chromosome_name, strand_sign, raw_lines, small
             out_lines.append("%s\t%d\t%d\t%s\t%f\t%s\t%s\t%f\t%d\t%d\t%d\n" % (
                 chromosome_name, start, end, items[3], mu_peak, var_peak, strand_sign, pi_peak, non_zero_loci,
                 summit_coord, peak_region[x]))
+            starts.append(start)
+            ends.append(end)
     except TypeError as ex:
-        return out_lines, all_peak_mus, ex
-    return out_lines, all_peak_mus, None
+        return out_lines, all_peak_mus, ex, _bounds(starts, ends)
+    return out_lines, all_peak_mus, None, _bounds(starts, ends)
+
+
+def _bounds(starts, ends):
+    return np.array(starts, dtype=np.int64), np.array(ends, dtype=np.int64)
 
 
 def _read_subpeak_input(subpeak_file):
@@ -954,13 +990,15 @@ def _read_subpeak_input(subpeak_file):
 
 
 def _subpeak_thresholds(output_file, chromosome_name, subpeak_file, out_lines, all_peak_mus, error,
-                        min_mu_percent=0.1, disable_qc=False, enable_eler=True, eler_min=1., indexer=None):
+                        min_mu_percent=0.1, disable_qc=False, enable_eler=True, eler_min=1., indexer=None,
+                        bounds=(None, None)):
     """Phase-1 reduce: derive the per-chromosome thresholds, and write + index the subpeak bed when needed.
 
     Phase 2 reads the subpeak bed through `ctx["index"]` (a `SubpeakIndex` over `out_lines`). Only when that
     index does not support the lines (ties, unsorted or empty records) is the bed written, compressed and
     indexed for the tabix fallback, as before. `indexer`, if given, is called instead of `index_bed_file`
-    (used to compress/index on the pool while the parent continues).
+    (used to compress/index on the pool while the parent continues). `bounds` are the lines' start and end
+    columns, if known.
     """
     subpeak_bed = output_file.replace(".bed", __SUB_PEAK_TPL__ % chromosome_name)
     ctx = {"lines": out_lines, "error": None, "chromosome": chromosome_name, "subpeak_file": subpeak_file,
@@ -970,7 +1008,7 @@ def _subpeak_thresholds(output_file, chromosome_name, subpeak_file, out_lines, a
         logger.error(str(chromosome_name) + "\t" + str(subpeak_file))
         logger.error(error)
         return ctx
-    index = SubpeakIndex(chromosome_name, out_lines)
+    index = SubpeakIndex(chromosome_name, out_lines, *bounds)
     ctx["index"] = index
     try:
         if not index.is_supported():
@@ -1030,27 +1068,29 @@ def _subpeak_thresholds(output_file, chromosome_name, subpeak_file, out_lines, a
 def _subpeak_phase1(rc_file, output_file, strand_sign, chromosome_name, subpeak_file, small_peak_threshold=5,
                     min_mu_percent=0.1, disable_qc=False, enable_eler=True, eler_min=1.):
     raw = _read_subpeak_input(subpeak_file)
-    out_lines, mus, err = _subpeak_block_stats(rc_file, chromosome_name, strand_sign, raw, small_peak_threshold)
+    out_lines, mus, err, bounds = _subpeak_block_stats(rc_file, chromosome_name, strand_sign, raw,
+                                                       small_peak_threshold)
     return _subpeak_thresholds(output_file, chromosome_name, subpeak_file, out_lines, mus, err,
                                min_mu_percent=min_mu_percent, disable_qc=disable_qc, enable_eler=enable_eler,
-                               eler_min=eler_min)
+                               eler_min=eler_min, bounds=bounds)
 
 
 def _check_window_block(rc_file, chromosome_name, peak_lines, context_lines, ctx, fdr_target, disable_ler=False,
                         sensitive=False, fc_cutoff=1.5, init_dens_cutoff=0.25, init_height_cutoff=4,
-                        chromosome_coverage=None):
+                        chromosome_coverage=None, context_bounds=(None, None)):
     """
     Phase-2 worker: evaluate `peak_lines` (consecutive subpeak bed lines) with a fresh LER cache.
 
     `context_lines` must contain every subpeak overlapping the flanks of the tested peaks (in file
-    order). Returns (bins, error) where error is a caught TypeError (as in the original loop) or None.
+    order); `context_bounds`, if given, are their start and end columns. Returns (bins, error) where error is a
+    caught TypeError (as in the original loop) or None.
     """
     per_base_cov = _load_coverage(rc_file) if chromosome_coverage is None else chromosome_coverage
     if fc_cutoff > 0:
         real_fc_cutoff = 1. / fc_cutoff
     else:
         real_fc_cutoff = 1.
-    index = SubpeakIndex(chromosome_name, context_lines)
+    index = SubpeakIndex(chromosome_name, context_lines, *context_bounds)
     if index.is_supported():
         bed_handler = index
     else:  # ties / unsorted / empty records: use the tabix file itself
@@ -1104,34 +1144,37 @@ def _bins_to_df(bins, strand_sign):
     return result_df
 
 
-def _segment_chunks(lines, target):
+def _segment_chunks(lines, target, index=None):
     """
     Split subpeak lines (file order) into chunks of whole independent segments (gap >= _SEGMENT_GAP)
-    with roughly `target` lines each. Returns list of (lo, hi) line-index ranges.
+    with roughly `target` lines each. Returns list of (lo, hi) line-index ranges. `index`, a SubpeakIndex
+    over `lines`, supplies the bounds without parsing the lines again.
     """
     if target <= 0 or len(lines) <= target:
         return [(0, len(lines))]
+    if index is None:
+        index = SubpeakIndex(None, lines)
+    # line i can start a chunk if it starts >= _SEGMENT_GAP after the end of every earlier line
+    gaps = np.flatnonzero(index.start_arr[1:] - index.prefix_max_end_arr[:-1] >= _SEGMENT_GAP) + 1
     chunks = []
     lo = 0
-    max_end = None
-    for i, ln in enumerate(lines):
-        f = ln.split("\t", 3)
-        s, e = int(f[1]), int(f[2])
-        if max_end is not None and s - max_end >= _SEGMENT_GAP and i - lo >= target:
+    for i in gaps.tolist():
+        if i - lo >= target:
             chunks.append((lo, i))
             lo = i
-        max_end = e if max_end is None or e > max_end else max_end
     chunks.append((lo, len(lines)))
     return chunks
 
 
 def _context_for(index, lines, lo, hi):
-    """Lines overlapping the flanks of lines[lo:hi] (superset of anything LER may query)."""
-    st = index.starts[lo:hi]
-    en = index.prefix_max_end[hi - 1]
-    q0 = max(min(st) - _FLANK_MAX_HALF - 2, 0)
-    q1 = en + _FLANK_MAX_HALF + 2
-    return [lines[i] for i in index.indices(q0, q1)]
+    """Lines overlapping the flanks of lines[lo:hi] (superset of anything LER may query), and their bounds."""
+    q0 = max(int(index.start_arr[lo:hi].min()) - _FLANK_MAX_HALF - 2, 0)
+    q1 = int(index.prefix_max_end_arr[hi - 1]) + _FLANK_MAX_HALF + 2
+    sel = index.overlapping(q0, q1)
+    bounds = (index.start_arr[sel], index.end_arr[sel])
+    if sel.shape[0] and sel[-1] - sel[0] + 1 == sel.shape[0]:
+        return lines[sel[0]:sel[-1] + 1], bounds
+    return [lines[i] for i in sel.tolist()], bounds
 
 
 def _worker_init(model_name, iqr_name):
@@ -1385,16 +1428,19 @@ def evaluate_strand_jobs(jobs, fdr_target, pool=None, thread_n=1, **kwargs):
         def indexer(path):
             pending_index.append(pool.apply_async(_index_bed_task, (path,)))
     for ui, u in enumerate(units):
-        out_lines, mus, err = [], [], None
-        for owner, (ol, m, e) in zip(p1_owner, p1_res):
+        out_lines, mus, err, starts, ends = [], [], None, [], []
+        for owner, (ol, m, e, (st, en)) in zip(p1_owner, p1_res):
             if owner != ui or err is not None:
                 continue
             out_lines.extend(ol)
             mus.extend(m)
+            starts.append(st)
+            ends.append(en)
             err = e
+        bounds = (np.concatenate(starts), np.concatenate(ends)) if starts else (None, None)
         ctxs.append(_subpeak_thresholds(u[3], u[1], u[5], out_lines, mus, err, min_mu_percent=min_mu_percent,
                                         disable_qc=disable_qc, enable_eler=enable_eler, eler_min=eler_min,
-                                        indexer=indexer))
+                                        indexer=indexer, bounds=bounds))
 
     _phase("phase1 thresholds")
     # ---- phase 2: local-environment tests, in independent chunks
@@ -1411,10 +1457,13 @@ def evaluate_strand_jobs(jobs, fdr_target, pool=None, thread_n=1, **kwargs):
                 r.get()
             pending_index = []
         slim = {k: v for k, v in c.items() if k not in ("lines", "index")}
-        for lo, hi in (_segment_chunks(lines, target) if index.is_supported() else [(0, len(lines))]):
-            context = lines if (lo == 0 and hi == len(lines)) else _context_for(index, lines, lo, hi)
+        for lo, hi in (_segment_chunks(lines, target, index) if index.is_supported() else [(0, len(lines))]):
+            if lo == 0 and hi == len(lines):
+                context, bounds = lines, (index.start_arr, index.end_arr)
+            else:
+                context, bounds = _context_for(index, lines, lo, hi)
             p2_tasks.append((u[2], u[1], lines[lo:hi], context, slim, fdr_target, disable_ler, sensitive,
-                             fc_cutoff, init_dens_cutoff, init_height_cutoff))
+                             fc_cutoff, init_dens_cutoff, init_height_cutoff, None, bounds))
             p2_owner.append(ui)
     _phase("phase2 setup")
     if pool is not None:
