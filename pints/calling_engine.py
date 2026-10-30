@@ -1195,7 +1195,15 @@ def _make_pool(n):
         ctx = mp.get_context()
     init_args = (type(stat_tester).__name__ if stat_tester is not None else None,
                  type(iqr_obj).__name__ if iqr_obj is not None else None)
-    return ctx.Pool(n, initializer=_worker_init, initargs=init_args)
+    # The workers' cyclic GC never visits objects that exist at the fork, so it doesn't write to (and copy) the
+    # parent's pages in every worker; the parent collects them again after the fork.
+    import gc
+    gc.collect()
+    gc.freeze()
+    try:
+        return ctx.Pool(n, initializer=_worker_init, initargs=init_args)
+    finally:
+        gc.unfreeze()
 
 
 def _run_tasks(pool, func, tasks, costs=None):
