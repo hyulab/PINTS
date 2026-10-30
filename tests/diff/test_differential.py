@@ -390,6 +390,47 @@ def test_pair(seed, stringent, min_len, div_min):
     same(res[0], res[1])
 
 
+@pytest.mark.parametrize("empty_strand", [None, "pl", "mn"])
+def test_pair_on_pool_matches_ref(empty_strand):
+    """Strands paired in parallel on a pool (including a strand without significant peaks) == pints_ref."""
+    rng = np.random.default_rng(17)
+    dfs = {}
+    for strand, lab in (("+", "pl"), ("-", "mn")):
+        n = 400
+        s = np.sort(rng.choice(200_000, n, replace=False))
+        e = s + rng.integers(1, 100, n)
+        padj = np.where(rng.random(n) < 0.4, rng.uniform(0, 0.05, n), rng.uniform(0, 1, n))
+        if lab == empty_strand:
+            padj = rng.uniform(0.2, 1, n)
+        dfs[lab] = pd.DataFrame({"chromosome": "chr1", "start": s, "end": e, "name": ".", "padj": padj,
+                                 "strand": strand, "reads": rng.integers(1, 100, n), "pval": padj / 3,
+                                 "mu_0": 0.1, "pi_0": 0.1, "mu_1": 1.0, "pi_1": 0.1, "var_1": 0.1, "ler_1": 0,
+                                 "ler_2": 0, "ler_3": 0, "non_zeros": 3, "summit": s + (e - s) // 2,
+                                 "summit_val": rng.integers(1, 50, n)}).loc[:, ce.COMMON_HEADER]
+    res = []
+    with ce._make_pool(2) as pool:
+        for mod, kw in ((ce, dict(pool=pool)), (ce, {}), (rce, {})):
+            with tempfile.TemporaryDirectory() as d:
+                for lab, df in dfs.items():
+                    fn = os.path.join(d, "s_%s.bed" % lab)
+                    df.sort_values(by=["chromosome", "start"]).to_csv(fn, sep="\t", index=False, header=False)
+                    mod.index_bed_file(fn)
+                (b, dv, u), gc = mod.pair(os.path.join(d, "s"), {k: v.copy() for k, v in dfs.items()}, 0.1, False,
+                                          **kw)
+                res.append(([file_bytes(x) for x in (b, dv, u)], [os.path.basename(g) for g in gc]))
+    same(res[0], res[2])
+    same(res[1], res[2])
+
+
+def test_bed_is_empty_follows_count():
+    with tempfile.TemporaryDirectory() as d:
+        for text in ("", "\n", "#c\ntrack x\nbrowser y\n\n", "#c\nchr1\t1\t5\n", "chr1\t1\t5\nchr1\t7\t9\n"):
+            fn = os.path.join(d, "x.bed")
+            with open(fn, "w") as fh:
+                fh.write(text)
+            assert ce._bed_is_empty(fn) == (ce.BedTool(fn).count() == 0), repr(text)
+
+
 # ------------------------------------------------------------------ IO
 @st.composite
 def random_reads(draw):
