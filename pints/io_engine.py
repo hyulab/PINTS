@@ -152,14 +152,14 @@ def _count_read_ends(input_bam, contig, mapq, layout, end, rc, start=None, stop=
     return pl_pos, mn_pos, total, n_rec
 
 
-def _save_end_counts(parts, length, fn):
+def _end_counts(parts, length):
     """
-    Dump the per-base counts of one strand, given as (unique positions, counts) parts, with the dtype
-    choice of get_read_signal; returns (path, is_zero_track).
+    The per-base counts of one strand, given as (unique positions, counts) parts, with the dtype choice of
+    get_read_signal: (sorted unique positions, counts in that dtype), or None if there are none.
     """
     parts = [(u, c) for u, c in parts if len(u)]
     if not parts:
-        return save_zero_track(fn, length), True
+        return None
     lo = min(int(u[0]) for u, _ in parts)
     hi = max(int(u[-1]) for u, _ in parts)
     if lo < 0 or hi >= length:
@@ -176,11 +176,35 @@ def _save_end_counts(parts, length, fn):
     # original accumulates in uint32 before choosing the dump dtype
     cnt = cnt.astype(np.uint32)
     dt = _smallest_int_dtype(cnt.max())
-    arr = np.zeros(length, dtype=dt)
-    arr[uniq] = cnt.astype(dt)
+    return uniq, cnt.astype(dt)
+
+
+def _save_end_counts(parts, length, fn):
+    """
+    Dump the per-base counts of one strand, given as (unique positions, counts) parts, with the dtype
+    choice of get_read_signal; returns (path, is_zero_track). With `fn` None, returns (counts, is_zero)
+    instead, where counts is `_end_counts`'s result (the parent builds the track).
+    """
+    counts = _end_counts(parts, length)
+    if fn is None:
+        return counts, counts is None
+    if counts is None:
+        return save_zero_track(fn, length), True
+    uniq, cnt = counts
+    arr = np.zeros(length, dtype=cnt.dtype)
+    arr[uniq] = cnt
     np.save(fn, arr)
     del arr
     return fn + ".npy", False
+
+
+def _end_counts_track(counts, length):
+    """CoverageTrack for `_end_counts`'s result; an all-zero track has the zero-track dtype (int8)."""
+    from .coverage_store import CoverageTrack
+    if counts is None:
+        return CoverageTrack(length, np.int8, np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int8))
+    uniq, cnt = counts
+    return CoverageTrack(length, cnt.dtype, uniq, cnt)
 
 
 def _unique_counts(positions):
@@ -193,7 +217,8 @@ def _bam_contig_worker(task):
     """
     Count 5'/3' ends for one contig and dump the npys.
 
-    Returns (contig, pl_path, mn_path, total_reads, n_records, pl_is_zero, mn_is_zero)
+    Returns (contig, pl_path, mn_path, total_reads, n_records, pl_is_zero, mn_is_zero). With pl_fn/mn_fn None,
+    the paths are `_end_counts` results instead (no files).
     """
     (input_bam, contig, length, mapq, layout, end, rc, pl_fn, mn_fn) = task
     pl_pos, mn_pos, total, n_rec = _count_read_ends(input_bam, contig, mapq, layout, end, rc)
@@ -222,7 +247,7 @@ def _bam_region_worker(task):
 
 def _bam_assemble_worker(task):
     """Sum the region counts of one contig and dump the npys; returns (contig, pl_path, mn_path, pl_is_zero,
-    mn_is_zero)."""
+    mn_is_zero). With pl_fn/mn_fn None, the paths are `_end_counts` results instead (no files)."""
     (contig, length, pl_parts, mn_parts, pl_fn, mn_fn) = task
     pl = _save_end_counts(pl_parts, length, pl_fn)
     mn = _save_end_counts(mn_parts, length, mn_fn)
@@ -242,7 +267,8 @@ def _bam_regions(length, n_records, records_per_task):
     return list(zip(bounds[:-1], bounds[1:]))
 
 
-def parse_bam_by_contig(input_bam, contigs, mapq, layout, end, rc, output_dir, output_prefix, threads=1):
+def parse_bam_by_contig(input_bam, contigs, mapq, layout, end, rc, output_dir, output_prefix, threads=1,
+                        as_tracks=False):
     """
     Index-based, contig-parallel equivalent of BamParsers + dtype conversion in get_read_signal.
 
@@ -252,6 +278,8 @@ def parse_bam_by_contig(input_bam, contigs, mapq, layout, end, rc, output_dir, o
     Parameters
     ----------
     contigs : list of (name, length) in header order (already filtered)
+    as_tracks : bool
+        Return `CoverageTrack`s (same values and dtypes as the dumps) instead of writing .npy dumps
 
     Returns
     -------
@@ -278,12 +306,17 @@ def parse_bam_by_contig(input_bam, contigs, mapq, layout, end, rc, output_dir, o
     region_tasks = []
     busy = [(name, length) for name, length in contigs if stats.get(name, None) != 0]
     per_task = max(1, sum(stats.get(name, 0) for name, _ in busy) // (threads * 4)) if threads > 1 else None
+    lengths = dict(contigs)
     for name, length in contigs:
-        pl_fn = os.path.join(output_dir, output_prefix + "_pl_%s" % name)
-        mn_fn = os.path.join(output_dir, output_prefix + "_mn_%s" % name)
+        pl_fn = None if as_tracks else os.path.join(output_dir, output_prefix + "_pl_%s" % name)
+        mn_fn = None if as_tracks else os.path.join(output_dir, output_prefix + "_mn_%s" % name)
         if stats.get(name, None) == 0:
-            result_pl[name] = save_zero_track(pl_fn, length)
-            result_mn[name] = save_zero_track(mn_fn, length)
+            if as_tracks:
+                result_pl[name] = _end_counts_track(None, length)
+                result_mn[name] = _end_counts_track(None, length)
+            else:
+                result_pl[name] = save_zero_track(pl_fn, length)
+                result_mn[name] = save_zero_track(mn_fn, length)
             continue
         regions = _bam_regions(length, stats.get(name, 0), per_task) if per_task is not None else None
         if regions is None:
@@ -330,6 +363,10 @@ def parse_bam_by_contig(input_bam, contigs, mapq, layout, end, rc, output_dir, o
         if stats.get(contig, None) != n_rec:
             ok = False
         total_reads += total
+        if as_tracks:
+            result_pl[contig] = _end_counts_track(pl_path, lengths[contig])
+            result_mn[contig] = _end_counts_track(mn_path, lengths[contig])
+            continue
         result_pl[contig] = pl_path
         result_mn[contig] = mn_path
         if pl_zero:
@@ -339,7 +376,7 @@ def parse_bam_by_contig(input_bam, contigs, mapq, layout, end, rc, output_dir, o
     if not ok:
         logger.warning("BAM index statistics do not match fetched records; using the serial parser")
         for d in (result_pl, result_mn):
-            for v in d.values():
+            for v in (() if as_tracks else d.values()):
                 _ZERO_TRACKS.discard(os.path.abspath(v))
                 if os.path.exists(v):
                     os.remove(v)
@@ -955,6 +992,18 @@ def get_read_signal(input_bam, loc_prime, chromosome_startswith, output_dir, out
     read_counts : int
         Total read counts passing filters
     """
+    return _read_signal(input_bam, loc_prime, chromosome_startswith, output_dir, output_prefix, filters=filters,
+                        reverse_complement=reverse_complement, **kwargs)[:3]
+
+
+def _read_signal(input_bam, loc_prime, chromosome_startswith, output_dir, output_prefix, filters=(),
+                 reverse_complement=False, as_tracks=False, **kwargs):
+    """
+    `get_read_signal`, returning (pl, mn, read_counts, cache_files). With `as_tracks`, pl and mn map chromosomes
+    to `CoverageTrack`s holding what the dumps would hold, and no dumps are written; dumps found in the output
+    directory (the cache) are loaded into tracks and listed in cache_files, so the caller can delete them as it
+    deletes dumps. Without `as_tracks`, cache_files is empty (the returned paths are the files).
+    """
     logger = logging.getLogger(__logger_name__)
     supported_protocols = {
         "PROcap": "R_5_f",
@@ -1029,11 +1078,18 @@ def get_read_signal(input_bam, loc_prime, chromosome_startswith, output_dir, out
         fast = parse_bam_by_contig(input_bam, [(c, chromosome_coverage_pl[c].shape[0]) for c in chromosome_coverage_pl],
                                    mapq=mapq_threshold, layout=library_layout, end=interested_end,
                                    rc=bool(reverse_complement), output_dir=output_dir, output_prefix=output_prefix,
-                                   threads=kwargs.get("thread_n", 1))
+                                   threads=kwargs.get("thread_n", 1), as_tracks=as_tracks)
 
+    cache_files = []
     if load_cache_flag:
         logger.info("Loading cache from previous result, if you want to re-parse the bam file, "
                     "please delete all files end with npy first.")
+        if as_tracks:
+            from .coverage_store import track_from_npy
+            for d in (result_pl, result_mn):
+                cache_files.extend(d.values())
+                for chrom in d:
+                    d[chrom] = track_from_npy(d[chrom])
     elif fast is not None:
         result_pl, result_mn, read_counts = fast
     else:
@@ -1086,17 +1142,24 @@ def get_read_signal(input_bam, loc_prime, chromosome_startswith, output_dir, out
                 if v > pl_chrom_max:
                     chromosome_coverage_pl[chrom] = chromosome_coverage_pl[chrom].astype(NP_DT_NAME[k], copy=False)
                     fn = os.path.join(output_dir, output_prefix + "_pl_%s" % chrom)
-                    np.save(fn, chromosome_coverage_pl[chrom])
-                    result_pl[chrom] = fn + ".npy"
+                    result_pl[chrom] = _store_or_save(chromosome_coverage_pl[chrom], fn, as_tracks)
                     break
             for k, v in enumerate(NP_DT_RANGE):
                 if v > mn_chrom_max:
                     chromosome_coverage_mn[chrom] = chromosome_coverage_mn[chrom].astype(NP_DT_NAME[k], copy=False)
                     fn = os.path.join(output_dir, output_prefix + "_mn_%s" % chrom)
-                    np.save(fn, chromosome_coverage_mn[chrom])
-                    result_mn[chrom] = fn + ".npy"
+                    result_mn[chrom] = _store_or_save(chromosome_coverage_mn[chrom], fn, as_tracks)
                     break
-    return result_pl, result_mn, read_counts
+    return result_pl, result_mn, read_counts, cache_files
+
+
+def _store_or_save(arr, fn, as_tracks):
+    """A track holding `arr`, or `np.save(fn, arr)` and the .npy path."""
+    if as_tracks:
+        from .coverage_store import track_from_dense
+        return track_from_dense(arr)
+    np.save(fn, arr)
+    return fn + ".npy"
 
 
 def _normalize_chrom_worker(npy_dump, input_npy, sf, fn, block=None):
