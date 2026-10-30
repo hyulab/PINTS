@@ -230,3 +230,47 @@ def test_merge_replicate_tracks_equals_file_merge(seed, n_reps, runs, vmax):
         for k in (0, 1):
             _assert_tracks_equal_dumps(got[k], a[k])
             assert [io.is_zero_track(got[k][c]) for c in got[k]] == [io.is_zero_track(a[k][c]) for c in a[k]]
+
+
+# ------------------------------------------------------------------ control normalisation
+@SLOW
+@given(st.integers(0, 2 ** 31 - 1), st.sampled_from([0.37, 1.0, 2.659, 0.0, -0.0, 1e-9, 7e5, float("nan"),
+                                                     float("inf"), -1.5]), st.booleans())
+def test_normalize_tracks_equals_file_normalisation(seed, sf, runs):
+    import logging
+    rng = np.random.default_rng(seed)
+    chroms = {"chr1": 5000, "chr2": 3000, "chrZ": 40, "chrE": 700, "chrM": 90}
+    with tempfile.TemporaryDirectory() as d:
+        def sample(tag, empty=(), zero=()):
+            paths, tracks = {}, {}
+            for c, L in chroms.items():
+                fn = os.path.join(d, "%s_%s.npy" % (tag, c))
+                if c in zero:
+                    paths[c] = io.save_zero_track(fn, L)
+                    tracks[c] = cs.zero_track(L)
+                    continue
+                v = np.where(rng.random(L) < 0.1, rng.integers(1, 300, L), 0)
+                if c in empty:
+                    v[:] = 0
+                if runs:
+                    v = np.repeat(v[::4], 4)[:L]
+                v = v.astype(rng.choice([np.int16, np.int32]))
+                np.save(fn, v)
+                paths[c] = fn
+                tracks[c] = _runs_of(v) if runs else cs.track_from_dense(v)
+            return paths, tracks
+        (ep, et), (em, emt) = sample("ep", zero=("chrE",)), sample("em", empty=("chrZ",))
+        (ip, it), (im, imt) = sample("ip", empty=("chrM",)), sample("im")
+        del im["chrZ"], imt["chrZ"]  # chromosome without control: dropped with a warning
+        lg = logging.getLogger("t")
+        for sub in ("a", "b"):
+            os.makedirs(os.path.join(d, sub))
+        with np.errstate(invalid="ignore", over="ignore"):
+            got = io.normalize_tracks_using_input(et, emt, it, imt, sf, lg)
+            a = io.normalize_using_input(ep, em, ip, im, sf, os.path.join(d, "a"), "n", lg)
+            b = rio.normalize_using_input(ep, em, ip, im, sf, os.path.join(d, "b"), "n", lg)
+        for k in (0, 1):
+            assert list(a[k]) == list(b[k])
+            _assert_tracks_equal_dumps(got[k], a[k])
+            assert [io.is_zero_track(got[k][c]) for c in got[k]] == [io.is_zero_track(a[k][c]) for c in a[k]]
+            assert all((t.values != 0).all() for t in got[k].values())

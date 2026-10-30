@@ -145,6 +145,85 @@ def zero_track(length, dtype=np.int8):
     return CoverageTrack(length, dtype, np.empty(0, dtype=np.int64), np.empty(0, dtype=dtype), zero_track=True)
 
 
+def align(tracks, support=None):
+    """
+    The tracks cut into common pieces: (starts, ends, [values of each track on each piece]), where the pieces
+    are the elementary segments between all run boundaries, in order, and every track is constant on each.
+    Bases outside every run are left out. ends is None when every track is in the points form (pieces of
+    one base). With `support` (an index into `tracks`), only the pieces where that track is non-zero.
+    """
+    pieces = [t.nonzero() for t in tracks]
+    points = all(t.ends is None for t in tracks)
+    if points:
+        bounds = np.unique(np.concatenate([p[0] for p in pieces]).astype(np.int64)) if support is None \
+            else pieces[support][0].astype(np.int64)
+        seg_end = None
+    else:
+        src = pieces if support is None else [pieces[support]] + [p for k, p in enumerate(pieces) if k != support]
+        edges = np.unique(np.concatenate([np.concatenate((p[0], p[1])) for p in src]).astype(np.int64))
+        bounds, seg_end = edges[:-1], edges[1:]
+    vals = []
+    for t, (st, en, va) in zip(tracks, pieces):
+        v = np.zeros(bounds.shape[0], dtype=t.dtype)
+        if st.shape[0]:
+            i = np.searchsorted(st, bounds, "right") - 1  # the run starting at or before each piece
+            inside = (i >= 0) & (bounds < en[np.maximum(i, 0)])
+            v[inside] = va[i[inside]]
+        vals.append(v)
+    keep = None
+    if support is not None:
+        keep = vals[support] != 0
+    elif seg_end is not None:
+        keep = np.zeros(bounds.shape[0], dtype=bool)
+        for v in vals:
+            keep |= v != 0
+    if keep is not None:
+        bounds, vals = bounds[keep], [v[keep] for v in vals]
+        seg_end = None if seg_end is None else seg_end[keep]
+    return bounds, seg_end, vals
+
+
+def normalize_track(exp, inp, sf):
+    """
+    One chromosome of `normalize_using_input` on tracks: ``max(exp - inp * sf, 0)`` in the smallest
+    `NP_DT_NAME` dtype that holds its maximum, or None when no dtype does (the chromosome is then dropped,
+    as by the file code).
+
+    Computed only where `exp` is non-zero. Elsewhere the dense code computes ``0 - inp * sf``: with `sf`
+    finite and >= 0 and `inp` non-negative (coverage after loading: counts, or bigWig values after
+    nan_to_num and the sign flip), that is <= 0 and never NaN, so it is set to 0 and stays 0 in every integer
+    dtype (a signed zero cannot survive the cast). Those zeros cannot change the maximum's dtype choice either,
+    as the maximum is >= 0 whenever any base is off the support. On the support, every element gets the
+    same float64 operations as in the dense code. Other `sf`, or tracks of different lengths, use the dense
+    code on the dense arrays.
+    """
+    from .io_engine import NP_DT_RANGE, NP_DT_NAME
+    if not (np.isfinite(sf) and sf >= 0) or exp.length != inp.length or exp.length == 0 \
+            or (inp.values.shape[0] and inp.values.min() < 0):
+        matched_input = inp.dense() * sf
+        adjusted_signal = exp.dense() - matched_input
+        adjusted_signal[adjusted_signal < 0] = 0
+        chrom_max = np.max(adjusted_signal)
+        for k, v in enumerate(NP_DT_RANGE):
+            if v > chrom_max:
+                return track_from_dense(adjusted_signal.astype(NP_DT_NAME[k], copy=False))
+        return None
+    starts, ends, (e, i) = align([exp, inp], support=0)
+    matched_input = i * sf
+    adjusted_signal = e - matched_input
+    adjusted_signal[adjusted_signal < 0] = 0
+    covered = starts.shape[0] if ends is None else int((ends - starts).sum())
+    chrom_max = np.max(adjusted_signal) if covered else None
+    if covered < exp.length:
+        chrom_max = 0. if chrom_max is None else max(chrom_max, 0.)
+    for k, v in enumerate(NP_DT_RANGE):
+        if v > chrom_max:
+            out = adjusted_signal.astype(NP_DT_NAME[k], copy=False)
+            nz = out != 0
+            return CoverageTrack(exp.length, NP_DT_NAME[k], starts[nz], out[nz], None if ends is None else ends[nz])
+    return None
+
+
 def merge_tracks(tracks):
     """
     Replicate merge of `merge_replicates_bw` on tracks: (merged track, its sum), where the merged track is the
@@ -156,21 +235,11 @@ def merge_tracks(tracks):
     n = tracks[0].length
     if any(t.length != n for t in tracks):
         raise ValueError("operands could not be broadcast together with shapes %s" % [(t.length,) for t in tracks])
-    points = all(t.ends is None for t in tracks)
-    pieces = [t.nonzero() for t in tracks]
-    if points:
-        bounds = np.unique(np.concatenate([p[0] for p in pieces]).astype(np.int64))
-        seg_end = bounds + 1
-    else:
-        edges = np.unique(np.concatenate([np.concatenate((p[0], p[1])) for p in pieces]).astype(np.int64))
-        bounds, seg_end = edges[:-1], edges[1:]
+    bounds, seg_end, vals = align(tracks)
+    points = seg_end is None
     total = np.zeros(bounds.shape[0], dtype=np.int64)
-    for st, en, va in pieces:
-        if st.shape[0] == 0:
-            continue
-        i = np.searchsorted(st, bounds, "right") - 1  # the input run starting at or before each segment
-        inside = (i >= 0) & (bounds < en[np.maximum(i, 0)])
-        total[inside] += va[i[inside]]
+    for v in vals:
+        total += v
     merged = total.astype(np.int32)  # modular, as repeated in-place int32 additions
     keep = merged != 0
     m32 = CoverageTrack(n, np.int32, bounds[keep], merged[keep], None if points else seg_end[keep])

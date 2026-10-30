@@ -1932,3 +1932,24 @@ def merge_replicate_tracks(per_sample_coverage_pls, per_sample_coverage_mns):
         pl_rc += pl_s
         mn_rc += mn_s
     return merged_pl, merged_mn, pl_rc, mn_rc
+
+
+def normalize_tracks_using_input(assay_pl, assay_mn, input_pl, input_mn, scale_factor, logger):
+    """
+    `normalize_using_input` for dicts of `CoverageTrack`s: the same chromosomes in the same order, the same
+    values and dtypes (see `normalize_track`), the same warnings, and no files.
+    """
+    from .coverage_store import normalize_track, zero_track
+    out = {"pl": {}, "mn": {}}
+    for assay_coverage, input_coverage, direction in ((assay_pl, input_pl, "pl"), (assay_mn, input_mn, "mn")):
+        for chrom_name, track in assay_coverage.items():
+            sf = scale_factor
+            if chrom_name in input_coverage and is_zero_track(track) and np.isfinite(sf) and sf >= 0:
+                out[direction][chrom_name] = zero_track(track.length, NP_DT_NAME[0])
+            elif chrom_name in input_coverage:
+                res = normalize_track(track, input_coverage[chrom_name], sf)
+                if res is not None:
+                    out[direction][chrom_name] = res
+            else:
+                logger.warning("%s doesn't have paired input/control" % chrom_name)
+    return out["pl"], out["mn"]
