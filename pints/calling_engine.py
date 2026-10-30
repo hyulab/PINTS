@@ -45,7 +45,10 @@ try:
         independent_filtering, get_elbow
     from .io_engine import get_read_signal, get_coverage_bw, log_assert, normalize_using_input, is_zero_track, \
         npy_layout, npy_read, NPY_BLOCK, \
-        index_bed_file, peak_bed_to_gtf, merge_replicates_bw
+        index_bed_file, peak_bed_to_gtf, merge_replicates_bw, _read_signal, _coverage_bw, merge_replicate_tracks, \
+        normalize_tracks_using_input
+    from .coverage_store import register as register_track, lookup as lookup_track, release as release_tracks, \
+        is_key
     from pints import __version__
 except ImportError as e:
     missing_package = str(e).replace("No module named '", "").replace("'", "")
@@ -53,6 +56,9 @@ except ImportError as e:
     sys.exit(-1)
 
 housekeeping_files = []
+# Coverage lives in the in-memory store (pints/coverage_store.py, reached by registry keys) instead of per-base
+# .npy dumps. PINTS_COVERAGE_STORE=0 uses the dumps (same results; kept for differential testing).
+COVERAGE_STORE = os.environ.get("PINTS_COVERAGE_STORE", "1") != "0"
 COMMON_HEADER = ('chromosome', 'start', 'end', 'name', 'padj', 'strand', 'reads',
                  'pval', 'mu_0', 'pi_0', 'mu_1', 'pi_1', 'var_1', 'ler_1', 'ler_2', 'ler_3',
                  'non_zeros', 'summit', 'summit_val')
@@ -523,11 +529,12 @@ def merge_covs(covs, chromosome_of_interest, skip_if_empty=False):
     merged_coverage : np.ndarray
         merged coverage tracks
     """
-    if skip_if_empty and all(is_zero_track(cd[chromosome_of_interest]) for cd in covs):
+    if skip_if_empty and all(is_zero_track(_resolve_coverage(cd[chromosome_of_interest])) for cd in covs):
         return None
     merged_coverage = None
     for cd in covs:
-        cov = np.load(cd[chromosome_of_interest])
+        ref = _resolve_coverage(cd[chromosome_of_interest])
+        cov = np.load(ref) if isinstance(ref, str) else ref.dense()
         if merged_coverage is None:
             merged_coverage = np.zeros(cov.shape[0], dtype=np.int32)
 
@@ -774,12 +781,37 @@ _RESULT_COLUMNS = ("chromosome", "start", "end", "name", "pval", "reads",
                    "ler_1", "ler_2", "ler_3", "non_zeros")
 
 
-def _load_coverage(rc_file):
-    """Read-only, page-cache-shared view of a coverage dump (same values/dtype as np.load)."""
+def _resolve_coverage(ref):
+    """A coverage dict value as readers use it: the track for a registry key, otherwise the path itself."""
+    return lookup_track(ref) if is_key(ref) else ref
+
+
+def _register_coverage(coverage, sample, strand):
+    """Register the tracks of a chromosome -> CoverageTrack dict; returns chromosome -> key (same order)."""
+    return {c: register_track(sample, strand, c, t) for c, t in coverage.items()}
+
+
+def _load_coverage(rc_file, lo=0, hi=None):
+    """
+    Read-only, page-cache-shared view of a coverage dump (same values/dtype as np.load). For a registry key,
+    a fresh full-length array of the track's dense dtype holding its bases in [lo, hi) and zeros elsewhere:
+    callers only read inside that span, and pages of `np.zeros` that are never written cost no memory.
+    """
+    if is_key(rc_file):
+        track = lookup_track(rc_file)
+        buf = np.zeros(track.length, dtype=track.dtype)
+        track.fill(buf, lo, hi)
+        return buf
     try:
         return np.asarray(np.load(rc_file, mmap_mode="r"))
     except ValueError:
         return np.load(rc_file, allow_pickle=True)
+
+
+# Phase 2 reads coverage at most _FLANK_MAX_HALF bases beyond a tested peak (check_window's flanks) and 2500
+# bases beyond a subpeak overlapping those flanks (remove_peaks_in_local_env), and every such subpeak is in the
+# task's context lines.
+_PHASE2_REACH = _FLANK_MAX_HALF + 2500 + 2
 
 
 class SubpeakIndex:
@@ -944,7 +976,11 @@ def open_peak_index(path, n_queries=None):
 
 def _subpeak_block_stats(rc_file, chromosome_name, strand_sign, raw_lines, small_peak_threshold):
     """Phase-1 worker: per-subpeak statistics, formatted exactly as the subpeak bed lines, and their bounds."""
-    per_base_cov = _load_coverage(rc_file)
+    if is_key(rc_file):  # each subpeak reads its own bases only
+        starts, ends = _line_bounds(raw_lines)
+        per_base_cov = _load_coverage(rc_file, int(starts.min()), int(ends.max())) if len(raw_lines) else None
+    else:
+        per_base_cov = _load_coverage(rc_file)
     out_lines = []
     starts, ends = [], []
     all_peak_mus = []
@@ -1085,7 +1121,17 @@ def _check_window_block(rc_file, chromosome_name, peak_lines, context_lines, ctx
     order); `context_bounds`, if given, are their start and end columns. Returns (bins, error) where error is a
     caught TypeError (as in the original loop) or None.
     """
-    per_base_cov = _load_coverage(rc_file) if chromosome_coverage is None else chromosome_coverage
+    if chromosome_coverage is not None:
+        per_base_cov = chromosome_coverage
+    elif is_key(rc_file):
+        ctx_starts, ctx_ends = context_bounds if context_bounds[0] is not None else _line_bounds(context_lines)
+        if len(ctx_starts):
+            per_base_cov = _load_coverage(rc_file, int(ctx_starts.min()) - _PHASE2_REACH,
+                                          int(ctx_ends.max()) + _PHASE2_REACH)
+        else:
+            per_base_cov = _load_coverage(rc_file, 0, 0)
+    else:
+        per_base_cov = _load_coverage(rc_file)
     if fc_cutoff > 0:
         real_fc_cutoff = 1. / fc_cutoff
     else:
@@ -1365,11 +1411,14 @@ def _element_definition_task(chrom_coverage, chromosome, sign, output_file, ce_d
 
 
 def _coverage_cost(coverage_dicts, chromosome):
-    """Scheduling weight of a chromosome: total on-disk size of its coverage tracks."""
+    """Scheduling weight of a chromosome: total on-disk size of its coverage tracks (dense size for tracks)."""
     total = 0
     for d in coverage_dicts:
         f = d.get(chromosome)
-        if isinstance(f, str) and os.path.exists(f):
+        if is_key(f):
+            t = lookup_track(f)
+            total += t.length * t.dtype.itemsize
+        elif isinstance(f, str) and os.path.exists(f):
             total += os.path.getsize(f)
     return total
 
@@ -1874,7 +1923,7 @@ _deferred_deletions = []
 def release_coverage_files(old_dicts, live_dicts=(), defer=False):
     """
     Delete, on a background thread, the coverage dumps in `old_dicts` that no dict in `live_dicts` still
-    uses. They stay in `housekeeping_files`; `housekeeping` waits for the thread before its own pass.
+    uses, and drop the in-memory tracks of `old_dicts` (registry keys) that no dict in `live_dicts` uses. They stay in `housekeeping_files`; `housekeeping` waits for the thread before its own pass.
 
     Parameters
     ----------
@@ -1887,6 +1936,9 @@ def release_coverage_files(old_dicts, live_dicts=(), defer=False):
         slows down processes that write files at the same time, so the pool path starts the deletion when
         the workers only compute.
     """
+    old_dicts, live_dicts = list(old_dicts), list(live_dicts)
+    live_keys = {k for d in live_dicts for k in d.values() if is_key(k)}
+    release_tracks({k for d in old_dicts for k in d.values() if is_key(k)} - live_keys)  # in this process
     live = {os.path.abspath(f) for d in live_dicts for f in d.values() if isinstance(f, str)}
     paths = sorted({f for d in old_dicts for f in d.values()
                     if isinstance(f, str) and f.endswith(".npy") and os.path.abspath(f) not in live})
@@ -1933,7 +1985,7 @@ def housekeeping(pybedtools_prefix=""):
         _background_deletions.pop().join()
     try:
         for hf in housekeeping_files:
-            if os.path.exists(hf):
+            if isinstance(hf, str) and os.path.exists(hf):
                 os.remove(hf)
         if pybedtools_prefix != "":
             import shutil
@@ -2030,8 +2082,8 @@ def _blockwise_element_definition(coverage_dict, chromosome_of_interest, subpeak
     tracks = []
     n = None
     for cd in coverage_dict:
-        path = cd[chromosome_of_interest]
-        lay = npy_layout(path)
+        path = _resolve_coverage(cd[chromosome_of_interest])
+        lay = npy_layout(path) if isinstance(path, str) else (None, path.dtype, path.length)
         if lay is None or lay[1].kind not in "biu":
             return False
         if n is None:
@@ -2043,14 +2095,14 @@ def _blockwise_element_definition(coverage_dict, chromosome_of_interest, subpeak
     if n is None or n < 1:
         return False
 
-    fhs = [open(p, "rb") for p, _ in tracks]
+    fhs = [open(p, "rb") if isinstance(p, str) else p for p, _ in tracks]  # tracks: windows instead of reads
     spb_fh = None
     index = 1
     try:
         def merged_slice(a, b):
             m = np.zeros(b - a, dtype=np.int32)
             for fh, (_, lay) in zip(fhs, tracks):
-                m += npy_read(fh, lay, a, b)
+                m += npy_read(fh, lay, a, b) if lay[0] is not None else fh.window(a, b)
             return m
 
         buf_start = 0
@@ -2095,8 +2147,9 @@ def _blockwise_element_definition(coverage_dict, chromosome_of_interest, subpeak
                 buf = buf[carry_from:].copy()
                 buf_start += carry_from
     finally:
-        for fh in fhs:
-            fh.close()
+        for (p, _), fh in zip(tracks, fhs):
+            if isinstance(p, str):
+                fh.close()
         if spb_fh is not None:
             spb_fh.close()
         buf = fresh = None
@@ -2143,7 +2196,7 @@ def unified_element_definition(coverage_dict, chromosome_of_interest, strand_sig
         file name for the subpeak bed file, or None if there's no peak
     """
     subpeak_bed = output_file.replace(".bed", __SUB_PEAK_TPL__ % chromosome_of_interest)
-    if all(is_zero_track(cd[chromosome_of_interest]) for cd in coverage_dict):
+    if all(is_zero_track(_resolve_coverage(cd[chromosome_of_interest])) for cd in coverage_dict):
         return None
     blockwise = _blockwise_element_definition(coverage_dict, chromosome_of_interest, subpeak_bed,
                                               join_distance, ce_donor, ce_trigger, compress=compress,
@@ -2562,6 +2615,20 @@ def on_the_fly_qc(output_prefix, min_mu_percent, top_peak_threshold, significant
                 logger.warning(msg)
 
 
+def _add_coverage(pl_cov_target, mn_cov_target, rc_target, plc, mnc, rc, cached, sample):
+    """Append one sample's coverage: registry keys for tracks (its reused .npy cache is deleted at the end, as
+    dumps are), else the dump paths, which are deleted at the end."""
+    if COVERAGE_STORE:
+        plc, mnc = _register_coverage(plc, sample, "pl"), _register_coverage(mnc, sample, "mn")
+        housekeeping_files.extend(cached)
+    else:
+        housekeeping_files.extend(plc.values())
+        housekeeping_files.extend(mnc.values())
+    pl_cov_target.append(plc)
+    mn_cov_target.append(mnc)
+    rc_target.append(rc)
+
+
 def parse_input_files(output_dir, output_prefix, filters, pl_cov_target, mn_cov_target, rc_target,
                       bam_files=None, bw_pl_files=None, bw_mn_files=None, merge_replicates=False, **kwargs):
     """
@@ -2619,20 +2686,15 @@ def parse_input_files(output_dir, output_prefix, filters, pl_cov_target, mn_cov_
         for i, bf in enumerate(bam_files):
             log_assert(os.path.exists(bf), "Cannot find input bam file %s" % bf, logger)
             logger.info("Loading {0}...".format(bf))
-            plc, mnc, rc = get_read_signal(input_bam=bf,
-                                           loc_prime=kwargs["bam_parser"],
-                                           chromosome_startswith=kwargs.pop("chromosome_startswith", ""),
-                                           reverse_complement=kwargs.get("seq_rc", False),
-                                           output_dir=output_dir,
-                                           output_prefix=output_prefix + "_%d" % i,
-                                           filters=filters,
-                                           **kwargs)
-
-            pl_cov_target.append(plc)
-            mn_cov_target.append(mnc)
-            rc_target.append(rc)
-            housekeeping_files.extend(plc.values())
-            housekeeping_files.extend(mnc.values())
+            plc, mnc, rc, cached = _read_signal(input_bam=bf,
+                                                loc_prime=kwargs["bam_parser"],
+                                                chromosome_startswith=kwargs.pop("chromosome_startswith", ""),
+                                                reverse_complement=kwargs.get("seq_rc", False),
+                                                output_dir=output_dir,
+                                                output_prefix=output_prefix + "_%d" % i,
+                                                filters=filters, as_tracks=COVERAGE_STORE,
+                                                **kwargs)
+            _add_coverage(pl_cov_target, mn_cov_target, rc_target, plc, mnc, rc, cached, output_prefix + "_%d" % i)
             logger.info("{0} loaded.".format(bf))
     elif bw_pl_files is not None and bw_mn_files is not None:
         log_assert(len(bw_pl_files) == len(bw_mn_files),
@@ -2642,20 +2704,26 @@ def parse_input_files(output_dir, output_prefix, filters, pl_cov_target, mn_cov_
             log_assert(os.path.exists(bw_pl), "Cannot find bigwig file %s" % bw_pl, logger)
             log_assert(os.path.exists(bw_mn_files[i]), "Cannot find bigwig file %s" % bw_mn_files[i], logger)
             logger.info("Loading {0} and {1}...".format(bw_pl, bw_mn_files[i]))
-            plc, mnc, rc = get_coverage_bw(bw_pl=bw_pl, bw_mn=bw_mn_files[i],
-                                           chromosome_startswith=kwargs.get("chromosome_startswith", ""),
-                                           output_dir=output_dir,
-                                           output_prefix=output_prefix + "_%d" % i,
-                                           threads=kwargs.get("thread_n", 1))
-
-            pl_cov_target.append(plc)
-            mn_cov_target.append(mnc)
-            rc_target.append(rc)
-            housekeeping_files.extend(plc.values())
-            housekeeping_files.extend(mnc.values())
+            plc, mnc, rc, cached = _coverage_bw(bw_pl=bw_pl, bw_mn=bw_mn_files[i],
+                                                chromosome_startswith=kwargs.get("chromosome_startswith", ""),
+                                                output_dir=output_dir,
+                                                output_prefix=output_prefix + "_%d" % i,
+                                                threads=kwargs.get("thread_n", 1), as_tracks=COVERAGE_STORE)
+            _add_coverage(pl_cov_target, mn_cov_target, rc_target, plc, mnc, rc, cached, output_prefix + "_%d" % i)
             logger.info("{0} and {1} loaded.".format(bw_pl, bw_mn_files[i]))
 
-    if merge_replicates and len(pl_cov_target) > 1:
+    if merge_replicates and len(pl_cov_target) > 1 and COVERAGE_STORE:
+        pl_covs, mn_covs, pl_rc, mn_rc = merge_replicate_tracks(
+            [{c: lookup_track(k) for c, k in d.items()} for d in pl_cov_target],
+            [{c: lookup_track(k) for c, k in d.items()} for d in mn_cov_target])
+        pl_covs = _register_coverage(pl_covs, output_prefix + "_merged", "pl")
+        mn_covs = _register_coverage(mn_covs, output_prefix + "_merged", "mn")
+        release_coverage_files(pl_cov_target + mn_cov_target, (pl_covs, mn_covs))
+        pl_cov_target[:] = [pl_covs]
+        mn_cov_target[:] = [mn_covs]
+        rc_target[:] = [pl_rc + mn_rc, ]
+        logger.info("Replicates merged")
+    elif merge_replicates and len(pl_cov_target) > 1:
         pl_covs, mn_covs, pl_rc, mn_rc = merge_replicates_bw(pl_cov_target, mn_cov_target, output_dir,
                                                              output_prefix + "_merged",
                                                              threads=kwargs.get("thread_n", 1))
@@ -2767,21 +2835,77 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
                                                           save_to=prefix + "_alpha.pdf")
             logger.info("Override the default for --donor-tolerance with {0}".format(kwargs["donor_tolerance"]))
 
-    # one persistent worker pool for all parallel stages (None -> everything runs inline, as before)
     thread_n = kwargs.get("thread_n", 1)
+    pool = None
+
+    def control_and_normalise():
+        """Parse the control and normalise the samples against it; returns the un-normalised sample dicts."""
+        pre_norm = chromosome_coverage_pl + chromosome_coverage_mn
+        parse_input_files(output_dir=output_dir, output_prefix="ct_" + output_prefix, filters=filters,
+                          pl_cov_target=input_coverage_pl, mn_cov_target=input_coverage_mn,
+                          rc_target=ircs, bam_files=kwargs.get("ct_bam", None),
+                          bw_pl_files=kwargs.get("ct_bw_pl", None), bw_mn_files=kwargs.get("ct_bw_mn", None),
+                          **kwargs)
+
+        if len(ircs) > 0:
+            if len(ircs) == 1 and len(rcs) > 1:
+                logger.info("Only one input sample is provided, it will be shared among all treatment libraries")
+                for _ in range(len(rcs) - len(ircs)):
+                    ircs.append(ircs[0])
+                    input_coverage_pl.append(input_coverage_pl[0])
+                    input_coverage_mn.append(input_coverage_mn[0])
+            for i, (rc, irc), in enumerate(zip(rcs, ircs)):
+                scale_factor = rc / irc
+                logger.info("Adjusting signals based-on input/control (scale factor: %.4f)" % scale_factor)
+                if COVERAGE_STORE:
+                    plc, mnc = normalize_tracks_using_input(
+                        *[{c: lookup_track(k) for c, k in d.items()} for d in (
+                            chromosome_coverage_pl[i], chromosome_coverage_mn[i], input_coverage_pl[i],
+                            input_coverage_mn[i])], scale_factor=scale_factor, logger=logger)
+                    plc = _register_coverage(plc, output_prefix + "_inputnorm_%d" % i, "pl")
+                    mnc = _register_coverage(mnc, output_prefix + "_inputnorm_%d" % i, "mn")
+                else:
+                    plc, mnc = normalize_using_input(chromosome_coverage_pl[i],
+                                                     chromosome_coverage_mn[i],
+                                                     input_coverage_pl[i],
+                                                     input_coverage_mn[i],
+                                                     scale_factor=scale_factor,
+                                                     output_dir=output_dir,
+                                                     output_prefix=output_prefix + "_inputnorm_%d" % i,
+                                                     logger=logger, threads=thread_n)
+                    housekeeping_files.extend(plc.values())
+                    housekeeping_files.extend(mnc.values())
+                chromosome_coverage_pl[i] = plc
+                chromosome_coverage_mn[i] = mnc
+                logger.info("Signals adjusted.")
+        return pre_norm
+
+    # element definition reads the un-normalised sample coverage
+    ued_coverage_pl, ued_coverage_mn = list(chromosome_coverage_pl), list(chromosome_coverage_mn)
+    if COVERAGE_STORE:
+        # pool workers reach tracks only through the registry they inherit when the pool forks, so the control
+        # and the normalised tracks are built first
+        _phase("input parsing")
+        pre_norm = control_and_normalise()
+        release_coverage_files(input_coverage_pl + input_coverage_mn,
+                               chromosome_coverage_pl + chromosome_coverage_mn + pre_norm)
+        _phase("control parsing+normalisation")
+
+    # one persistent worker pool for all parallel stages (None -> everything runs inline, as before)
     pool = _make_pool(thread_n) if thread_n > 1 else None
 
     ued_keys, ued_tasks, ued_costs = [], [], []
     for chromosome in chromosomes:
         for target_dict, chrom_coverage, sign, strand_short in zip((subpeak_pl_beds, subpeak_mn_beds),
-                                                                   (chromosome_coverage_pl, chromosome_coverage_mn),
+                                                                   (ued_coverage_pl, ued_coverage_mn),
                                                                    ("+", "-"), ("pl", "mn")):
             ued_keys.append((target_dict, chromosome))
             ued_tasks.append((chrom_coverage, chromosome, sign, prefix + "_{0}.bed".format(strand_short),
                               kwargs.get("donor_tolerance", 0.3), kwargs.get("peak_distance", 1),
                               kwargs.get("ce_trigger", 3), kwargs.get("peak_width", None)))
             ued_costs.append(_coverage_cost(chrom_coverage, chromosome))
-    _phase("input parsing")
+    if not COVERAGE_STORE:
+        _phase("input parsing")
     ued_res = _run_tasks(pool, _element_definition_task, ued_tasks, costs=ued_costs)
     _phase("element definition")
     # results are consumed in the original (chromosome, strand) order
@@ -2792,41 +2916,15 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
             housekeeping_files.append(res + ".csi")
 
     _phase("subpeak bookkeeping")
-    parse_input_files(output_dir=output_dir, output_prefix="ct_" + output_prefix, filters=filters,
-                      pl_cov_target=input_coverage_pl, mn_cov_target=input_coverage_mn,
-                      rc_target=ircs, bam_files=kwargs.get("ct_bam", None),
-                      bw_pl_files=kwargs.get("ct_bw_pl", None), bw_mn_files=kwargs.get("ct_bw_mn", None), **kwargs)
-
-    if len(ircs) > 0:
-        pre_norm = chromosome_coverage_pl + chromosome_coverage_mn
-        if len(ircs) == 1 and len(rcs) > 1:
-            logger.info("Only one input sample is provided, it will be shared among all treatment libraries")
-            for _ in range(len(rcs) - len(ircs)):
-                ircs.append(ircs[0])
-                input_coverage_pl.append(input_coverage_pl[0])
-                input_coverage_mn.append(input_coverage_mn[0])
-        for i, (rc, irc), in enumerate(zip(rcs, ircs)):
-            scale_factor = rc / irc
-            logger.info("Adjusting signals based-on input/control (scale factor: %.4f)" % scale_factor)
-            plc, mnc = normalize_using_input(chromosome_coverage_pl[i],
-                                             chromosome_coverage_mn[i],
-                                             input_coverage_pl[i],
-                                             input_coverage_mn[i],
-                                             scale_factor=scale_factor,
-                                             output_dir=output_dir,
-                                             output_prefix=output_prefix + "_inputnorm_%d" % i,
-                                             logger=logger, threads=thread_n)
-            chromosome_coverage_pl[i] = plc
-            chromosome_coverage_mn[i] = mnc
-            logger.info("Signals adjusted.")
-
-            housekeeping_files.extend(plc.values())
-            housekeeping_files.extend(mnc.values())
-        # un-normalised experiment and control dumps are not read again
-        release_coverage_files(pre_norm + input_coverage_pl + input_coverage_mn,
-                               chromosome_coverage_pl + chromosome_coverage_mn, defer=pool is not None)
-
-    _phase("control parsing+normalisation")
+    if COVERAGE_STORE:
+        release_coverage_files(ued_coverage_pl + ued_coverage_mn, chromosome_coverage_pl + chromosome_coverage_mn)
+    else:
+        pre_norm = control_and_normalise()
+        if len(ircs) > 0:
+            # un-normalised experiment and control dumps are not read again
+            release_coverage_files(pre_norm + input_coverage_pl + input_coverage_mn,
+                                   chromosome_coverage_pl + chromosome_coverage_mn, defer=pool is not None)
+        _phase("control parsing+normalisation")
     fdr_target = kwargs.pop("fdr_target", 0.1)
     # window evaluation for every sample x strand at once (shared pool, longest tasks first)
     precomputed = {}
