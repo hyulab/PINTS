@@ -172,3 +172,61 @@ def test_bigwig_tracks_without_numpy_and_from_cache(monkeypatch):
                 same(total, ref[2])
                 _assert_tracks_equal_dumps(pl, ref[0]); _assert_tracks_equal_dumps(mn, ref[1])
                 assert sorted(cache) == sorted(list(dumps[0].values()) + list(dumps[1].values()))
+
+
+# ------------------------------------------------------------------ replicate merge
+from pints import coverage_store as cs
+
+
+def _runs_of(arr):
+    """Runs-form track of a dense array (maximal runs of equal non-zero value)."""
+    nz = arr != 0
+    edges = np.flatnonzero(np.diff(np.concatenate(([0], arr.astype(np.int64), [0]))) != 0)
+    st_, en, va = [], [], []
+    for a, b in zip(edges[:-1], edges[1:]):
+        if nz[a]:
+            st_.append(a); en.append(b); va.append(arr[a])
+    return cs.CoverageTrack(arr.shape[0], arr.dtype, st_, va, en)
+
+
+@SLOW
+@given(st.integers(0, 2 ** 31 - 1), st.sampled_from([2, 3]), st.booleans(), st.sampled_from([3, 300, 40_000]))
+def test_merge_replicate_tracks_equals_file_merge(seed, n_reps, runs, vmax):
+    rng = np.random.default_rng(seed)
+    chroms = {"chr1": 5000, "chr2": 3000, "chrZ": 40, "chrE": 700, "chrR": 900}
+    with tempfile.TemporaryDirectory() as d:
+        def sample(tag, rep):
+            paths, tracks = {}, {}
+            for c, L in chroms.items():
+                if c == "chrR" and rep == 1:
+                    continue  # not shared by every replicate: left out of the merge
+                fn = os.path.join(d, "%s_%s.npy" % (tag, c))
+                if c == "chrE":  # registered empty track (BAM contig without reads)
+                    paths[c] = io.save_zero_track(fn, L)
+                    tracks[c] = cs.zero_track(L)
+                    continue
+                dt = rng.choice([np.int8, np.int16, np.int32]) if vmax < 100 else np.int32
+                v = np.where(rng.random(L) < 0.08, rng.integers(1, vmax, L), 0)
+                if c == "chrZ" and rep == 0:
+                    v[:] = 0  # empty, but not registered as a zero track (bigWig dumps)
+                if runs:
+                    v = np.repeat(v[::5], 5)[:L]
+                v = v.astype(dt)
+                np.save(fn, v)
+                paths[c] = fn
+                tracks[c] = _runs_of(v) if runs else cs.track_from_dense(v)
+            return paths, tracks
+        pls = [sample("p%d" % i, i) for i in range(n_reps)]
+        mns = [sample("m%d" % i, i) for i in range(n_reps)]
+        for sub in ("a", "b"):
+            os.makedirs(os.path.join(d, sub))
+        got = io.merge_replicate_tracks([t for _, t in pls], [t for _, t in mns])
+        a = io.merge_replicates_bw([p for p, _ in pls], [p for p, _ in mns], os.path.join(d, "a"), "m")
+        b = rio.merge_replicates_bw([p for p, _ in pls], [p for p, _ in mns], os.path.join(d, "b"), "m")
+        for exp in (a, b):
+            same(got[2], exp[2])
+            same(got[3], exp[3])
+        same(got[2], a[2])
+        for k in (0, 1):
+            _assert_tracks_equal_dumps(got[k], a[k])
+            assert [io.is_zero_track(got[k][c]) for c in got[k]] == [io.is_zero_track(a[k][c]) for c in a[k]]

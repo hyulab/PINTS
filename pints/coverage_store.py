@@ -27,11 +27,15 @@ class CoverageTrack:
     (non-zero, of dtype `dtype`). ``ends`` is None in the points form, where every run has length 1 (BAM 5'
     counts). `window`, `dense`, `sum` and `max` return exactly what the same operation on the dense array
     returns. Integer dtypes only, like every coverage dtype in PINTS (`NP_DT_NAME` and the uint32 BAM counters).
-    """
-    __slots__ = ("length", "dtype", "starts", "ends", "values")
 
-    def __init__(self, length, dtype, starts, values, ends=None):
+    `zero_track` marks what the file-based code registers with `save_zero_track` (`is_zero_track`): an empty
+    track can be either, and some code paths branch on the registration, not on the content.
+    """
+    __slots__ = ("length", "dtype", "starts", "ends", "values", "zero_track")
+
+    def __init__(self, length, dtype, starts, values, ends=None, zero_track=False):
         self.length = int(length)
+        self.zero_track = bool(zero_track)
         self.dtype = np.dtype(dtype)
         if self.dtype.kind not in "biu":
             raise TypeError("coverage tracks hold integer dtypes, not %s" % self.dtype)
@@ -134,6 +138,48 @@ class CoverageTrack:
     def __reduce__(self):
         # tracks are reached through the registry; pickling one into a pool task would copy it into every task
         raise TypeError("CoverageTrack is not meant to be pickled; pass its registry key instead")
+
+
+def zero_track(length, dtype=np.int8):
+    """The track `save_zero_track(path, length, dtype)` stands for: all zeros, registered as a zero track."""
+    return CoverageTrack(length, dtype, np.empty(0, dtype=np.int64), np.empty(0, dtype=dtype), zero_track=True)
+
+
+def merge_tracks(tracks):
+    """
+    Replicate merge of `merge_replicates_bw` on tracks: (merged track, its sum), where the merged track is the
+    sum of the inputs in int32 (the first replicate cast to int32, the others added in place, which wraps
+    like int32), cast to the dtype `determine_data_type` picks from its maximum, and the sum is ``np.sum`` of
+    the int32 sum. Inputs of different lengths raise ValueError (the dense code fails to broadcast).
+    """
+    from .io_engine import determine_data_type
+    n = tracks[0].length
+    if any(t.length != n for t in tracks):
+        raise ValueError("operands could not be broadcast together with shapes %s" % [(t.length,) for t in tracks])
+    points = all(t.ends is None for t in tracks)
+    pieces = [t.nonzero() for t in tracks]
+    if points:
+        bounds = np.unique(np.concatenate([p[0] for p in pieces]).astype(np.int64))
+        seg_end = bounds + 1
+    else:
+        edges = np.unique(np.concatenate([np.concatenate((p[0], p[1])) for p in pieces]).astype(np.int64))
+        bounds, seg_end = edges[:-1], edges[1:]
+    total = np.zeros(bounds.shape[0], dtype=np.int64)
+    for st, en, va in pieces:
+        if st.shape[0] == 0:
+            continue
+        i = np.searchsorted(st, bounds, "right") - 1  # the input run starting at or before each segment
+        inside = (i >= 0) & (bounds < en[np.maximum(i, 0)])
+        total[inside] += va[i[inside]]
+    merged = total.astype(np.int32)  # modular, as repeated in-place int32 additions
+    keep = merged != 0
+    m32 = CoverageTrack(n, np.int32, bounds[keep], merged[keep], None if points else seg_end[keep])
+    s = m32.sum()
+    data_type = determine_data_type(m32.max())  # raises for a zero-length chromosome, like np.max
+    vals = m32.values.astype(data_type, copy=False)
+    nz = vals != 0
+    out = CoverageTrack(n, data_type, m32.starts[nz], vals[nz], None if points else m32.ends[nz])
+    return out, s
 
 
 def track_from_dense(arr):

@@ -46,8 +46,11 @@ def save_zero_track(path, length, dtype=np.int8):
 
 
 def is_zero_track(path):
-    """True if `path` was written by this process (or its parent) as an all-zero coverage track."""
-    return isinstance(path, str) and os.path.abspath(path) in _ZERO_TRACKS
+    """True if `path` was written by this process (or its parent) as an all-zero coverage track, or is a
+    `CoverageTrack` standing for one."""
+    if isinstance(path, str):
+        return os.path.abspath(path) in _ZERO_TRACKS
+    return bool(getattr(path, "zero_track", False))
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -200,9 +203,9 @@ def _save_end_counts(parts, length, fn):
 
 def _end_counts_track(counts, length):
     """CoverageTrack for `_end_counts`'s result; an all-zero track has the zero-track dtype (int8)."""
-    from .coverage_store import CoverageTrack
+    from .coverage_store import CoverageTrack, zero_track
     if counts is None:
-        return CoverageTrack(length, np.int8, np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int8))
+        return zero_track(length)
     uniq, cnt = counts
     return CoverageTrack(length, cnt.dtype, uniq, cnt)
 
@@ -1895,4 +1898,37 @@ def merge_replicates_bw(per_sample_coverage_pls, per_sample_coverage_mns, output
 
             merged_pl[chrom] = pl_fn
             merged_mn[chrom] = mn_fn
+    return merged_pl, merged_mn, pl_rc, mn_rc
+
+
+def merge_replicate_tracks(per_sample_coverage_pls, per_sample_coverage_mns):
+    """
+    `merge_replicates_bw` for dicts of `CoverageTrack`s: (merged_pl, merged_mn, pl_rc, mn_rc), the same
+    chromosomes in the same (set) order, the same values, dtypes and read counts, and no files. A single
+    replicate is returned as it is.
+    """
+    from .coverage_store import merge_tracks, zero_track
+    merged_pl = {}
+    merged_mn = {}
+    pl_rc = 0
+    mn_rc = 0
+
+    shared_chromosomes = reduce(set.intersection, (set(d.keys()) for d in per_sample_coverage_pls+per_sample_coverage_mns))
+
+    if len(per_sample_coverage_pls) != len(per_sample_coverage_mns):
+        raise ValueError("Number of replicates for pl and mn must be the same")
+    if len(per_sample_coverage_pls) == 1:
+        return per_sample_coverage_pls[0], per_sample_coverage_mns[0], pl_rc, mn_rc
+    elif len(per_sample_coverage_pls) == 0:
+        raise ValueError("Number of replicates for pl and mn must be greater than 1.")
+    for chrom in shared_chromosomes:
+        if all(is_zero_track(d[chrom]) for d in per_sample_coverage_pls + per_sample_coverage_mns):
+            length = per_sample_coverage_pls[0][chrom].length
+            merged_pl[chrom] = zero_track(length, determine_data_type(0))
+            merged_mn[chrom] = zero_track(length, determine_data_type(0))
+            continue
+        merged_pl[chrom], pl_s = merge_tracks([d[chrom] for d in per_sample_coverage_pls])
+        merged_mn[chrom], mn_s = merge_tracks([d[chrom] for d in per_sample_coverage_mns])
+        pl_rc += pl_s
+        mn_rc += mn_s
     return merged_pl, merged_mn, pl_rc, mn_rc
