@@ -437,7 +437,7 @@ def _warn_fractional(values, bw_file, chromosome):
     return False
 
 
-def _get_coverage_bw(bw_file, chromosome_startswith, output_dir, output_prefix):
+def _get_coverage_bw(bw_file, chromosome_startswith, output_dir, output_prefix, as_tracks=False):
     """
     Get coverage information from bigwig files
 
@@ -451,7 +451,8 @@ def _get_coverage_bw(bw_file, chromosome_startswith, output_dir, output_prefix):
         Path to write outputs
     output_prefix : str
         Prefix of outputs
-    kwargs :
+    as_tracks : bool
+        Return `CoverageTrack`s instead of dump paths, and the dumps reused from the cache as a third value
 
     Returns
     -------
@@ -476,6 +477,7 @@ def _get_coverage_bw(bw_file, chromosome_startswith, output_dir, output_prefix):
     chrom_size_list = []
     read_counts = 0
 
+    cache_files = []
     for chromosome, csize in bw.chroms().items():
         if chromosome.startswith(chromosome_startswith):
             fn = os.path.join(output_dir, "%s_%s" % (output_prefix, chromosome))
@@ -488,15 +490,25 @@ def _get_coverage_bw(bw_file, chromosome_startswith, output_dir, output_prefix):
                 _warn_fractional(_chromosome_cov, bw_file, chromosome)
                 _chromosome_cov[_chromosome_cov < 0] *= -1
                 _chromosome_cov = _chromosome_cov.astype(data_type, copy=False)
-                np.save(fn, _chromosome_cov)
+                if as_tracks:
+                    from .coverage_store import track_from_dense
+                    chromosome_coverage[chromosome] = track_from_dense(_chromosome_cov)
+                else:
+                    np.save(fn, _chromosome_cov)
             else:
                 _chromosome_cov = np.load(chromosome_coverage[chromosome])
+                if as_tracks:
+                    from .coverage_store import track_from_dense
+                    cache_files.append(chromosome_coverage[chromosome])
+                    chromosome_coverage[chromosome] = track_from_dense(_chromosome_cov)
             read_counts += np.sum(_chromosome_cov)
             chrom_size_list.append((chromosome, csize))
             chromosome_pre_accessible_dict[chromosome] = []
             chromosome_reads_dict[chromosome] = 0
     
     bw.close()
+    if as_tracks:
+        return chromosome_coverage, read_counts, cache_files
     return chromosome_coverage, read_counts
 
 
@@ -590,9 +602,81 @@ def _bw_blockwise_sparse(bw, chromosome, csize, data_type, npy_file, block=None,
     return np.sum(np.array(sums, dtype=acc))
 
 
-def _bw_chrom_worker(bw_file, chromosome, csize, data_type, npy_file, block=None):
-    """Load one chromosome of a bigWig exactly as `_get_coverage_bw` does; returns np.sum of the track."""
+def _bw_track_runs(bw, chromosome, csize, data_type, block=None):
+    """The track `_bw_blockwise_sparse` would write, as runs: (starts, ends, values), with runs whose value
+    becomes 0 left out. Same queries, checks and element-wise transformation; None where it returns None."""
+    block = _BW_IV_BLOCK if block is None else int(block)
+    if csize <= 0:
+        return None
+    runs = []
+    for a in range(0, csize, block):
+        b = min(csize, a + block)
+        iv = bw.intervals(chromosome, a, b)
+        if iv:
+            arr = np.asarray(iv, dtype=np.float64)
+            st = arr[:, 0].astype(np.int64)
+            en = arr[:, 1].astype(np.int64)
+            if not (np.array_equal(st, arr[:, 0]) and np.array_equal(en, arr[:, 1])):
+                return None
+            if st.min() < 0 or en.max() > csize or np.any(en <= st) or np.any(st[1:] < en[:-1]) \
+                    or np.any(en <= a) or np.any(st >= b):
+                return None
+            v = np.nan_to_num(arr[:, 2])
+            v[v < 0] *= -1
+            v = v.astype(data_type, copy=False)
+            keep = v != 0
+            runs.append((np.maximum(st, a)[keep], np.minimum(en, b)[keep], v[keep]))
+    if not runs:
+        e = np.empty(0, dtype=np.int64)
+        return e, e, np.empty(0, dtype=data_type)
+    return tuple(np.concatenate(x) for x in zip(*runs))
+
+
+def _bw_dense_points(bw, chromosome, csize, data_type, block):
+    """The dense fallback of `_bw_chrom_worker`, as points (positions, values) of its non-zero bases."""
+    pos, vals = [], []
+    for a in range(0, max(csize, 0), block):
+        b = min(csize, a + block)
+        v = np.nan_to_num(bw.values(chromosome, a, b, numpy=True))
+        v[v < 0] *= -1
+        v = v.astype(data_type, copy=False)
+        nz = np.flatnonzero(v)
+        pos.append(nz + a)
+        vals.append(v[nz])
+    if not pos:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=data_type)
+    return np.concatenate(pos), np.concatenate(vals)
+
+
+def _bw_chrom_track(bw_file, chromosome, csize, data_type, npy_file, block=None):
+    """
+    `_bw_chrom_worker` without the dump: (sum, (starts, ends, values), cache_file). ends is None for the points
+    form. An existing dump (the cache) is loaded instead and returned as cache_file.
+    """
     import pyBigWig
+    from .coverage_store import track_from_npy
+    block = _BW_BLOCK if block is None else block
+    if os.path.exists(npy_file):
+        t = track_from_npy(npy_file)
+        return np.load(npy_file).sum(), (t.starts, t.ends, t.values), npy_file
+    bw = pyBigWig.open(bw_file)
+    try:
+        runs = _bw_track_runs(bw, chromosome, int(csize), data_type)
+        if runs is None:
+            pos, vals = _bw_dense_points(bw, chromosome, int(csize), data_type, block)
+            runs = (pos, None, vals)
+    finally:
+        bw.close()
+    from .coverage_store import CoverageTrack
+    return CoverageTrack(csize, data_type, runs[0], runs[2], runs[1]).sum(), runs, None
+
+
+def _bw_chrom_worker(bw_file, chromosome, csize, data_type, npy_file, block=None, as_tracks=False):
+    """Load one chromosome of a bigWig exactly as `_get_coverage_bw` does; returns np.sum of the track. With
+    `as_tracks`, returns `_bw_chrom_track`'s result instead (no dump)."""
+    import pyBigWig
+    if as_tracks:
+        return _bw_chrom_track(bw_file, chromosome, csize, data_type, npy_file, block)
     block = _BW_BLOCK if block is None else block
     if os.path.exists(npy_file):
         return np.load(npy_file).sum()
@@ -642,15 +726,16 @@ def _get_coverage_bw_tasks(bw_file, chromosome_startswith, output_dir, output_pr
     return data_type, tasks
 
 
-def _get_coverage_bw_parallel(bw_files, chromosome_startswith, output_dir, prefixes, threads):
+def _get_coverage_bw_parallel(bw_files, chromosome_startswith, output_dir, prefixes, threads, as_tracks=False):
     """Load several bigWigs with one process pool (inline, in file order, when threads <= 1); same files, dicts
-    (same order) and read counts."""
+    (same order) and read counts. With `as_tracks`, the dicts hold `CoverageTrack`s (no dumps), and each result
+    also lists the dumps reused from the cache: (coverage, read_counts, cache_files)."""
     from multiprocessing import get_context
     plans = [_get_coverage_bw_tasks(f, chromosome_startswith, output_dir, p) for f, p in zip(bw_files, prefixes)]
     jobs, owners = [], []
     for k, (f, (dt, tasks)) in enumerate(zip(bw_files, plans)):
         for chromosome, csize, npy in tasks:
-            jobs.append((f, chromosome, csize, dt, npy))
+            jobs.append((f, chromosome, csize, dt, npy, None, as_tracks))
             owners.append(k)
     order = sorted(range(len(jobs)), key=lambda i: -jobs[i][2])
     sums = [None] * len(jobs)
@@ -664,10 +749,18 @@ def _get_coverage_bw_parallel(bw_files, chromosome_startswith, output_dir, prefi
     for k, (dt, tasks) in enumerate(plans):
         coverage = {}
         read_counts = 0
+        cache_files = []
         for (chromosome, csize, npy), (owner, s) in zip(tasks, [(o, x) for o, x in zip(owners, sums) if o == k]):
-            coverage[chromosome] = npy
+            if as_tracks:
+                from .coverage_store import CoverageTrack
+                s, (starts, ends, values), cached = s
+                coverage[chromosome] = CoverageTrack(csize, values.dtype if cached else dt, starts, values, ends)
+                if cached:
+                    cache_files.append(cached)
+            else:
+                coverage[chromosome] = npy
             read_counts += s  # accumulated in file order, as in the serial loader
-        results.append((coverage, read_counts))
+        results.append((coverage, read_counts, cache_files) if as_tracks else (coverage, read_counts))
     return results
 
 
@@ -699,6 +792,16 @@ def get_coverage_bw(bw_pl, bw_mn, chromosome_startswith, output_dir, output_pref
     rc : int
         Number of total read counts
     """
+    return _coverage_bw(bw_pl, bw_mn, chromosome_startswith, output_dir, output_prefix, threads=threads)[:3]
+
+
+def _coverage_bw(bw_pl, bw_mn, chromosome_startswith, output_dir, output_prefix, threads=1, as_tracks=False):
+    """
+    `get_coverage_bw`, returning (pl, mn, read_counts, cache_files). With `as_tracks`, pl and mn map chromosomes
+    to `CoverageTrack`s holding what the dumps would hold, and no dumps are written; dumps reused from the
+    output directory are listed in cache_files (deleted like dumps by the caller). Otherwise cache_files is
+    empty.
+    """
     logger = logging.getLogger(__logger_name__)
     try:
         import pyBigWig
@@ -706,11 +809,15 @@ def get_coverage_bw(bw_pl, bw_mn, chromosome_startswith, output_dir, output_pref
     except ImportError:
         blockwise = False  # the original loader reports the missing package
     if threads > 1 or blockwise:
-        (pl, pc), (mn, mc) = _get_coverage_bw_parallel((bw_pl, bw_mn), chromosome_startswith, output_dir,
-                                                       (output_prefix + "_pl", output_prefix + "_mn"), threads)
+        loaded = _get_coverage_bw_parallel((bw_pl, bw_mn), chromosome_startswith, output_dir,
+                                           (output_prefix + "_pl", output_prefix + "_mn"), threads,
+                                           as_tracks=as_tracks)
     else:
-        pl, pc = _get_coverage_bw(bw_pl, chromosome_startswith, output_dir, output_prefix + "_pl")
-        mn, mc = _get_coverage_bw(bw_mn, chromosome_startswith, output_dir, output_prefix + "_mn")
+        extra = (True,) if as_tracks else ()  # as_tracks, only when set (keeps the original call)
+        loaded = [_get_coverage_bw(bw_pl, chromosome_startswith, output_dir, output_prefix + "_pl", *extra),
+                  _get_coverage_bw(bw_mn, chromosome_startswith, output_dir, output_prefix + "_mn", *extra)]
+    (pl, pc), (mn, mc) = [x[:2] for x in loaded]
+    cache_files = [f for x in loaded for f in (x[2] if as_tracks else ())]
 
     pl_chrs = set(pl.keys())
     mn_chrs = set(mn.keys())
@@ -726,8 +833,11 @@ def get_coverage_bw(bw_pl, bw_mn, chromosome_startswith, output_dir, output_pref
             static_keys = list(in_dict.keys())
             for c in static_keys:
                 if c not in whitelist:
-                    adjust_counts += np.abs(np.nansum(np.load(in_dict[c])))
-                    os.remove(in_dict[c])
+                    if as_tracks:  # np.nansum of an integer track is its sum
+                        adjust_counts += np.abs(in_dict[c].sum())
+                    else:
+                        adjust_counts += np.abs(np.nansum(np.load(in_dict[c])))
+                        os.remove(in_dict[c])
                     del in_dict[c]
             return adjust_counts
 
@@ -735,7 +845,7 @@ def get_coverage_bw(bw_pl, bw_mn, chromosome_startswith, output_dir, output_pref
         pc -= c0
         c1 = _clean(mn, allowed_bws)
         mc -= c1
-    return pl, mn, pc + mc
+    return pl, mn, pc + mc, cache_files
 
 
 class BamParsers:

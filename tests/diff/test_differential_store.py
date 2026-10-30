@@ -91,3 +91,84 @@ def test_bam_tracks_from_the_npy_cache(rr, lib):
         _assert_tracks_equal_dumps(mn, dumps[1])
         assert sorted(cache) == sorted(list(dumps[0].values()) + list(dumps[1].values()))
         assert sorted(_npys(out)) == before
+
+
+# ------------------------------------------------------------------ bigWig
+def _runs_bigwig(path, chroms, rng, vmax):
+    """bedGraph-style bigWig with runs of several lengths, negative, fractional (some cast to 0) and huge values.
+    (No inf: pyBigWig's header() crashes on it, in the reference too.)"""
+    import pyBigWig
+    bw = pyBigWig.open(path, "w")
+    bw.addHeader(list(chroms))
+    for name, L in chroms:
+        pos, starts, ends, vals = 0, [], [], []
+        while True:
+            pos += int(rng.integers(0, 60))
+            ln = int(rng.choice([1, 1, 1, 2, 7, 150]))
+            if pos + ln > L:
+                break
+            v = float(rng.choice([rng.integers(1, vmax), -rng.integers(1, vmax), rng.uniform(-3, 3), 0.4, 3e9]))
+            starts.append(pos); ends.append(pos + ln); vals.append(v)
+            pos += ln
+        if starts:
+            bw.addEntries([name] * len(starts), starts, ends=ends, values=vals)
+    bw.close()
+    return path
+
+
+@SLOW
+@given(st.integers(0, 2 ** 31 - 1), st.sampled_from([3, 100, 30000, 3_000_000]), st.sampled_from([1, 3]),
+       st.sampled_from(["", "chr"]), st.sampled_from([64, 1 << 22]), st.booleans(), st.booleans())
+def test_bigwig_tracks_equal_reference_dumps(seed, vmax, threads, prefix_filter, iv_block, mismatch, dense):
+    rng = np.random.default_rng(seed)
+    chroms = [("chr1", 9000), ("chr2", 2000), ("ctgX", 777), ("chrM", 16)]
+    mn_chroms = chroms + [("chrU", 3001)] if mismatch else chroms  # only in one strand: dropped, counts adjusted
+    old_iv = io._BW_IV_BLOCK
+    io._BW_IV_BLOCK = iv_block
+    old_runs = io._bw_track_runs
+    if dense:  # intervals unusable: the dense values() fallback
+        io._bw_track_runs = lambda *a, **k: None
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            p = _runs_bigwig(os.path.join(d, "p.bw"), chroms, rng, vmax)
+            m = _runs_bigwig(os.path.join(d, "m.bw"), mn_chroms, rng, vmax)
+            os.makedirs(os.path.join(d, "a")); os.makedirs(os.path.join(d, "b"))
+            with np.errstate(invalid="ignore"):
+                pl, mn, total, cache = io._coverage_bw(p, m, prefix_filter, os.path.join(d, "a"), "q",
+                                                       threads=threads, as_tracks=True)
+                b = rio.get_coverage_bw(p, m, prefix_filter, os.path.join(d, "b"), "q")
+            same(total, b[2])
+            _assert_tracks_equal_dumps(pl, b[0])
+            _assert_tracks_equal_dumps(mn, b[1])
+            assert cache == [] and _npys(os.path.join(d, "a")) == []
+            for t in list(pl.values()) + list(mn.values()):
+                assert (t.values != 0).all()
+    finally:
+        io._BW_IV_BLOCK = old_iv
+        io._bw_track_runs = old_runs
+
+
+def test_bigwig_tracks_without_numpy_and_from_cache(monkeypatch):
+    import pyBigWig
+    rng = np.random.default_rng(5)
+    chroms = [("chr1", 3000), ("chr2", 500)]
+    with tempfile.TemporaryDirectory() as d:
+        p = _runs_bigwig(os.path.join(d, "p.bw"), chroms, rng, 300)
+        m = _runs_bigwig(os.path.join(d, "m.bw"), chroms, rng, 300)
+        a, b = os.path.join(d, "a"), os.path.join(d, "b")
+        os.makedirs(a); os.makedirs(b)
+        with np.errstate(invalid="ignore"):
+            ref = rio.get_coverage_bw(p, m, "", b, "q")
+            for numpy_flag in (0, 1):
+                monkeypatch.setattr(pyBigWig, "numpy", numpy_flag)
+                pl, mn, total, cache = io._coverage_bw(p, m, "", a, "q", as_tracks=True)
+                same(total, ref[2])
+                _assert_tracks_equal_dumps(pl, ref[0]); _assert_tracks_equal_dumps(mn, ref[1])
+                assert cache == [] and _npys(a) == []
+            dumps = io.get_coverage_bw(p, m, "", a, "q")  # leaves dumps: the cache
+            for numpy_flag, threads in ((0, 1), (1, 1), (1, 3)):
+                monkeypatch.setattr(pyBigWig, "numpy", numpy_flag)
+                pl, mn, total, cache = io._coverage_bw(p, m, "", a, "q", threads=threads, as_tracks=True)
+                same(total, ref[2])
+                _assert_tracks_equal_dumps(pl, ref[0]); _assert_tracks_equal_dumps(mn, ref[1])
+                assert sorted(cache) == sorted(list(dumps[0].values()) + list(dumps[1].values()))
