@@ -847,7 +847,9 @@ def get_elbow(X, Y):
     p2 = np.array([X_s[-1], Y_s[-1]])
     P3 = np.column_stack((X_s, Y_s))
 
-    D = np.abs(np.cross(p2 - p1, P3 - p1) / np.linalg.norm(p2 - p1))
+    # z component of the cross product (np.cross no longer takes 2-D vectors since NumPy 2.5); same arithmetic
+    d1, d3 = p2 - p1, P3 - p1
+    D = np.abs((d1[0] * d3[:, 1] - d1[1] * d3[:, 0]) / np.linalg.norm(d1))
     tmp = np.where(D == np.nanmax(D))[0]
     if len(tmp) > 0:
         midx = tmp[-1]
