@@ -799,7 +799,7 @@ def _load_coverage(rc_file, lo=0, hi=None):
     """
     if is_key(rc_file):
         track = lookup_track(rc_file)
-        buf = np.zeros(track.length, dtype=track.dtype)
+        buf = track.empty_buffer()
         track.fill(buf, lo, hi)
         return buf
     try:

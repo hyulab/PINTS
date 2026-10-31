@@ -9,6 +9,8 @@ Pool workers reach tracks through the module-level registry, by key: tasks carry
 workers inherit the registry when the pool forks (tracks are read-only after that, so their pages stay shared).
 `track_from_npy` / `track_to_npy` are the only bridge to files.
 """
+import mmap
+
 import numpy as np
 
 __all__ = ("CoverageTrack", "track_from_dense", "track_from_npy", "track_to_npy", "register", "lookup", "release",
@@ -128,8 +130,14 @@ class CoverageTrack:
         buf[pos] = 0
 
     def empty_buffer(self):
-        """A full-length zero array of the dense dtype for `fill` (its pages are only allocated when written)."""
-        return np.zeros(self.length, dtype=self.dtype)
+        """
+        A full-length zero array of the dense dtype for `fill`, in its own anonymous mapping: its pages are only
+        allocated when written, and all of them go back to the OS when it is freed. (After freeing a few
+        np.zeros buffers of some MB, malloc serves the next ones from its heap, where calloc writes every page and
+        freed pages stay with the process: a pool worker kept ~150 MB that way.)
+        """
+        n = self.length
+        return np.frombuffer(mmap.mmap(-1, max(n * self.dtype.itemsize, 1)), dtype=self.dtype, count=n)
 
     def __repr__(self):
         return "CoverageTrack(length=%d, dtype=%s, runs=%d, %s)" % (
