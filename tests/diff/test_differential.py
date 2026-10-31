@@ -423,12 +423,13 @@ def test_pair_on_pool_matches_ref(empty_strand):
 
 
 def test_bed_is_empty_follows_count():
+    pybedtools = pytest.importorskip("pybedtools")
     with tempfile.TemporaryDirectory() as d:
         for text in ("", "\n", "#c\ntrack x\nbrowser y\n\n", "#c\nchr1\t1\t5\n", "chr1\t1\t5\nchr1\t7\t9\n"):
             fn = os.path.join(d, "x.bed")
             with open(fn, "w") as fh:
                 fh.write(text)
-            assert ce._bed_is_empty(fn) == (ce.BedTool(fn).count() == 0), repr(text)
+            assert ce._bed_is_empty(fn) == (pybedtools.BedTool(fn).count() == 0), repr(text)
 
 
 # ------------------------------------------------------------------ IO

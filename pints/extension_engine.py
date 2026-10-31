@@ -21,7 +21,7 @@ import logging
 try:
     import numpy as np
     import pandas as pd
-    from pybedtools import BedTool
+    from pints import bed_ops
     from pints.io_engine import get_read_signal, get_coverage_bw, log_assert
     from collections import namedtuple
 except ImportError as e:
@@ -172,18 +172,20 @@ def main(input_file, layout, div_file, bid_file, single_file, divergent_extensio
                header=False)
     bid.to_csv(bid_file.replace(".bed", __EXTENDED_FILE_TPL__.format(de_tag=de_tag)), sep="\t", index=False,
                header=False)
-    single_obj = BedTool(single.to_csv(sep="\t", index=False, header=False), from_string=True)
+    # as BedTool(..., from_string=True) writes it: fields split on whitespace, empty ones dropped, blank lines too
+    single_lines = ["\t".join(ln.split()) + "\n"
+                    for ln in single.to_csv(sep="\t", index=False, header=False).splitlines() if ln.strip()]
 
-    if promoter_bed is not None:
-        promoter_bed_obj = BedTool(promoter_bed)
-        BedTool.from_dataframe(div).intersect(promoter_bed_obj, v=True).saveas(
-            div_file.replace(".bed", __EXTENDED_DISTAL_FILE_TPL__.format(de_tag=de_tag)))
-        BedTool.from_dataframe(bid).intersect(promoter_bed_obj, v=True).saveas(
-            bid_file.replace(".bed", __EXTENDED_DISTAL_FILE_TPL__.format(de_tag=de_tag)))
-        single_obj.intersect(promoter_bed_obj, v=True).saveas(
-            single_file.replace(".bed", __EXTENDED_DISTAL_FILE_TPL__.format(de_tag=de_tag)))
+    if promoter_bed is not None:  # BedTool(...).intersect(BedTool(promoter_bed), v=True)
+        promoters = bed_ops.read_records(promoter_bed)
+        bed_ops.write_lines(bed_ops.intersect_lines(bed_ops.frame_lines(div), promoters, "v"),
+                            div_file.replace(".bed", __EXTENDED_DISTAL_FILE_TPL__.format(de_tag=de_tag)))
+        bed_ops.write_lines(bed_ops.intersect_lines(bed_ops.frame_lines(bid), promoters, "v"),
+                            bid_file.replace(".bed", __EXTENDED_DISTAL_FILE_TPL__.format(de_tag=de_tag)))
+        bed_ops.write_lines(bed_ops.intersect_lines(single_lines, promoters, "v"),
+                            single_file.replace(".bed", __EXTENDED_DISTAL_FILE_TPL__.format(de_tag=de_tag)))
 
-    single_obj.moveto(single_file.replace(".bed", __EXTENDED_FILE_TPL__.format(de_tag=de_tag)))
+    bed_ops.write_lines(single_lines, single_file.replace(".bed", __EXTENDED_FILE_TPL__.format(de_tag=de_tag)))
     housekeeping_files = []
     housekeeping_files.extend(pl.values())
     housekeeping_files.extend(mn.values())

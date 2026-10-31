@@ -12,6 +12,7 @@ Each function reproduces, byte for byte, what PINTS got from pybedtools + bedtoo
 * `merge_lines` is ``bedtools merge -c ... -o collapse|distinct`` on sorted records.
 * `cat_lines` is ``BedTool.cat(..., postmerge=False)``: concatenation, truncated to the smallest field
   count when the files differ in it.
+* `intersect_lines` is ``bedtools intersect -v``, ``-u`` or ``-c``, optionally with ``-s``.
 
 Only what PINTS writes is supported (tab-separated BED records, no header, track or comment lines);
 other input raises ValueError instead of being silently treated differently.
@@ -188,30 +189,49 @@ def sort_lines(lines, start_column=None):
     return out
 
 
-def merge_lines(lines, columns, operations):
+def _span(r):
+    """Start and end of a record as bedtools compares them: a zero-length record is one base wider on each side."""
+    start, end = int(r[1]), int(r[2])
+    if start == end:
+        return start - 1, end + 1
+    return start, end
+
+
+def merge_lines(lines, columns=(), operations=(), strand=False, distance=0):
     """
-    ``bedtools merge -c columns -o operations`` on sorted BED records: overlapping and book-ended records
-    are merged, zero-length ones taken as one base wider on each side; ``collapse`` lists a column's values in record order, ``distinct`` its unique values in
-    byte order. Columns are 1-based.
+    ``bedtools merge -c columns -o operations -d distance`` on sorted BED records: overlapping and book-ended
+    records, and records at most `distance` apart, are merged, zero-length ones taken as one base wider on each
+    side; ``collapse`` lists a column's values in record order, ``distinct`` its unique values in byte order.
+    Columns are 1-based.
+
+    With `strand` (``-s``) only records on the same strand merge and records whose strand is not ``+`` or ``-``
+    are left out. bedtools holds records of the other strand back in a heap, which reorders them; the merged
+    records here are the same set (zero-length records excepted, which are refused) but come in the order of
+    their first records, and ``collapse`` lists values in input order.
     """
     if len(columns) != len(operations) or not set(operations) <= {"collapse", "distinct"}:
         raise ValueError("unsupported merge operations: %r" % (operations,))
-    out = []
-    cur = None
+    clusters = []
+    open_by_strand = {}
     for r in _fields(lines):
-        start, end = int(r[1]), int(r[2])
-        if start == end:  # bedtools widens zero-length records by one base on each side
-            start, end = start - 1, end + 1
-        if cur is not None and r[0] == cur[0] and start <= cur[2]:
+        if strand:
+            if len(r) < 6 or r[5] not in ("+", "-"):
+                continue
+            if r[1] == r[2]:
+                raise ValueError("strand-aware merge of zero-length records is not supported: %r" % "\t".join(r))
+            key = r[5]
+        else:
+            key = None
+        start, end = _span(r)
+        cur = open_by_strand.get(key)
+        if cur is not None and r[0] == cur[0] and start <= cur[2] + distance:
             cur[2] = max(cur[2], end)
             cur[3].append(r)
             continue
-        if cur is not None:
-            out.append(_merged_line(cur, columns, operations))
         cur = [r[0], start, end, [r]]
-    if cur is not None:
-        out.append(_merged_line(cur, columns, operations))
-    return out
+        open_by_strand[key] = cur
+        clusters.append(cur)
+    return [_merged_line(c, columns, operations) for c in clusters]
 
 
 def _merged_line(cluster, columns, operations):
@@ -230,7 +250,11 @@ def _merged_line(cluster, columns, operations):
 def cat_lines(paths):
     """``BedTool.cat(*paths, postmerge=False)`` for PINTS's own BED files: records of all non-empty files
     in order, cut to the smallest field count among them when the files differ."""
-    parts = [read_lines(p) for p in paths]
+    return cat_parts([read_lines(p) for p in paths])
+
+
+def cat_parts(parts):
+    """`cat_lines` for files already read (lists of lines)."""
     parts = [p for p in parts if p]
     counts = set()
     for p in parts:
@@ -245,11 +269,69 @@ def cat_lines(paths):
     return lines
 
 
+def intersect_lines(a, b, mode, strand=False):
+    """
+    ``bedtools intersect -a a -b b`` with ``-v`` (`mode` "v": records of `a` overlapping nothing in `b`),
+    ``-u`` ("u": records of `a` overlapping something) or ``-c`` ("c": each record of `a` with the number of
+    records of `b` it overlaps appended). Records overlap when they share at least one base, zero-length ones
+    taken as one base wider on each side; with `strand` (``-s``) only records with the same strand count.
+    Records of `a` keep their order and text.
+    """
+    if mode not in ("v", "u", "c"):
+        raise ValueError("unsupported intersect mode: %r" % (mode,))
+    rows_a, rows_b = _fields(a), _fields(b)
+    if strand and any(len(r) < 6 for r in rows_a + rows_b):
+        raise ValueError("strand-aware intersect needs six BED columns")
+    key = (lambda r: (r[0], r[5])) if strand else (lambda r: r[0])
+    if any(_span(r)[0] < 0 for r in rows_b):  # bedtools cannot bin these: "illegal bin number" (zero-length at 0, too)
+        raise ValueError("records with negative coordinates cannot be intersected")
+    groups = {}
+    for r in rows_b:
+        groups.setdefault(key(r), []).append(_span(r))
+    index = {}
+    for k, spans in groups.items():
+        arr = np.array(spans, dtype=np.int64)
+        index[k] = (np.sort(arr[:, 0]), np.sort(arr[:, 1]))
+    counts = np.zeros(len(rows_a), dtype=np.int64)
+    queries = {}
+    for i, r in enumerate(rows_a):
+        queries.setdefault(key(r), []).append(i)
+    for k, members in queries.items():
+        if k not in index:
+            continue
+        starts, ends = index[k]
+        spans = np.array([_span(rows_a[i]) for i in members], dtype=np.int64)
+        # b overlaps a when b.start < a.end and b.end > a.start; every b with b.end <= a.start also has
+        # b.start < a.end, so the count is a difference of two ranks
+        counts[members] = (np.searchsorted(starts, spans[:, 1], side="left")
+                           - np.searchsorted(ends, spans[:, 0], side="right"))
+    if mode == "c":
+        return [ln.rstrip("\n") + "\t%d\n" % c for ln, c in zip(a, counts)]
+    keep = counts == 0 if mode == "v" else counts > 0
+    return [ln for ln, k in zip(a, keep) if k]
+
+
+def read_records(path):
+    """Records of any BED file (e.g. a user's annotation), optionally gzip-compressed: blank, header, track
+    and browser lines are skipped, as bedtools does."""
+    import gzip
+    with open(path, "rb") as fh:
+        gz = fh.read(2) == b"\x1f\x8b"
+    with (gzip.open(path, "rt", newline="") if gz else open(path, newline="")) as fh:
+        return [ln if ln.endswith("\n") else ln + "\n" for ln in fh
+                if ln.strip() and not ln.startswith(("@", "#", "track", "browser"))]
+
+
 def is_empty(path):
     """True if the file has no records (`BedTool(path).count() == 0`: blank, header, track and browser lines
     are not records)."""
     with open(path) as fh:
         return not any(ln.strip() and not ln.startswith(("@", "#", "track", "browser")) for ln in fh)
+
+
+def frame_lines(df):
+    """A data frame as ``BedTool.from_dataframe`` writes it: tab-separated, no header or index, NaN as "."."""
+    return df.to_csv(sep="\t", header=False, index=False, na_rep=".").splitlines(keepends=True)
 
 
 def write_lines(lines, path):

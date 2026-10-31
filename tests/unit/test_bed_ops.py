@@ -51,6 +51,9 @@ def test_sort_and_merge_match_bedtools(seed):
         expected = _bedtools(["merge", "-i", "stdin", "-c", ",".join(map(str, cols)), "-o", ",".join(ops)],
                              expected)
         assert "".join(bed_ops.merge_lines(got, cols, ops)) == expected
+        d = rng.choice([1, 10, 500])
+        assert "".join(bed_ops.merge_lines(got, distance=d)) == _bedtools(["merge", "-i", "stdin", "-d", str(d)],
+                                                                           "".join(got))
 
 
 def test_std_sort_heapsort_fallback_and_thresholds():
@@ -108,3 +111,53 @@ def test_gtf_is_sorted_on_its_start_column(tmp_path):
     p = str(tmp_path / "bed_named.gtf")
     bed_ops.write_lines(lines, p)
     assert "".join(bed_ops.sort_lines(bed_ops.read_lines(p))) == _bedtools(["sort", "-i", p], "")
+
+
+@needs_bedtools
+@pytest.mark.parametrize("seed", range(60))
+def test_strand_merge_and_intersect_match_bedtools(seed, tmp_path):
+    rng = random.Random(1000 + seed)
+    span = rng.choice([1, 5, 50, 1000, 10 ** 5])
+    chroms = rng.sample(CHROMS, rng.choice([1, 2, 4]))
+    a = _bedtools(["sort", "-i", "stdin"], "".join(_records(rng, rng.choice([1, 2, 17, 300, 3000]), span, chroms)))
+    b = _records(rng, rng.choice([0, 1, 5, 200, 3000]), span, chroms)
+    for k, ln in enumerate(b):  # some strands bedtools -s ignores
+        if rng.random() < 0.1:
+            f = ln.split("\t")
+            f[5] = "."
+            b[k] = "\t".join(f)
+    a_lines = a.splitlines(keepends=True)
+    if rng.random() < 0.5:
+        rng.shuffle(a_lines)  # intersect keeps the order of -a, sorted or not
+    pa, pb = tmp_path / "a.bed", tmp_path / "b.bed"
+    pa.write_text("".join(a_lines))
+    pb.write_text("".join(b))
+    # strand-aware merge: the same merged records as bedtools (whose order differs), zero-length ones refused
+    sorted_b = bed_ops.sort_lines([ln for ln in b if ln.split("\t")[1] != ln.split("\t")[2]])
+    expected = _bedtools(["merge", "-s", "-i", "stdin", "-c", "4,5,6", "-o", "distinct,distinct,distinct"],
+                         "".join(sorted_b)) if sorted_b else ""
+    got = bed_ops.merge_lines(sorted_b, (4, 5, 6), ("distinct",) * 3, strand=True)
+    assert sorted(got) == sorted(expected.splitlines(keepends=True))
+    if len(sorted_b) != len(b):
+        with pytest.raises(ValueError):
+            bed_ops.merge_lines(bed_ops.sort_lines(b), (4, 5, 6), ("distinct",) * 3, strand=True)
+    for mode in ("v", "u", "c"):
+        for strand in (False, True):
+            args = ["intersect", "-a", str(pa), "-b", str(pb), "-" + mode] + (["-s"] if strand else [])
+            run = subprocess.run([BEDTOOLS] + args, capture_output=True, text=True)
+            if run.returncode:  # a zero-length record at 0 reaches -1 when widened
+                with pytest.raises(ValueError):
+                    bed_ops.intersect_lines(a_lines, b, mode, strand=strand)
+                continue
+            assert "".join(bed_ops.intersect_lines(a_lines, b, mode, strand=strand)) == run.stdout, (mode, strand)
+
+
+def test_read_records_skips_headers_and_reads_gzip(tmp_path):
+    import gzip
+    text = "track name=x\n#c\nbrowser p\n\nchr1\t1\t2\tn\t0\t+\nchr2\t3\t4\tm\t0\t-"
+    plain, gz = tmp_path / "p.bed", tmp_path / "p.bed.gz"
+    plain.write_text(text)
+    with gzip.open(gz, "wt") as fh:
+        fh.write(text)
+    expected = ["chr1\t1\t2\tn\t0\t+\n", "chr2\t3\t4\tm\t0\t-\n"]
+    assert bed_ops.read_records(str(plain)) == expected == bed_ops.read_records(str(gz))

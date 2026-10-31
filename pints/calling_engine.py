@@ -14,7 +14,6 @@
 #  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 #  GNU General Public License for more details.
 
-import datetime
 import gzip
 import io
 import logging
@@ -37,11 +36,9 @@ try:
     import pandas as pd
     import pysam
     import pyBigWig
-    import pybedtools
     from scipy.stats import poisson
     from scipy.signal import find_peaks, peak_widths
     from scipy.ndimage import gaussian_filter1d
-    from pybedtools import BedTool
     from .stats_engine import Poisson, ZIP, pval_dist, bgIQR, pkIQR, \
         independent_filtering, get_elbow
     from .io_engine import get_read_signal, get_coverage_bw, log_assert, normalize_using_input, is_zero_track, \
@@ -166,7 +163,7 @@ def run_command(cmd, repress_log=False):
 
 def runtime_check(check_updates=True):
     """
-    Runtime check, make sure all dependent tools are callable
+    Runtime check (PINTS no longer calls external tools: bgzip, tabix and bedtools are not needed)
 
     Parameters
     ----------
@@ -177,15 +174,8 @@ def runtime_check(check_updates=True):
     -------
 
     """
-    import shutil
     if sys.platform == "win32":
         logger.warning("No test had performed on Windows, so it might be buggy.")
-    dependent_tools = ("bgzip", "tabix", "bedtools")
-    for tool in dependent_tools:
-        full_path = shutil.which(tool)
-        if full_path is None:
-            logger.error("Required tool %s is not callable" % tool)
-            sys.exit(1)
     if check_updates:
         check_update()
 
@@ -583,12 +573,13 @@ def cut_peaks_dry_run(annotation_gtf, pl_cov_files, mn_cov_files, tss_extension=
     pct_tss = pct_bed.loc[:, ("seqname", "start", "end", "transcript_id", "gene_name", "strand")]
     pct_tss["start"] = pct_tss.apply(lambda x: x["start"] if x["strand"] == "+" else x["end"] - 1, axis=1)
     pct_tss["end"] = pct_tss.apply(lambda x: x["start"] + 1 if x["strand"] == "+" else x["end"], axis=1)
-    pct_tss.drop_duplicates(subset=["seqname", "start", "end"], inplace=True)
-    pct_tss_bed = BedTool.from_dataframe(pct_tss)
+    pct_tss = pct_tss.drop_duplicates(subset=["seqname", "start", "end"])
+    pct_tss_bed = bed_ops.frame_lines(pct_tss)
     pct_tss["start"] -= tss_extension
     pct_tss["end"] += tss_extension
-    tss_window = BedTool.from_dataframe(pct_tss).sort().merge(s=True, c=(4, 5, 6),
-                                                              o=("distinct", "distinct", "distinct"))
+    merged_windows = bed_ops.merge_lines(bed_ops.sort_lines(bed_ops.frame_lines(pct_tss)), (4, 5, 6),
+                                         ("distinct", "distinct", "distinct"), strand=True)
+    tss_window = [(int(f[1]), int(f[2]), f[5]) for f in (ln.rstrip("\n").split("\t") for ln in merged_windows)]
     logger.info("%d annotated TSSs loaded" % pct_tss.shape[0])
     pl_cov = merge_covs(pl_cov_files, highlight_chromosome)
     mn_cov = merge_covs(mn_cov_files, highlight_chromosome)
@@ -609,20 +600,21 @@ def cut_peaks_dry_run(annotation_gtf, pl_cov_files, mn_cov_files, tss_extension=
     median_sizes = np.zeros(search_range.shape[0])
     for i, dt in enumerate(search_range):
         predicted_peaks_dicts = []
-        for window in tss_window:
-            if window.strand == "+":
+        for w_start, w_stop, w_strand in tss_window:
+            if w_strand == "+":
                 cov_obj = pl_cov
             else:
                 cov_obj = mn_cov
-            if np.sum(cov_obj[window.start:window.stop]) > 0:
-                ss, es = cp_atom(cov_obj, window.start, window.stop, donor_tolerance=dt)
+            if np.sum(cov_obj[w_start:w_stop]) > 0:
+                ss, es = cp_atom(cov_obj, w_start, w_stop, donor_tolerance=dt)
                 for sc, ec in zip(ss, es):
                     predicted_peaks_dicts.append({"seqname": highlight_chromosome,
                                                   "start": sc, "end": ec, "name": ".",
-                                                  "score": ".", "strand": window.strand})
-        predicted_peaks = BedTool.from_dataframe(pd.DataFrame(predicted_peaks_dicts))
-        tmp_result = predicted_peaks.intersect(pct_tss_bed, c=True, s=True)
-        tmp_df = tmp_result.to_dataframe(names=("seqname", "start", "end", "name", "score", "strand", "hits"))
+                                                  "score": ".", "strand": w_strand})
+        predicted_peaks = bed_ops.frame_lines(pd.DataFrame(predicted_peaks_dicts))
+        tmp_result = bed_ops.intersect_lines(predicted_peaks, pct_tss_bed, "c", strand=True)
+        tmp_df = pd.read_csv(io.StringIO("".join(tmp_result)), sep="\t",
+                             names=("seqname", "start", "end", "name", "score", "strand", "hits"))
         lens = tmp_df["end"] - tmp_df["start"]
         ambiguous_rate = tmp_df.loc[np.logical_and(lens > 2, tmp_df.hits > 1), :].shape[0] / \
                          tmp_df.loc[lens > 2, :].shape[0]
@@ -1973,7 +1965,7 @@ def _remove_in_background(paths):
         _background_deletions.append(t)
 
 
-def housekeeping(pybedtools_prefix=""):
+def housekeeping():
     """
     Delete intermediate files
 
@@ -1989,9 +1981,6 @@ def housekeeping(pybedtools_prefix=""):
         for hf in housekeeping_files:
             if isinstance(hf, str) and os.path.exists(hf):
                 os.remove(hf)
-        if pybedtools_prefix != "":
-            import shutil
-            shutil.rmtree(pybedtools_prefix)
     except Exception as ex:
         logger.warning(str(ex))
 
@@ -2262,27 +2251,25 @@ def inferring_elements_from_other_reps(prefix, n_samples):
         div_file = sample_prefix + "_divergent_peaks.bed"
         single_file = sample_prefix + "_unidirectional_peaks.bed"
         if os.path.exists(bid_file):
-            bids.append(BedTool(bid_file))
+            bids.append(bed_ops.read_lines(bid_file))
         if os.path.exists(div_file):
-            divs.append(BedTool(div_file))
+            divs.append(bed_ops.read_lines(div_file))
         if os.path.exists(single_file):
-            sigs.append(BedTool(single_file))
-    if len(bids) > 0:
-        merged_bids = BedTool.cat(*bids, c=(4, 5, 6,), o=("distinct", "distinct", "distinct",))
-    else:
-        merged_bids = None
-    if len(divs) > 0:
-        merged_divs = BedTool.cat(*divs, c=(4, 5, 6,), o=("distinct", "distinct", "distinct",))
-    else:
-        merged_divs = None
+            sigs.append(bed_ops.read_lines(single_file))
+
+    def merged(calls):  # BedTool.cat(*calls, c=(4, 5, 6), o=("distinct",) * 3)
+        return bed_ops.merge_lines(bed_ops.sort_lines(bed_ops.cat_parts(calls)), (4, 5, 6), ("distinct",) * 3)
+
+    merged_bids = merged(bids) if len(bids) > 0 else None
+    merged_divs = merged(divs) if len(divs) > 0 else None
 
     for separate_calls, pool, label in zip((bids, divs), (merged_bids, merged_divs), ("bidirectional", "divergent")):
         if pool is None:
             continue
         for i, separate_bed in enumerate(separate_calls):
-            not_reported_ele = pool.intersect(separate_bed, v=True).intersect(sigs[i], u=True)
-            BedTool.cat(*[separate_bed, not_reported_ele], postmerge=False).sort().saveas(
-                prefix + "_%d_%s_peaks.bed" % (i + 1, label))
+            not_reported_ele = bed_ops.intersect_lines(bed_ops.intersect_lines(pool, separate_bed, "v"), sigs[i], "u")
+            bed_ops.write_lines(bed_ops.sort_lines(bed_ops.cat_parts([separate_bed, not_reported_ele])),
+                                prefix + "_%d_%s_peaks.bed" % (i + 1, label))
 
 
 def get_epig_annotation(annotation_source, output_dir):
@@ -2768,11 +2755,6 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
     show_parameter_info(input_bam, **kwargs)
 
     prefix = os.path.join(output_dir, output_prefix)
-    pybdt_tmp = os.path.join(output_dir,
-                             "pybdt_" + datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S") + "_" + str(os.getpid()))
-    if not os.path.exists(pybdt_tmp):
-        os.mkdir(pybdt_tmp)
-    pybedtools.set_tempdir(pybdt_tmp)
 
     log_assert(model in ("Poisson", "ZIP"), "Unsupported model", logger)
     if model == "ZIP":
@@ -3064,14 +3046,11 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
                                         placeholders={3: "Marginal"})
             annotate_tre_with_epig_info(r_unid, epig_annotation, only_annotated_records=True)
 
-            # merge results
-            BedTool.cat(*[BedTool(bid), BedTool(r_bid).intersect(bid, v=True).saveas()], postmerge=False).sort().saveas(
-                bid)
-            BedTool.cat(*[BedTool(div), BedTool(r_div).intersect(div, v=True).saveas()], postmerge=False).sort().saveas(
-                div)
-            BedTool.cat(*[BedTool(unid), BedTool(r_unid).intersect(unid, v=True).saveas()],
-                        postmerge=False).sort().saveas(
-                unid)
+            # merge results: BedTool.cat(final, BedTool(relaxed).intersect(final, v=True), postmerge=False).sort()
+            for final, relaxed in ((bid, r_bid), (div, r_div), (unid, r_unid)):
+                final_lines = bed_ops.read_lines(final)
+                extra = bed_ops.intersect_lines(bed_ops.read_lines(relaxed), final_lines, "v")
+                bed_ops.write_lines(bed_ops.sort_lines(bed_ops.cat_parts([final_lines, extra])), final)
             for g in r_gc:
                 housekeeping_files.append(g)
             housekeeping_files.append(r_bid)
@@ -3111,4 +3090,4 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
     if pool is not None:
         pool.close()
         pool.join()
-    housekeeping(pybdt_tmp)
+    housekeeping()

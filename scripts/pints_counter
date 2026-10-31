@@ -17,9 +17,9 @@
 import argparse
 import os
 import pyBigWig
-import pybedtools
 import numpy as np
 import pandas as pd
+from pints import bed_ops
 
 
 __EXAMPLE__ = """
@@ -47,17 +47,15 @@ def prepare_regions(primary_regions, additional_regions=None, max_dist=0):
 
     Returns
     -------
-    merged_regions : pybedtools.BedTool
-        Merged regions
+    merged_regions : list of list of str
+        Merged regions (chromosome, start, end)
     """
     all_files = list(primary_regions)
     if additional_regions:
         all_files.extend(list(additional_regions))
-    merged_regions = pybedtools.BedTool.cat(
-        *[pybedtools.BedTool(f) for f in all_files], postmerge=False
-    ).sort().merge(
-        d=max_dist).saveas()
-    return merged_regions
+    # BedTool.cat(*all_files, postmerge=False).sort().merge(d=max_dist)
+    merged = bed_ops.merge_lines(bed_ops.sort_lines(bed_ops.cat_lines(all_files)), distance=max_dist)
+    return [ln.rstrip("\n").split("\t") for ln in merged]
 
 
 def get_counts(regions, primary_signal, additional_signal=None):
@@ -66,7 +64,7 @@ def get_counts(regions, primary_signal, additional_signal=None):
 
     Parameters
     ----------
-    regions : pybedtools.BedTool
+    regions : list of list of str
         Regions
     primary_signal : str
         Path to a bigWig file storing all primary signals (e.g. signal on the forward strand)
@@ -249,7 +247,6 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    pybedtools.set_tempdir(".")
     main(
         bidirectional_calls=args.bidirectional_calls,
         pl_bws=args.pl_bws, conditions=args.conditions, condition_names=args.condition_names,
