@@ -1486,14 +1486,21 @@ def index_bed_file(file_path, logger=None):
     -------
 
     """
-    from pybedtools import BedTool
+    from pints import bed_ops
     if logger is None:
         assert os.path.exists(file_path), "Bed file {} cannot be located".format(file_path)
     else:
         log_assert(os.path.exists(file_path), "Bed file {} cannot be located".format(file_path), logger)
-    # compress and index
-    fn = BedTool(file_path).bgzip(in_place=True, force=True)
-    pysam.tabix_index(fn, preset="bed" if fn.find("bed") != -1 else "gff", force=True, csi=True)
+    # compress and index (sorted as BedTool(file_path).bgzip(in_place=True, force=True) sorts: bedtools sort)
+    fn = file_path + ".gz"
+    preset = "bed" if fn.find("bed") != -1 else "gff"
+    sorted_path = file_path + ".sorted.tmp"
+    bed_ops.write_lines(bed_ops.sort_lines(bed_ops.read_lines(file_path)), sorted_path)
+    try:
+        pysam.tabix_compress(sorted_path, fn, force=True)
+    finally:
+        os.remove(sorted_path)
+    pysam.tabix_index(fn, preset=preset, force=True, csi=True)
     # remove original file
     os.remove(file_path)
 

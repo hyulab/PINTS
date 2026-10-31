@@ -16,6 +16,7 @@
 
 import datetime
 import gzip
+import io
 import logging
 import os
 import sys
@@ -47,6 +48,7 @@ try:
         npy_layout, npy_read, NPY_BLOCK, \
         index_bed_file, peak_bed_to_gtf, merge_replicates_bw, _read_signal, _coverage_bw, merge_replicate_tracks, \
         normalize_tracks_using_input
+    from . import bed_ops
     from .coverage_store import register as register_track, lookup as lookup_track, release as release_tracks, \
         is_key
     from pints import __version__
@@ -2386,11 +2388,7 @@ def _pair_strand(sample_prefix, label, anti_label, sig_bins, fdr_target, stringe
 
 def _bed_is_empty(path):
     """`BedTool(path).count() == 0`, stopping at the first feature (same rules for header and blank lines)."""
-    try:
-        next(iter(BedTool(path)))
-    except StopIteration:
-        return True
-    return False
+    return bed_ops.is_empty(path)
 
 
 def pair(sample_prefix, df_dict, fdr_target, stringent_only, specific_suffix="", pool=None, **kwargs):
@@ -2440,24 +2438,22 @@ def pair(sample_prefix, df_dict, fdr_target, stringent_only, specific_suffix="",
         exp_mn_file = sample_prefix + "%s_sig_mn_%s_peaks.bed" % (specific_suffix, directionality)
         if os.path.exists(exp_pl_file) and os.path.exists(exp_mn_file):
             if directionality != "singletons":
-                tmp_pl_bed = BedTool(exp_pl_file)
-                tmp_mn_bed = BedTool(exp_mn_file)
                 pl_empty, mn_empty = _bed_is_empty(exp_pl_file), _bed_is_empty(exp_mn_file)
                 if pl_empty and mn_empty:
                     continue
-                elif pl_empty or mn_empty:
-                    # only one strand produced pairs: merge it on its own (previously the raw 16-column
-                    # records were parsed with 8 names, giving a malformed BED)
-                    pri_merged_file = (tmp_mn_bed if pl_empty else tmp_pl_bed).sort().merge(
-                        c=(12, 13, 14, 15, 16), o=("collapse", "collapse", "collapse", "collapse", "distinct"))
                 else:
-                    pri_merged_file = BedTool.cat(*[BedTool(exp_pl_file),
-                                                    BedTool(exp_mn_file)],
-                                                  c=(12, 13, 14, 15, 16),
-                                                  o=("collapse", "collapse", "collapse", "collapse", "distinct"))
-                pri_merged_df = pri_merged_file.to_dataframe(names=("chrom", "start", "end", "tss_fwd",
-                                                                    "tss_fwd_vals", "tss_rev", "tss_rev_vals",
-                                                                    "confidence"))
+                    # BedTool.cat(pl, mn, c=..., o=...): concatenate, bedtools sort, bedtools merge; when only one
+                    # strand produced pairs, BedTool(that strand).sort().merge(c=..., o=...) (previously the raw
+                    # 16-column records were parsed with 8 names, giving a malformed BED)
+                    lines = (bed_ops.read_lines(exp_mn_file) if pl_empty else bed_ops.read_lines(exp_pl_file)
+                             if mn_empty else bed_ops.cat_lines((exp_pl_file, exp_mn_file)))
+                    pri_merged_file = io.StringIO("".join(bed_ops.merge_lines(
+                        bed_ops.sort_lines(lines), (12, 13, 14, 15, 16),
+                        ("collapse", "collapse", "collapse", "collapse", "distinct"))))
+                # as BedTool.to_dataframe(names=...) reads it
+                pri_merged_df = pd.read_csv(pri_merged_file, sep="\t", names=("chrom", "start", "end", "tss_fwd",
+                                                                              "tss_fwd_vals", "tss_rev",
+                                                                              "tss_rev_vals", "confidence"))
                 for str_col in ("tss_fwd", "tss_fwd_vals", "tss_rev", "tss_rev_vals"):
                     pri_merged_df[str_col] = pri_merged_df[str_col].astype(str)
                 fwd_tss_cols = pri_merged_df["tss_fwd"].str.split(",", expand=True).fillna(value="-1").astype(int)
@@ -2473,14 +2469,13 @@ def pair(sample_prefix, df_dict, fdr_target, stringent_only, specific_suffix="",
                 max_index = rev_tss_val_cols.idxmax(axis=1)
                 pri_merged_df["tss_rev"] = rev_tss_cols.values[np.arange(rev_tss_cols.shape[0]), max_index]
                 pri_merged_df["tss_rev_val"] = rev_tss_val_cols.values[np.arange(rev_tss_cols.shape[0]), max_index]
-                BedTool.from_dataframe(
-                    pri_merged_df.loc[:, ("chrom", "start", "end", "confidence", "tss_fwd", "tss_rev")]).saveas(
-                    sample_prefix + "%s_%s_peaks.bed" % (specific_suffix, directionality))
-            else:
-                BedTool.cat(*[BedTool(exp_pl_file),
-                              BedTool(exp_mn_file)],
-                            postmerge=False).sort().saveas(
-                    sample_prefix + "%s_unidirectional_peaks.bed" % specific_suffix)
+                # as BedTool.from_dataframe(...).saveas(...) writes it
+                pri_merged_df.loc[:, ("chrom", "start", "end", "confidence", "tss_fwd", "tss_rev")].to_csv(
+                    sample_prefix + "%s_%s_peaks.bed" % (specific_suffix, directionality),
+                    sep="\t", header=False, index=False, na_rep=".")
+            else:  # BedTool.cat(pl, mn, postmerge=False).sort()
+                bed_ops.write_lines(bed_ops.sort_lines(bed_ops.cat_lines((exp_pl_file, exp_mn_file))),
+                                    sample_prefix + "%s_unidirectional_peaks.bed" % specific_suffix)
     return (sample_prefix + "%s_bidirectional_peaks.bed" % specific_suffix,
             sample_prefix + "%s_divergent_peaks.bed" % specific_suffix,
             sample_prefix + "%s_unidirectional_peaks.bed" % specific_suffix), data_structure._make(generated_files)
