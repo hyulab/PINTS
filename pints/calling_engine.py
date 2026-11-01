@@ -1782,7 +1782,7 @@ _MALLOC_TRIM = None
 
 
 def _blockwise_element_definition(coverage_dict, chromosome_of_interest, subpeak_bed, join_distance, ce_donor,
-                                  ce_trigger, block=None):
+                                  ce_trigger, block=None, peak_width=None):
     """Block-wise form of the body of `unified_element_definition` (same file, same return value).
 
     The merged int32 track is built one block at a time (``zeros(int32)`` then ``+=`` per replicate, the same
@@ -1842,7 +1842,8 @@ def _blockwise_element_definition(coverage_dict, chromosome_of_interest, subpeak
                 sub_peaks = cut_peaks(buf[row_start:row_end],
                                       donor_tolerance=ce_donor,
                                       ce_trigger=ce_trigger,
-                                      join_distance=join_distance)
+                                      join_distance=join_distance,
+                                      peak_width=peak_width)
                 for sp in sub_peaks:
                     start = sp[0] + row_start
                     end = sp[1] + row_start
@@ -1907,7 +1908,7 @@ def unified_element_definition(coverage_dict, chromosome_of_interest, strand_sig
     if all(is_zero_track(cd[chromosome_of_interest]) for cd in coverage_dict):
         return None
     blockwise = _blockwise_element_definition(coverage_dict, chromosome_of_interest, subpeak_bed,
-                                              join_distance, ce_donor, ce_trigger)
+                                              join_distance, ce_donor, ce_trigger, peak_width=peak_width)
     if blockwise is not False:
         return blockwise
     merged_coverage = merge_covs(coverage_dict, chromosome_of_interest, skip_if_empty=True)

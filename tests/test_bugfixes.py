@@ -124,3 +124,28 @@ def test_pairs_found_on_one_strand_only():
     b = _pair([(1000, 1050, 1e-5, 50), (9000, 9050, 1e-5, 30)], [(800, 850, 0.9, 40), (8850, 8900, 0.9, 5)])
     assert list(b.iloc[:, 0]) == ["chr1", "chr1"]
     assert [tuple(r) for r in b.iloc[:, 1:3].to_numpy()] == [(800, 1050), (8850, 9050)]
+
+
+def test_parallel_bigwig_loader_reports_fractional_values(tmp_path, caplog):
+    """The block-wise loader used by peak calling warns as _get_coverage_bw does."""
+    import pyBigWig
+    path = str(tmp_path / "f.bw")
+    bw = pyBigWig.open(path, "w")
+    bw.addHeader([("chr1", 1000)])
+    bw.addEntries("chr1", list(range(100, 110)), values=[0.5] * 10, span=1)
+    bw.close()
+    with caplog.at_level(logging.WARNING):
+        total = io._bw_chrom_worker(path, "chr1", 1000, np.int32, str(tmp_path / "f_chr1.npy"))
+    assert total == 0 and any("non-integer" in r.getMessage() for r in caplog.records)
+
+
+def test_peak_width_reaches_blockwise_element_definition(monkeypatch, tmp_path):
+    seen = []
+    real = ce.cut_peaks
+    monkeypatch.setattr(ce, "cut_peaks", lambda *a, **kw: seen.append(kw.get("peak_width")) or real(*a, **kw))
+    cov = np.zeros(50_000, dtype=np.int32)
+    cov[1000:1030] = 5
+    fn = str(tmp_path / "c.npy")
+    np.save(fn, cov)
+    ce.unified_element_definition([{"chr1": fn}], "chr1", "+", str(tmp_path / "s_pl.bed"), peak_width=5)
+    assert seen and set(seen) == {5}

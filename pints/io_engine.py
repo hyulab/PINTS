@@ -354,7 +354,7 @@ def _get_coverage_bw(bw_file, chromosome_startswith, output_dir, output_prefix):
 _BW_BLOCK = 1 << 24  # bases per bigWig read in the parallel loader
 
 
-def _bw_sparse_track(bw, chromosome, csize, data_type):
+def _bw_sparse_track(bw, chromosome, csize, data_type, bw_file=None):
     """Build the track from bigWig intervals instead of a dense float64 `values()` array.
 
     Positions without data are NaN in `values()` and become 0 after `nan_to_num`; covered positions get the
@@ -374,6 +374,7 @@ def _bw_sparse_track(bw, chromosome, csize, data_type):
     if st[0] < 0 or en[-1] > csize or np.any(en <= st) or np.any(st[1:] < en[:-1]):
         return None
     v = np.nan_to_num(arr[:, 2])
+    _warn_fractional(v, bw_file, chromosome)
     v[v < 0] *= -1
     v = v.astype(data_type, copy=False)
     ln = en - st
@@ -388,7 +389,7 @@ def _bw_sparse_track(bw, chromosome, csize, data_type):
 _BW_IV_BLOCK = 1 << 22  # bases per bw.intervals() query in the block-wise sparse loader
 
 
-def _bw_blockwise_sparse(bw, chromosome, csize, data_type, npy_file, block=None):
+def _bw_blockwise_sparse(bw, chromosome, csize, data_type, npy_file, block=None, bw_file=None):
     """Block-wise form of `_bw_sparse_track` + `np.save`: same file bytes, same returned sum.
 
     The track is written block by block (`intervals(chrom, a, b)` clipped to [a, b)) behind a header that is
@@ -404,6 +405,7 @@ def _bw_blockwise_sparse(bw, chromosome, csize, data_type, npy_file, block=None)
     off, dt = layout[0], layout[1]
     acc = np.sum(np.zeros(0, dtype=data_type)).dtype  # numpy's accumulator type for an integer sum
     sums = []
+    fractional = None  # values of the first block with non-integer values: warned about once, on success only
     with open(npy_file, "r+b") as fh:
         for a in range(0, csize, block):
             b = min(csize, a + block)
@@ -419,6 +421,8 @@ def _bw_blockwise_sparse(bw, chromosome, csize, data_type, npy_file, block=None)
                         or np.any(en <= a) or np.any(st >= b):
                     return None
                 v = np.nan_to_num(arr[:, 2])
+                if fractional is None and np.any(v != np.trunc(v)):
+                    fractional = v.copy()
                 v[v < 0] *= -1
                 v = v.astype(data_type, copy=False)
                 cs = np.maximum(st, a) - a
@@ -431,6 +435,8 @@ def _bw_blockwise_sparse(bw, chromosome, csize, data_type, npy_file, block=None)
             fh.seek(off + a * dt.itemsize)
             fh.write(out.view(np.uint8))
             sums.append(np.sum(out))
+    if fractional is not None:
+        _warn_fractional(fractional, bw_file, chromosome)
     # wrap-around (if any) is modular, as in a single np.sum over the whole track
     return np.sum(np.array(sums, dtype=acc))
 
@@ -443,20 +449,24 @@ def _bw_chrom_worker(bw_file, chromosome, csize, data_type, npy_file, block=None
         return np.load(npy_file).sum()
     bw = pyBigWig.open(bw_file)
     try:
-        s = _bw_blockwise_sparse(bw, chromosome, int(csize), data_type, npy_file)
+        s = _bw_blockwise_sparse(bw, chromosome, int(csize), data_type, npy_file, bw_file=bw_file)
         if s is not None:
             return s
         if csize <= block:
             cov = np.nan_to_num(bw.values(chromosome, 0, csize, numpy=True))
+            _warn_fractional(cov, bw_file, chromosome)
             cov[cov < 0] *= -1
             cov = cov.astype(data_type, copy=False)
             np.save(npy_file, cov)
             return np.sum(cov)
         # element-wise identical transformation, block by block, into an .npy with the same header
         out = np.lib.format.open_memmap(npy_file, mode="w+", dtype=data_type, shape=(int(csize),))
+        warned = False
         for a in range(0, csize, block):
             b = min(csize, a + block)
             v = np.nan_to_num(bw.values(chromosome, a, b, numpy=True))
+            if not warned:
+                warned = _warn_fractional(v, bw_file, chromosome)
             v[v < 0] *= -1
             out[a:b] = v.astype(data_type, copy=False)
         out.flush()
