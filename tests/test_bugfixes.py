@@ -86,3 +86,16 @@ def test_poisson_model_lrt():
     assert 0.02 < np.mean(np.array(ps) < 0.05) < 0.09  # calibrated under the null
 
 
+def test_fractional_bigwig_values_are_reported(tmp_path, caplog):
+    import pyBigWig
+    path = str(tmp_path / "f.bw")
+    bw = pyBigWig.open(path, "w")
+    bw.addHeader([("chr1", 1000)])
+    bw.addEntries("chr1", list(range(100, 110)), values=[0.5] * 10, span=1)
+    bw.close()
+    with caplog.at_level(logging.WARNING):
+        cov, _ = io._get_coverage_bw(path, "chr", str(tmp_path), "f")
+    assert any("non-integer" in r.getMessage() for r in caplog.records)
+    assert np.load(cov["chr1"]).sum() == 0  # values are still truncated, as before
+
+
