@@ -605,13 +605,15 @@ def _bw_blockwise_sparse(bw, chromosome, csize, data_type, npy_file, block=None,
     return np.sum(np.array(sums, dtype=acc))
 
 
-def _bw_track_runs(bw, chromosome, csize, data_type, block=None):
+def _bw_track_runs(bw, chromosome, csize, data_type, block=None, bw_file=None):
     """The track `_bw_blockwise_sparse` would write, as runs: (starts, ends, values), with runs whose value
-    becomes 0 left out. Same queries, checks and element-wise transformation; None where it returns None."""
+    becomes 0 left out. Same queries, checks, element-wise transformation and warning; None where it returns
+    None."""
     block = _BW_IV_BLOCK if block is None else int(block)
     if csize <= 0:
         return None
     runs = []
+    fractional = None
     for a in range(0, csize, block):
         b = min(csize, a + block)
         iv = bw.intervals(chromosome, a, b)
@@ -625,22 +627,29 @@ def _bw_track_runs(bw, chromosome, csize, data_type, block=None):
                     or np.any(en <= a) or np.any(st >= b):
                 return None
             v = np.nan_to_num(arr[:, 2])
+            if fractional is None and np.any(v != np.trunc(v)):
+                fractional = v.copy()
             v[v < 0] *= -1
             v = v.astype(data_type, copy=False)
             keep = v != 0
             runs.append((np.maximum(st, a)[keep], np.minimum(en, b)[keep], v[keep]))
+    if fractional is not None:
+        _warn_fractional(fractional, bw_file, chromosome)
     if not runs:
         e = np.empty(0, dtype=np.int64)
         return e, e, np.empty(0, dtype=data_type)
     return tuple(np.concatenate(x) for x in zip(*runs))
 
 
-def _bw_dense_points(bw, chromosome, csize, data_type, block):
+def _bw_dense_points(bw, chromosome, csize, data_type, block, bw_file=None):
     """The dense fallback of `_bw_chrom_worker`, as points (positions, values) of its non-zero bases."""
     pos, vals = [], []
+    warned = False
     for a in range(0, max(csize, 0), block):
         b = min(csize, a + block)
         v = np.nan_to_num(bw.values(chromosome, a, b, numpy=True))
+        if not warned:
+            warned = _warn_fractional(v, bw_file, chromosome)
         v[v < 0] *= -1
         v = v.astype(data_type, copy=False)
         nz = np.flatnonzero(v)
@@ -664,9 +673,9 @@ def _bw_chrom_track(bw_file, chromosome, csize, data_type, npy_file, block=None)
         return np.load(npy_file).sum(), (t.starts, t.ends, t.values), npy_file
     bw = pyBigWig.open(bw_file)
     try:
-        runs = _bw_track_runs(bw, chromosome, int(csize), data_type)
+        runs = _bw_track_runs(bw, chromosome, int(csize), data_type, bw_file=bw_file)
         if runs is None:
-            pos, vals = _bw_dense_points(bw, chromosome, int(csize), data_type, block)
+            pos, vals = _bw_dense_points(bw, chromosome, int(csize), data_type, block, bw_file=bw_file)
             runs = (pos, None, vals)
     finally:
         bw.close()

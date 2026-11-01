@@ -149,3 +149,16 @@ def test_peak_width_reaches_blockwise_element_definition(monkeypatch, tmp_path):
     np.save(fn, cov)
     ce.unified_element_definition([{"chr1": fn}], "chr1", "+", str(tmp_path / "s_pl.bed"), peak_width=5)
     assert seen and set(seen) == {5}
+
+
+def test_in_memory_bigwig_tracks_report_fractional_values(tmp_path, caplog):
+    """The coverage store's bigWig loader warns as the dump-writing loaders do."""
+    import pyBigWig
+    path = str(tmp_path / "f.bw")
+    bw = pyBigWig.open(path, "w")
+    bw.addHeader([("chr1", 1000)])
+    bw.addEntries("chr1", list(range(100, 110)), values=[0.5] * 10, span=1)
+    bw.close()
+    with caplog.at_level(logging.WARNING):
+        total, _, _ = io._bw_chrom_track(path, "chr1", 1000, np.int32, str(tmp_path / "f_chr1.npy"))
+    assert total == 0 and any("non-integer" in r.getMessage() for r in caplog.records)
