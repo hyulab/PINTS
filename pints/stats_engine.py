@@ -132,6 +132,32 @@ class Poisson(StatModel):
         from scipy.stats import poisson
         return poisson.sf(peak_mu, le_mu)
 
+    @staticmethod
+    def _max_log_likelihood(obs):
+        obs = np.asarray(obs, dtype=float)
+        if obs.size == 0:
+            return 0.
+        m = obs.mean()
+        if m <= 0:
+            return 0.
+        return float(np.sum(poisson.logpmf(obs, m)))
+
+    def lrt(self, group_1_obs, group_2_obs):
+        """
+        Likelihood ratio test: separate Poisson rates vs one shared rate (chi-square, 1 df).
+
+        Returns
+        -------
+        statistic : float
+        p_value : float
+        """
+        g1 = np.asarray(group_1_obs)
+        g2 = np.asarray(group_2_obs)
+        statistic = 2 * (Poisson._max_log_likelihood(g1) + Poisson._max_log_likelihood(g2)
+                         - Poisson._max_log_likelihood(np.concatenate((g1, g2))))
+        statistic = max(statistic, 0.)
+        return statistic, chi2.sf(statistic, df=1)
+
 
 class ZIP(StatModel):
     @staticmethod

@@ -72,3 +72,17 @@ def test_peak_width_reaches_find_peaks(monkeypatch, tmp_path):
     assert any(s <= 115 < e for s, e in wide)
 
 
+def test_poisson_model_lrt():
+    """Poisson did not implement the abstract lrt(), so --model Poisson raised TypeError."""
+    from scipy.stats import poisson, chi2
+    rng = np.random.default_rng(3)
+    a, b = rng.poisson(2.0, 200), rng.poisson(3.0, 300)
+    ll = lambda x: poisson.logpmf(x, x.mean()).sum()
+    w, p = se.Poisson().lrt(a, b)
+    w_ref = 2 * (ll(a) + ll(b) - ll(np.concatenate([a, b])))
+    assert np.isclose(w, w_ref) and np.isclose(p, chi2.sf(w_ref, 1))
+    assert se.Poisson().lrt(np.zeros(5), np.zeros(5)) == (0., 1.)
+    ps = [se.Poisson().lrt(rng.poisson(2, 100), rng.poisson(2, 300))[1] for _ in range(400)]
+    assert 0.02 < np.mean(np.array(ps) < 0.05) < 0.09  # calibrated under the null
+
+
