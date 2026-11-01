@@ -99,3 +99,28 @@ def test_fractional_bigwig_values_are_reported(tmp_path, caplog):
     assert np.load(cov["chr1"]).sum() == 0  # values are still truncated, as before
 
 
+def _peaks(rows, strand):
+    out = [dict(chromosome="chr1", start=s, end=e, name=".", padj=padj, strand=strand, reads=reads,
+                pval=padj / 10, mu_0=.1, pi_0=.1, mu_1=1., pi_1=.1, var_1=.1, ler_1=0, ler_2=0, ler_3=0,
+                non_zeros=3, summit=(s + e) // 2, summit_val=5) for s, e, padj, reads in rows]
+    return pd.DataFrame(out, columns=ce.COMMON_HEADER)
+
+
+def _pair(pl, mn):
+    with tempfile.TemporaryDirectory() as d:
+        pre = os.path.join(d, "s")
+        dfs = {"pl": _peaks(pl, "+"), "mn": _peaks(mn, "-")}
+        for lab, df in dfs.items():
+            fn = pre + "_%s.bed" % lab
+            df.sort_values(["chromosome", "start"]).to_csv(fn, sep="\t", index=False, header=False)
+            io.index_bed_file(fn)
+        (bid, _, _), _ = ce.pair(pre, dfs, 0.1, False)
+        return pd.read_csv(bid, sep="\t", header=None)
+
+
+def test_pairs_found_on_one_strand_only():
+    """Only the forward strand's significant peaks find partners: the pairs were written unmerged and parsed
+    with the wrong columns, so the chromosome column held a peak end."""
+    b = _pair([(1000, 1050, 1e-5, 50), (9000, 9050, 1e-5, 30)], [(800, 850, 0.9, 40), (8850, 8900, 0.9, 5)])
+    assert list(b.iloc[:, 0]) == ["chr1", "chr1"]
+    assert [tuple(r) for r in b.iloc[:, 1:3].to_numpy()] == [(800, 1050), (8850, 9050)]

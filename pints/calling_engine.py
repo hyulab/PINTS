@@ -1452,10 +1452,11 @@ def pair(sample_prefix, df_dict, fdr_target, stringent_only, specific_suffix="",
                 tmp_mn_bed = BedTool(exp_mn_file)
                 if tmp_pl_bed.count() == 0 and tmp_mn_bed.count() == 0:
                     continue
-                elif tmp_pl_bed.count() == 0:
-                    pri_merged_file = tmp_mn_bed
-                elif tmp_mn_bed.count() == 0:
-                    pri_merged_file = tmp_pl_bed
+                elif tmp_pl_bed.count() == 0 or tmp_mn_bed.count() == 0:
+                    # only one strand produced pairs: merge it on its own (previously the raw 16-column
+                    # records were parsed with 8 names, giving a malformed BED)
+                    pri_merged_file = (tmp_mn_bed if tmp_pl_bed.count() == 0 else tmp_pl_bed).sort().merge(
+                        c=(12, 13, 14, 15, 16), o=("collapse", "collapse", "collapse", "collapse", "distinct"))
                 else:
                     pri_merged_file = BedTool.cat(*[BedTool(exp_pl_file),
                                                     BedTool(exp_mn_file)],
