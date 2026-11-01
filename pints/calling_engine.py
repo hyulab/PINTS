@@ -568,7 +568,7 @@ def cut_peaks_dry_run(annotation_gtf, pl_cov_files, mn_cov_files, tss_extension=
 
 
 def cut_peaks(window, donor_tolerance, ce_trigger, join_distance=1, peak_rel_height=1.,
-              max_distance=30):
+              max_distance=30, peak_width=None):
     """
     Cut peaks from the given window
 
@@ -586,12 +586,18 @@ def cut_peaks(window, donor_tolerance, ce_trigger, join_distance=1, peak_rel_hei
         Used for calculation of the peaks width, thus it is only used if width is given.
     max_distance : int
         max distance between two subpeaks to be joined, by default, 20
+    peak_width : int or None
+        Required width of peaks in samples (`width` of scipy.signal.find_peaks, measured at peak_rel_height).
+        None (default) applies no width requirement.
     Returns
     -------
     merged_intervals : list
         List of tuples of merged intervals [(start_1, end_1), ... , (start_n, end_n)]
     """
-    peaks, _ = find_peaks(window, rel_height=peak_rel_height)
+    if peak_width is None:
+        peaks, _ = find_peaks(window, rel_height=peak_rel_height)
+    else:
+        peaks, _ = find_peaks(window, rel_height=peak_rel_height, width=peak_width)
     _, _, starts, ends = peak_widths(window, peaks, rel_height=peak_rel_height)
     intervals = []
     for k, start in enumerate(starts):
@@ -1194,7 +1200,7 @@ def show_parameter_info(input_bam, **kwargs):
 
 
 def unified_element_definition(coverage_dict, chromosome_of_interest, strand_sign, output_file,
-                               join_distance=1, ce_donor=1.0, ce_trigger=3):
+                               join_distance=1, ce_donor=1.0, ce_trigger=3, peak_width=None):
     """
     Unified element boundary definition
     If multiple replicates are present, then this function will merge all signal tracks together
@@ -1245,7 +1251,8 @@ def unified_element_definition(coverage_dict, chromosome_of_interest, strand_sig
             sub_peaks = cut_peaks(merged_coverage[row.start:row.end],
                                   donor_tolerance=ce_donor,
                                   ce_trigger=ce_trigger,
-                                  join_distance=join_distance)
+                                  join_distance=join_distance,
+                                  peak_width=peak_width)
             for sp in sub_peaks:
                 start = sp[0] + row.start
                 end = sp[1] + row.start
@@ -1360,6 +1367,16 @@ def get_epig_annotation(annotation_source, output_dir):
     except Exception as ex:
         logger.error(ex)
     return dst
+
+
+def _highlight_chromosome(kwargs):
+    """`--focused-chrom` is stored as `focused_chrom` by the CLI; `highlight_chromosome` by the API."""
+    return kwargs.get("highlight_chromosome", kwargs.get("focused_chrom", "chr1"))
+
+
+def _stringent_only(kwargs):
+    """`--stringent-pairs-only` is stored as `stringent_pairs_only` by the CLI; `stringent_only` by the API."""
+    return bool(kwargs.get("stringent_only", kwargs.get("stringent_pairs_only", False)))
 
 
 def pair(sample_prefix, df_dict, fdr_target, stringent_only, specific_suffix="", **kwargs):
@@ -1792,7 +1809,7 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
     subpeak_pl_beds = {}
     subpeak_mn_beds = {}
     if kwargs.get("annotation_gtf", None) is not None:
-        highlight_chromosome = kwargs.get("highlight_chromosome", "chr1")
+        highlight_chromosome = _highlight_chromosome(kwargs)
         log_assert(os.path.exists(kwargs.get("annotation_gtf", None)), "Cannot find gene annotation file", logger)
         if highlight_chromosome in chromosome_coverage_pl[0]:
             kwargs["donor_tolerance"] = cut_peaks_dry_run(kwargs.get("annotation_gtf", None), chromosome_coverage_pl,
@@ -1811,7 +1828,8 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
                                                                  prefix + "_{0}.bed".format(strand_short),
                                                                  ce_donor=kwargs.get("donor_tolerance", 0.3),
                                                                  join_distance=kwargs.get("peak_distance", 1),
-                                                                 ce_trigger=kwargs.get("ce_trigger", 3))
+                                                                 ce_trigger=kwargs.get("ce_trigger", 3),
+                                                                 peak_width=kwargs.get("peak_width", None))
 
             if target_dict[chromosome] is not None:
                 housekeeping_files.append(target_dict[chromosome])
@@ -1873,7 +1891,7 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
 
         logger.info("Pairing peaks")
         (bid, div, unid), gc = pair(sample_prefix, df_dict=df_dict, fdr_target=fdr_target,
-                                    stringent_only=kwargs.get("stringent_only", False), **kwargs)
+                                    stringent_only=_stringent_only(kwargs), **kwargs)
         # reformat unidirectional output
         unid_df = pd.read_csv(unid, sep="\t", names=COMMON_HEADER)
         unid_df[["chromosome", "start", "end", "name", "padj", "strand",
@@ -1895,7 +1913,7 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
 
             relaxed_fdr = kwargs.get("relaxed_fdr_target", fdr_target * 2)
             (r_bid, r_div, r_unid), r_gc = pair(sample_prefix, df_dict=df_dict, fdr_target=relaxed_fdr,
-                                                stringent_only=kwargs.get("stringent_only", False),
+                                                stringent_only=_stringent_only(kwargs),
                                                 specific_suffix="_EA", **kwargs)
             r_unid_df = pd.read_csv(r_unid, sep="\t", names=COMMON_HEADER)
             r_unid_df[["chromosome", "start", "end", "name", "padj", "strand",
