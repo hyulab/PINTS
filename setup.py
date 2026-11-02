@@ -20,7 +20,6 @@ setup(
         "pybedtools>=0.8.1",
         "statsmodels>=0.12.1",
         "pyBigWig",
-        "biopython",
         "matplotlib",
     ),
     extras_require={},
