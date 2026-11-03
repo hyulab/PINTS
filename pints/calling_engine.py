@@ -2757,6 +2757,12 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
     prefix = os.path.join(output_dir, output_prefix)
 
     log_assert(model in ("Poisson", "ZIP"), "Unsupported model", logger)
+    if kwargs.get("output_diagnostics", False):
+        try:
+            import matplotlib  # noqa: F401
+        except ImportError:
+            log_assert(False, "--debug saves diagnostic plots, which need matplotlib: pip install 'pyPINTS[plots]'",
+                       logger)
     if model == "ZIP":
         stat_tester = ZIP()
     elif model == "Poisson":
