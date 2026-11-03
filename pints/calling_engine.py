@@ -77,34 +77,31 @@ def check_update():
 
     """
     logger.info("Checking for updates...")
-    import requests
-    from requests.adapters import HTTPAdapter
-    from urllib3.util import Retry
+    import json
     import time
-    requests.packages.urllib3.disable_warnings()
-    retry_strategy = Retry(
-        total=3,
-        backoff_factor=3
-    )
-    adapter = HTTPAdapter(max_retries=retry_strategy)
+    import urllib.request
 
-    with requests.Session() as http:
-        http.mount("https://", adapter)
-
-        try:
-            req = http.get(url="https://pypi.org/pypi/pyPINTS/json", timeout=10)
-            rj = req.json()
-            remote_version = rj["info"]["version"]
-            import pints
-            if pints.__version__ == remote_version:
-                logger.info("You are using the latest version of PINTS")
-            else:
-                logger.warning("!!!Your PINTS version is out-dated ({cv} vs. {rv})!!!".format(cv=pints.__version__,
-                                                                                              rv=remote_version))
-                logger.warning("Please run `pip install -U pyPINTS` to update!")
-                time.sleep(10)
-        except Exception as ex:
-            logger.error(ex)
+    try:
+        for wait in (0, 6, 12, None):  # up to 3 retries, backing off as requests/urllib3 did
+            try:
+                with urllib.request.urlopen("https://pypi.org/pypi/pyPINTS/json", timeout=10) as response:
+                    rj = json.load(response)
+                break
+            except OSError:  # URLError, HTTPError and timeouts
+                if wait is None:
+                    raise
+                time.sleep(wait)
+        remote_version = rj["info"]["version"]
+        import pints
+        if pints.__version__ == remote_version:
+            logger.info("You are using the latest version of PINTS")
+        else:
+            logger.warning("!!!Your PINTS version is out-dated ({cv} vs. {rv})!!!".format(cv=pints.__version__,
+                                                                                          rv=remote_version))
+            logger.warning("Please run `pip install -U pyPINTS` to update!")
+            time.sleep(10)
+    except Exception as ex:
+        logger.error(ex)
 
 
 def handle_exception(exc_type, exc_value, exc_traceback):

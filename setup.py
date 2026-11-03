@@ -16,7 +16,6 @@ setup(
         "pandas>=1.1.5",
         "scipy>=1.5.2",
         "pysam>=0.16.0.1",
-        "requests",
         "pyBigWig",
     ),
     extras_require={"fast": ["numba>=0.56"], "plots": ["matplotlib"]},
