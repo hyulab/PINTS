@@ -17,7 +17,6 @@ setup(
         "scipy>=1.5.2",
         "pysam>=0.16.0.1",
         "requests",
-        "statsmodels>=0.12.1",
         "pyBigWig",
         "matplotlib",
     ),

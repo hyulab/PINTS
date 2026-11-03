@@ -7,7 +7,7 @@ tests/diff         differential tests: `pints` (optimised) vs frozen `pints_ref`
 tests/reference    frozen copy of upstream PINTS 81b2dd9 as `pints_ref` (imports renamed only), with the
                    one-strand pair merge fix of the bugfix PR
 
-Run with:  pip install pytest hypothesis numba && pytest -m "not slow" tests/unit tests/diff
+Run with:  pip install pytest hypothesis numba statsmodels && pytest -m "not slow" tests/unit tests/diff
 """
 import os
 import sys

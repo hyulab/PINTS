@@ -867,6 +867,75 @@ class pkIQR(IQR):
         return new_local_env[new_local_env >= 0], ler_count
 
 
+def _bh_sorted(pvals_sorted, alpha):
+    """Benjamini-Hochberg on ascending p-values: (reject, padj), as statsmodels' fdrcorrection(is_sorted=True)"""
+    ecdffactor = np.arange(1, len(pvals_sorted) + 1) / float(len(pvals_sorted))
+    reject = pvals_sorted <= ecdffactor * alpha
+    if reject.any():
+        reject[:max(np.nonzero(reject)[0])] = True
+    pvals_corrected = np.minimum.accumulate((pvals_sorted / ecdffactor)[::-1])[::-1]
+    pvals_corrected[pvals_corrected > 1] = 1
+    return reject, pvals_corrected
+
+
+def adjust_pvalues(pvals, alpha=0.05, method="fdr_bh"):
+    """
+    Adjusted p-values for multiple testing, in the input order. The same operations as
+    ``statsmodels.stats.multitest.multipletests(pvals, alpha, method)[1]`` (statsmodels 0.12-0.14), so the
+    results are bit-identical, for the methods pints_caller offers.
+
+    Parameters
+    ----------
+    pvals : array-like
+        p-values
+    alpha : float
+        FDR target (used by the two-stage methods)
+    method : str
+        fdr_bh (Benjamini-Hochberg), bonferroni, fdr_tsbh (two-stage BH) or fdr_tsbky (Benjamini, Krieger
+        and Yekutieli 2006, Definition 6)
+
+    Returns
+    -------
+    padj : np.ndarray
+
+    Raises
+    ------
+    ZeroDivisionError
+        For no p-values, as statsmodels does
+    """
+    pvals = np.asarray(pvals)
+    ntests = len(pvals)
+    if ntests == 0:  # statsmodels fails here too (computing the Sidak level), and the callers rely on it
+        raise ZeroDivisionError("no p-values to adjust")
+    sortind = np.argsort(pvals)
+    pvals = np.take(pvals, sortind)
+    method = method.lower()
+    if method == "bonferroni":
+        pvals_corrected = pvals * float(ntests)
+    elif method == "fdr_bh":
+        pvals_corrected = _bh_sorted(pvals, alpha)[1]
+    elif method in ("fdr_tsbh", "fdr_tsbky"):  # statsmodels' fdrcorrection_twostage with maxiter=1
+        fact = (1. + alpha) if method == "fdr_tsbky" else 1.
+        alpha_prime = alpha / fact if method == "fdr_tsbky" else alpha
+        rej, pvals_corrected = _bh_sorted(pvals, alpha_prime)
+        r1 = rej.sum()
+        if r1 == 0 or r1 == ntests:
+            pvals_corrected *= fact
+        else:
+            ntests0 = 1.0 * ntests - r1
+            rej, pvals_corrected = _bh_sorted(pvals, alpha_prime * ntests / ntests0)
+            pvals_corrected *= ntests0 * 1.0 / ntests
+            if method == "fdr_tsbky":
+                pvals_corrected *= (1. + alpha)
+        pvals_corrected[pvals_corrected > 1] = 1
+    else:
+        raise ValueError("method not recognized: %s" % method)
+    pvals_corrected[pvals_corrected > 1] = 1
+    out = np.empty_like(pvals_corrected)
+    out[sortind] = pvals_corrected
+    return out
+
+
 def independent_filtering(df, fdr_target=0.1, output_to=None, logger=None, **kwargs):
     """
     Independent filtering
@@ -895,7 +964,6 @@ def independent_filtering(df, fdr_target=0.1, output_to=None, logger=None, **kwa
          Independent filtering increases detection power for high-throughput experiments.
          PNAS 107, 9546–9551 (2010).
     """
-    from statsmodels.stats.multitest import multipletests
     from pints.io_engine import log_assert
     import pandas as pd
 
@@ -909,7 +977,7 @@ def independent_filtering(df, fdr_target=0.1, output_to=None, logger=None, **kwa
     select_probe = None
     read_counts_threshold = 0
     try:
-        direct_padj = multipletests(df["pval"], alpha=fdr_target, method=adjust_method)[1]
+        direct_padj = adjust_pvalues(df["pval"], alpha=fdr_target, method=adjust_method)
     except ZeroDivisionError:
         direct_padj = df["pval"] * df.shape[0]
     # Every quantile threshold defines a subset; identical thresholds give identical subsets, so the
@@ -932,7 +1000,7 @@ def independent_filtering(df, fdr_target=0.1, output_to=None, logger=None, **kwa
             tmp_probe = reads_col > threshold
             sub_p = pval_col.loc[tmp_probe]
             try:
-                read_out = multipletests(sub_p, alpha=fdr_target, method=adjust_method)[1]
+                read_out = adjust_pvalues(sub_p, alpha=fdr_target, method=adjust_method)
             except ZeroDivisionError:
                 # if we cannot run BH, then we use Bonferroni correction
                 read_out = sub_p * sub_p.shape[0]
