@@ -18,6 +18,8 @@ import gzip
 import io
 import logging
 import os
+import re
+import shutil
 import sys
 from collections import namedtuple
 from glob import glob
@@ -928,6 +930,43 @@ class PeakBedIndex:
                 pme.append(m)
         return cls(blocks)
 
+    @classmethod
+    def from_tabix(cls, path, chromosomes):
+        """
+        PeakBedIndex of the records of `chromosomes` only, read through the file's tabix index, so that
+        building it decompresses those chromosomes' blocks only. A chromosome the index lacks gets no block, so
+        fetching it raises ValueError as tabix does. Returns None when a name is one tabix might parse as a
+        region, or the records are outside the supported subset.
+        """
+        tbx = pysam.TabixFile(path, index=path + ".csi")
+        try:
+            blocks = {}
+            contigs = set(tbx.contigs)
+            for chrom in chromosomes:
+                if not _TABIX_SAFE_NAME.match(chrom):
+                    return None
+                if chrom not in contigs:
+                    continue
+                lines, starts, ends, pme, m = [], [], [], [], -1
+                for rec in tbx.fetch(chrom):
+                    parts = rec.split("\t", 3)
+                    if "\r" in rec or len(parts) < 4 or parts[0] != chrom:
+                        return None
+                    if not (parts[1].isascii() and parts[1].isdigit() and parts[2].isascii() and parts[2].isdigit()):
+                        return None
+                    s, e = int(parts[1]), int(parts[2])
+                    if (starts and s < starts[-1]) or e <= s or s < 0:
+                        return None
+                    lines.append(rec + "\n")
+                    starts.append(s)
+                    ends.append(e)
+                    m = e if e > m else m
+                    pme.append(m)
+                blocks[chrom] = (lines, starts, ends, pme)
+        finally:
+            tbx.close()
+        return cls(blocks)
+
     def fetch(self, chromosome, start, end, parser=None):
         # argument checks in pysam's order: end, start, start > end, empty region, then the contig
         if end < 0:
@@ -948,6 +987,7 @@ class PeakBedIndex:
 
 
 _PEAK_INDEX_BYTES_PER_QUERY = 2000
+_TABIX_SAFE_NAME = re.compile(r"[A-Za-z0-9_.\-]+\Z")  # contig names a region string cannot misparse
 
 
 def open_peak_index(path, n_queries=None):
@@ -1274,6 +1314,12 @@ def _pair_task(sample_prefix, df_dict, fdr_target, stringent_only, kwargs):
              "reads", "summit", "summit_val"]].to_csv(
         unid, sep="\t", header=False, index=False)
     return (bid, div, unid), tuple(gc)  # gc is a locally defined namedtuple (not picklable); only iterated
+
+
+def _read_peak_table(peaks_bed, window_size_threshold):
+    """One strand's filtered peaks as `peak_calling` reads them for pairing (also a pool task)."""
+    peak_df = pd.read_csv(peaks_bed, sep="\t", header=None, names=COMMON_HEADER)
+    return peak_df.loc[peak_df["end"] - peak_df["start"] < window_size_threshold, :]
 
 
 def _stratified_filtering_task(tmp_df, output_file, fdr_target, kwargs):
@@ -1754,7 +1800,7 @@ def _concat_result_frames(sub_dfs):
 
 
 def merge_opposite_peaks(sig_peak_bed, peak_candidate_bed, divergent_output_bed, bidirectional_output_bed,
-                         singleton_bed, fdr_target, stringent_only=False, **kwargs):
+                         singleton_bed, fdr_target, stringent_only=False, tbx=None, **kwargs):
     """
     Merge peaks on the opposite strand and generate divergent peak pairs
 
@@ -1774,6 +1820,9 @@ def merge_opposite_peaks(sig_peak_bed, peak_candidate_bed, divergent_output_bed,
         FDR target
     stringent_only : bool
         Set it to True if you only want to keep significant pairs (both peaks needs to be significant)
+    tbx : None or object with tabix's fetch
+        Index of `peak_candidate_bed` (covering at least the chromosomes in `sig_peak_bed`); by default
+        `open_peak_index` opens one
 
     **kwargs :
         close_threshold : int
@@ -1785,9 +1834,10 @@ def merge_opposite_peaks(sig_peak_bed, peak_candidate_bed, divergent_output_bed,
     -------
 
     """
-    with open(sig_peak_bed, "r") as sig_fh:
-        n_queries = sum(1 for _ in sig_fh)
-    tbx = open_peak_index(peak_candidate_bed, n_queries=n_queries)
+    if tbx is None:
+        with open(sig_peak_bed, "r") as sig_fh:
+            n_queries = sum(1 for _ in sig_fh)
+        tbx = open_peak_index(peak_candidate_bed, n_queries=n_queries)
     fh = open(sig_peak_bed, "r")
     div_fh = open(divergent_output_bed, "w")
     bid_fh = open(bidirectional_output_bed, "w")
@@ -2370,6 +2420,84 @@ def _pair_strand(sample_prefix, label, anti_label, sig_bins, fdr_target, stringe
     return generated_files
 
 
+_PAIR_CHUNK_LINES = 2000  # significant peaks per pairing task (consecutive chromosomes are grouped up to this)
+
+
+def _pair_chunk_task(sig_lines, chromosomes, candidate_bed, n_queries, part_prefix, fdr_target, stringent_only,
+                     kwargs):
+    """
+    Pool task: `merge_opposite_peaks` for consecutive lines of a strand's significant peaks, all on
+    `chromosomes`, against an index of those chromosomes' candidates only. Each output line depends only
+    on its query line and the candidates on the query's chromosome, so the parts of a strand, joined in
+    order, are the files one call over the whole strand writes.
+    """
+    tbx = PeakBedIndex.from_tabix(candidate_bed, chromosomes)
+    if tbx is None:
+        tbx = open_peak_index(candidate_bed, n_queries=n_queries)
+    sig_file = part_prefix + "_sig.bed"
+    with open(sig_file, "w") as fh:
+        fh.writelines(sig_lines)
+    outputs = tuple(part_prefix + "_%s.bed" % k for k in ("div", "bid", "single"))
+    try:
+        merge_opposite_peaks(sig_file, candidate_bed, divergent_output_bed=outputs[0],
+                             bidirectional_output_bed=outputs[1], singleton_bed=outputs[2],
+                             fdr_target=fdr_target, stringent_only=stringent_only, tbx=tbx, **kwargs)
+    finally:
+        os.remove(sig_file)
+    return outputs
+
+
+def _pair_strands_by_chromosome(pool, strands):
+    """
+    `_pair_strand` for every strand in `strands` (its argument tuples), with the opposite-peak search split
+    into pool tasks of consecutive chromosomes instead of one task per strand. Writes the same files.
+    """
+    pending = []
+    for sample_prefix, label, anti_label, sig_bins, fdr_target, stringent_only, specific_suffix, kwargs in strands:
+        sig_file = sample_prefix + __SIG_PEAK_TPL__ % (specific_suffix, label)
+        with open(sig_file, "w") as f:
+            sig_bins.to_csv(f, sep="\t", index=False, header=False)
+        with open(sig_file, "r") as f:
+            lines = f.readlines()
+        # runs of consecutive lines on one chromosome (as merge_opposite_peaks reads the chromosome)
+        runs = []
+        for line in lines:
+            chrom = line.strip().split("\t")[0]
+            if runs and runs[-1][0] == chrom:
+                runs[-1][1].append(line)
+            else:
+                runs.append((chrom, [line]))
+        chunks = []
+        for chrom, run in runs:
+            if chunks and len(chunks[-1][1]) < _PAIR_CHUNK_LINES:
+                chunks[-1][0].append(chrom)
+                chunks[-1][1].extend(run)
+            else:
+                chunks.append(([chrom], list(run)))
+        candidate_bed = sample_prefix + "_%s.bed.gz" % anti_label
+        tasks = [pool.apply_async(_pair_chunk_task, (
+            chunk_lines, sorted(set(chroms)), candidate_bed, len(lines),
+            sample_prefix + "%s_sig_%s_part%d" % (specific_suffix, label, i), fdr_target, stringent_only, kwargs))
+            for i, (chroms, chunk_lines) in enumerate(chunks)]
+        outputs = tuple(sample_prefix + "%s_sig_%s_%s_peaks.bed" % (specific_suffix, label, k)
+                        for k in ("divergent", "bidirectional", "singletons"))
+        pending.append((sig_file, outputs, tasks))
+
+    generated_files = []
+    for sig_file, outputs, tasks in pending:
+        parts = [t.get() for t in tasks]
+        for i, output in enumerate(outputs):
+            with open(output, "wb") as out:
+                for part in parts:
+                    with open(part[i], "rb") as fh:
+                        shutil.copyfileobj(fh, out)
+        for part in parts:
+            for f in part:
+                os.remove(f)
+        generated_files += [sig_file] + list(outputs)
+    return generated_files
+
+
 def _bed_is_empty(path):
     """`BedTool(path).count() == 0`, stopping at the first feature (same rules for header and blank lines)."""
     return bed_ops.is_empty(path)
@@ -2415,7 +2543,7 @@ def pair(sample_prefix, df_dict, fdr_target, stringent_only, specific_suffix="",
     if pool is None:
         generated_files = sum((_pair_strand(*a) for a in strands), [])
     else:  # the strands only read each other's candidate files, written before pairing
-        generated_files = sum((r.get() for r in [pool.apply_async(_pair_strand, a) for a in strands]), [])
+        generated_files = _pair_strands_by_chromosome(pool, strands)
 
     for directionality in ("bidirectional", "divergent", "singletons"):
         exp_pl_file = sample_prefix + "%s_sig_pl_%s_peaks.bed" % (specific_suffix, directionality)
@@ -2991,6 +3119,7 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
                     n_significant,
                     is_strict_mode=__STRICT_QC__)
             continue
+        peak_tables = []
         for cov_dict, label, spb, strand_sign in zip(
                 (pl_cov_dict, chromosome_coverage_mn[rep]),
                 ("pl", "mn"), (subpeak_pl_beds, subpeak_mn_beds), ("+", "-")):
@@ -3006,9 +3135,11 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
                                                 fdr_target=fdr_target,
                                                 precomputed=precomputed.get((rep, label)),
                                                 **kwargs)
-
-            peak_df = pd.read_csv(peaks_bed, sep="\t", header=None, names=COMMON_HEADER)
-            peak_df = peak_df.loc[peak_df["end"] - peak_df["start"] < kwargs.get("window_size_threshold", 2000), :]
+            read_args = (peaks_bed, kwargs.get("window_size_threshold", 2000))
+            # the strands' tables are read in parallel on the pool (a pickled frame is an exact copy)
+            peak_tables.append((label, read_args if pool is None else pool.apply_async(_read_peak_table, read_args)))
+        for label, table in peak_tables:
+            peak_df = _read_peak_table(*table) if pool is None else table.get()
             n_significant += np.sum(peak_df["padj"] < fdr_target)
             df_dict[label] = peak_df
 

@@ -993,8 +993,10 @@ def independent_filtering(df, fdr_target=0.1, output_to=None, logger=None, **kwa
     pval_col = df["pval"]
     per_threshold = {}
     selected = None
-    for quantile in np.arange(0, 1, 0.005):
-        threshold = reads_col.quantile(quantile)
+    # all thresholds from one quantile call: pandas computes a scalar quantile as the list [q], so each value
+    # is bitwise the one a separate call returns
+    quantiles = np.arange(0, 1, 0.005)
+    for quantile, threshold in zip(quantiles, reads_col.quantile(quantiles).to_numpy()):
         hit = per_threshold.get(threshold) if threshold == threshold else None
         if hit is None:
             tmp_probe = reads_col > threshold
