@@ -2545,7 +2545,21 @@ def pair(sample_prefix, df_dict, fdr_target, stringent_only, specific_suffix="",
     else:  # the strands only read each other's candidate files, written before pairing
         generated_files = _pair_strands_by_chromosome(pool, strands)
 
-    for directionality in ("bidirectional", "divergent", "singletons"):
+    merges = [(sample_prefix, specific_suffix, (d,)) for d in ("bidirectional", "divergent", "singletons")]
+    if pool is None:
+        for a in merges:
+            _merge_strands(*a)
+    else:  # each writes its own output from its own two files
+        for r in [pool.apply_async(_merge_strands, a) for a in merges]:
+            r.get()
+    return (sample_prefix + "%s_bidirectional_peaks.bed" % specific_suffix,
+            sample_prefix + "%s_divergent_peaks.bed" % specific_suffix,
+            sample_prefix + "%s_unidirectional_peaks.bed" % specific_suffix), data_structure._make(generated_files)
+
+
+def _merge_strands(sample_prefix, specific_suffix, directionalities):
+    """Joins the two strands' files of each of `directionalities` into the sample's output file (for `pair`)."""
+    for directionality in directionalities:
         exp_pl_file = sample_prefix + "%s_sig_pl_%s_peaks.bed" % (specific_suffix, directionality)
         exp_mn_file = sample_prefix + "%s_sig_mn_%s_peaks.bed" % (specific_suffix, directionality)
         if os.path.exists(exp_pl_file) and os.path.exists(exp_mn_file):
@@ -2588,9 +2602,6 @@ def pair(sample_prefix, df_dict, fdr_target, stringent_only, specific_suffix="",
             else:  # BedTool.cat(pl, mn, postmerge=False).sort()
                 bed_ops.write_lines(bed_ops.sort_lines(bed_ops.cat_lines((exp_pl_file, exp_mn_file))),
                                     sample_prefix + "%s_unidirectional_peaks.bed" % specific_suffix)
-    return (sample_prefix + "%s_bidirectional_peaks.bed" % specific_suffix,
-            sample_prefix + "%s_divergent_peaks.bed" % specific_suffix,
-            sample_prefix + "%s_unidirectional_peaks.bed" % specific_suffix), data_structure._make(generated_files)
 
 
 def annotate_tre_with_epig_info(peak_file, epig_bigbed_file, only_annotated_records=False, placeholders={}):

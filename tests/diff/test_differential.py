@@ -390,9 +390,9 @@ def test_pair(seed, stringent, min_len, div_min):
     same(res[0], res[1])
 
 
-@pytest.mark.parametrize("empty_strand", [None, "pl", "mn"])
+@pytest.mark.parametrize("empty_strand", [None, "pl", "mn", "both"])
 def test_pair_on_pool_matches_ref(empty_strand):
-    """Strands paired in parallel on a pool (including a strand without significant peaks) == pints_ref."""
+    """Strands paired and merged in parallel on a pool (including strands without significant peaks) == pints_ref."""
     rng = np.random.default_rng(17)
     dfs = {}
     for strand, lab in (("+", "pl"), ("-", "mn")):
@@ -400,7 +400,7 @@ def test_pair_on_pool_matches_ref(empty_strand):
         s = np.sort(rng.choice(200_000, n, replace=False))
         e = s + rng.integers(1, 100, n)
         padj = np.where(rng.random(n) < 0.4, rng.uniform(0, 0.05, n), rng.uniform(0, 1, n))
-        if lab == empty_strand:
+        if empty_strand in (lab, "both"):
             padj = rng.uniform(0.2, 1, n)
         dfs[lab] = pd.DataFrame({"chromosome": "chr1", "start": s, "end": e, "name": ".", "padj": padj,
                                  "strand": strand, "reads": rng.integers(1, 100, n), "pval": padj / 3,
