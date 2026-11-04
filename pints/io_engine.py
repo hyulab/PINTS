@@ -923,7 +923,7 @@ def peak_bed_to_gtf(pl_df, mn_df, save_to, version=""):
     result["feature"] = "peak"
     result["frame"] = 0
     result["start"] += 1
-    result.sort_values(by=["chromosome", "start"], inplace=True)
+    result = result.sort_values(by=["chromosome", "start"])
     result.loc[:, ("chromosome", "source", "feature",
                    "start", "end", "padj", "strand",
                    "frame", "attribute")].to_csv(save_to,
