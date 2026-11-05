@@ -1540,7 +1540,7 @@ def evaluate_strand_jobs(jobs, fdr_target, pool=None, thread_n=1, **kwargs):
     # ---- phase 2: local-environment tests, in independent chunks
     total2 = sum(len(c["lines"]) for c in ctxs if c["error"] is None)
     target = max(_MIN_P2_CHUNK, total2 // (workers * 8) + 1) if pool is not None else 0
-    p2_tasks, p2_owner = [], []
+    p2_tasks, p2_owner, p2_costs = [], [], []
     for ui, (u, c) in enumerate(zip(units, ctxs)):
         if c["error"] is not None:
             continue
@@ -1559,10 +1559,13 @@ def evaluate_strand_jobs(jobs, fdr_target, pool=None, thread_n=1, **kwargs):
             p2_tasks.append((u[2], u[1], lines[lo:hi], context, slim, fdr_target, disable_ler, sensitive,
                              fc_cutoff, init_dens_cutoff, init_height_cutoff, None, bounds))
             p2_owner.append(ui)
+            # a chunk's run time follows the subpeaks' total width more closely than their number (dense
+            # chromosomes such as chrEBV cost about twice as much per subpeak and cannot be split further)
+            p2_costs.append(int((index.end_arr[lo:hi] - index.start_arr[lo:hi]).sum()))
     _phase("phase2 setup")
     if pool is not None:
         start_deferred_releases()  # the tests below write no files
-    p2_res = _run_tasks(pool, _check_window_block, p2_tasks, costs=[len(t[2]) for t in p2_tasks])
+    p2_res = _run_tasks(pool, _check_window_block, p2_tasks, costs=p2_costs)
     _phase("phase2 tests")
     for r in pending_index:
         r.get()
