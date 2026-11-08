@@ -29,6 +29,16 @@ def _npys(d):
     return [f for f in os.listdir(d) if f.endswith(".npy")]
 
 
+def _make_stale(dumps):
+    """Rewrite dumps with other values (every element differs), as if left by a run on another input; returns
+    their bytes."""
+    for d in dumps:
+        for f in d.values():
+            a = np.load(f)
+            np.save(f, ((a + 1) % 2).astype(a.dtype))
+    return {f: open(f, "rb").read() for d in dumps for f in d.values()}
+
+
 @SLOW
 @given(mixed_reads(), st.sampled_from(LIBS), st.booleans(), st.sampled_from([1, 3]),
        st.sampled_from([(), ("ctg",)]), st.booleans())
@@ -76,21 +86,21 @@ def test_bam_region_tracks_equal_reference_dumps(rr, lib, threads, span, seed):
 
 @SLOW
 @given(mixed_reads(), st.sampled_from(["PROcap", "R2_3"]))
-def test_bam_tracks_from_the_npy_cache(rr, lib):
-    """Dumps left in the output directory are reused (as tracks) and reported for deletion."""
+def test_bam_tracks_ignore_old_dumps(rr, lib):
+    """Dumps left in the output directory with the same prefix are neither read nor touched."""
     contigs, reads = rr
     with tempfile.TemporaryDirectory() as d:
         bam = make_bam(os.path.join(d, "x.bam"), contigs, reads)
-        out = os.path.join(d, "a"); os.makedirs(out)
-        dumps = io.get_read_signal(bam, lib, "", out, "p")
-        before = sorted(_npys(out))
+        out, fresh = os.path.join(d, "a"), os.path.join(d, "b")
+        os.makedirs(out); os.makedirs(fresh)
+        dumps = io.get_read_signal(bam, lib, "", fresh, "p")
+        stale = _make_stale(io.get_read_signal(bam, lib, "", out, "p")[:2])
         pl, mn, total, cache = io._read_signal(bam, lib, "", out, "p", as_tracks=True)
-        ref = rio.get_read_signal(bam, lib, "", out, "p")  # the reference also reads the cache
-        same(total, ref[2])
+        same(total, dumps[2])
         _assert_tracks_equal_dumps(pl, dumps[0])
         _assert_tracks_equal_dumps(mn, dumps[1])
-        assert sorted(cache) == sorted(list(dumps[0].values()) + list(dumps[1].values()))
-        assert sorted(_npys(out)) == before
+        assert cache == []
+        assert {f: open(f, "rb").read() for f in stale} == stale
 
 
 # ------------------------------------------------------------------ bigWig
@@ -148,7 +158,7 @@ def test_bigwig_tracks_equal_reference_dumps(seed, vmax, threads, prefix_filter,
         io._bw_track_runs = old_runs
 
 
-def test_bigwig_tracks_without_numpy_and_from_cache(monkeypatch):
+def test_bigwig_tracks_without_numpy_and_ignoring_old_dumps(monkeypatch):
     import pyBigWig
     rng = np.random.default_rng(5)
     chroms = [("chr1", 3000), ("chr2", 500)]
@@ -165,13 +175,14 @@ def test_bigwig_tracks_without_numpy_and_from_cache(monkeypatch):
                 same(total, ref[2])
                 _assert_tracks_equal_dumps(pl, ref[0]); _assert_tracks_equal_dumps(mn, ref[1])
                 assert cache == [] and _npys(a) == []
-            dumps = io.get_coverage_bw(p, m, "", a, "q")  # leaves dumps: the cache
+            stale = _make_stale(io.get_coverage_bw(p, m, "", a, "q")[:2])  # dumps left with the same prefix
             for numpy_flag, threads in ((0, 1), (1, 1), (1, 3)):
                 monkeypatch.setattr(pyBigWig, "numpy", numpy_flag)
                 pl, mn, total, cache = io._coverage_bw(p, m, "", a, "q", threads=threads, as_tracks=True)
                 same(total, ref[2])
                 _assert_tracks_equal_dumps(pl, ref[0]); _assert_tracks_equal_dumps(mn, ref[1])
-                assert sorted(cache) == sorted(list(dumps[0].values()) + list(dumps[1].values()))
+                assert cache == []
+                assert {f: open(f, "rb").read() for f in stale} == stale
 
 
 # ------------------------------------------------------------------ replicate merge

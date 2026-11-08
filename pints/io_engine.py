@@ -485,7 +485,7 @@ def _get_coverage_bw(bw_file, chromosome_startswith, output_dir, output_prefix, 
         if chromosome.startswith(chromosome_startswith):
             fn = os.path.join(output_dir, "%s_%s" % (output_prefix, chromosome))
             chromosome_coverage[chromosome] = fn + ".npy"
-            if not os.path.exists(chromosome_coverage[chromosome]):
+            if as_tracks or not os.path.exists(chromosome_coverage[chromosome]):
                 if pyBigWig.numpy:
                     _chromosome_cov = np.nan_to_num(bw.values(chromosome, 0, csize, numpy=True))
                 else:
@@ -500,10 +500,6 @@ def _get_coverage_bw(bw_file, chromosome_startswith, output_dir, output_prefix, 
                     np.save(fn, _chromosome_cov)
             else:
                 _chromosome_cov = np.load(chromosome_coverage[chromosome])
-                if as_tracks:
-                    from .coverage_store import track_from_dense
-                    cache_files.append(chromosome_coverage[chromosome])
-                    chromosome_coverage[chromosome] = track_from_dense(_chromosome_cov)
             read_counts += np.sum(_chromosome_cov)
             chrom_size_list.append((chromosome, csize))
             chromosome_pre_accessible_dict[chromosome] = []
@@ -662,15 +658,11 @@ def _bw_dense_points(bw, chromosome, csize, data_type, block, bw_file=None):
 
 def _bw_chrom_track(bw_file, chromosome, csize, data_type, npy_file, block=None):
     """
-    `_bw_chrom_worker` without the dump: (sum, (starts, ends, values), cache_file). ends is None for the points
-    form. An existing dump (the cache) is loaded instead and returned as cache_file.
+    `_bw_chrom_worker` without the dump: (sum, (starts, ends, values), None). ends is None for the points form.
+    An existing dump at `npy_file` is not read (the store never reads dumps).
     """
     import pyBigWig
-    from .coverage_store import track_from_npy
     block = _BW_BLOCK if block is None else block
-    if os.path.exists(npy_file):
-        t = track_from_npy(npy_file)
-        return np.load(npy_file).sum(), (t.starts, t.ends, t.values), npy_file
     bw = pyBigWig.open(bw_file)
     try:
         runs = _bw_track_runs(bw, chromosome, int(csize), data_type, bw_file=bw_file)
@@ -1190,10 +1182,13 @@ def _read_signal(input_bam, loc_prime, chromosome_startswith, output_dir, output
             del tmp
         return flag, read_counts
 
-    lcf, rc = load_signal_from_cache(chromosome_coverage_pl, result_pl, direction="pl")
-    lcf1, rc1 = load_signal_from_cache(chromosome_coverage_mn, result_mn, direction="mn")
-    load_cache_flag = 1 if lcf and lcf1 else 0
-    read_counts = rc + rc1
+    if as_tracks:  # the store never reads dumps: ones left in the output directory may come from another input
+        load_cache_flag, read_counts = 0, 0
+    else:
+        lcf, rc = load_signal_from_cache(chromosome_coverage_pl, result_pl, direction="pl")
+        lcf1, rc1 = load_signal_from_cache(chromosome_coverage_mn, result_mn, direction="mn")
+        load_cache_flag = 1 if lcf and lcf1 else 0
+        read_counts = rc + rc1
 
     fast = None
     if not load_cache_flag and kwargs.get("fast_bam", True):
@@ -1206,12 +1201,6 @@ def _read_signal(input_bam, loc_prime, chromosome_startswith, output_dir, output
     if load_cache_flag:
         logger.info("Loading cache from previous result, if you want to re-parse the bam file, "
                     "please delete all files end with npy first.")
-        if as_tracks:
-            from .coverage_store import track_from_npy
-            for d in (result_pl, result_mn):
-                cache_files.extend(d.values())
-                for chrom in d:
-                    d[chrom] = track_from_npy(d[chrom])
     elif fast is not None:
         result_pl, result_mn, read_counts = fast
     else:
