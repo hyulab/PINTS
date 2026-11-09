@@ -2612,7 +2612,7 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
                 n_significant += np.sum(peak_df["padj"] < fdr_target)
                 df_dict[label] = peak_df
             deferred_pairing[rep] = (n_significant, pool.apply_async(
-                _pair_task, (sample_prefix, df_dict, fdr_target, kwargs.get("stringent_only", False), kwargs)))
+                _pair_task, (sample_prefix, df_dict, fdr_target, _stringent_only(kwargs), kwargs)))
     # peak calling (IQR)
     for rep, pl_cov_dict in enumerate(chromosome_coverage_pl):
         logger.info("Working on sample %d" % (rep + 1))
