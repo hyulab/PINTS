@@ -2900,7 +2900,10 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
                                                                    (ued_coverage_pl, ued_coverage_mn),
                                                                    ("+", "-"), ("pl", "mn")):
             ued_keys.append((target_dict, chromosome))
-            ued_tasks.append((chrom_coverage, chromosome, sign, prefix + "_{0}.bed".format(strand_short),
+            # each task gets only its chromosome's entries: pickling every sample's whole dict into each of
+            # (contigs x 2) tasks cost seconds on references with thousands of contigs (registry keys pickle slowly)
+            task_coverage = [{chromosome: cd[chromosome]} if chromosome in cd else {} for cd in chrom_coverage]
+            ued_tasks.append((task_coverage, chromosome, sign, prefix + "_{0}.bed".format(strand_short),
                               kwargs.get("donor_tolerance", 0.3), kwargs.get("peak_distance", 1),
                               kwargs.get("ce_trigger", 3), kwargs.get("peak_width", None)))
             ued_costs.append(_coverage_cost(chrom_coverage, chromosome))
