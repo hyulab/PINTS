@@ -25,6 +25,12 @@ Alternatively, you can clone this repo to a local directory, then run the follow
 python setup.py install
 ```
 
+Two optional extras add packages that PINTS can use but does not need:
+
+* `pip install 'pyPINTS[fast]'` installs [Numba](https://numba.pydata.org), which compiles the statistical kernels
+  used during peak calling. Results are the same with and without it; only the run time differs.
+* `pip install 'pyPINTS[plots]'` installs matplotlib, which `--debug` needs for its diagnostic plots.
+
 ## Get started
 
 PINTS can call peaks from either bigWig or BAM files. If you have signals for the forward and reverse strands in
