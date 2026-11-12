@@ -34,7 +34,7 @@ __EXTENDED_DISTAL_FILE_TPL__ = "_element_{de_tag}bp_e.bed"
 
 
 def main(input_file, layout, div_file, bid_file, single_file, divergent_extension=(60, 60),
-         unidirectional_extension=(60, 60), promoter_bed=None):
+         unidirectional_extension=(60, 60), promoter_bed=None, save_to=None):
     """
     Extend boundaries
 
@@ -56,23 +56,22 @@ def main(input_file, layout, div_file, bid_file, single_file, divergent_extensio
         BPs to be extended for unidirectional peaks
     promoter_bed : str or None
         Path to a bed file which defines promoter regions
+    save_to : str or None
+        Folder for the extended elements (and the temporary coverage files). None: next to the peak calls
 
     Returns
     -------
     None
     """
 
-    de_tag = "_".join(set(map(str, divergent_extension)))
-    parent_path = os.path.dirname(div_file)
+    de_tag = "_".join(dict.fromkeys(map(str, divergent_extension)))  # left, then right; each distinct value once
+    parent_path = save_to if save_to is not None else os.path.dirname(div_file)
     if isinstance(input_file, str):
         log_assert(layout is not None,
                    "Please specify which type of experiment this data was generated from with --exp-type", logger)
         pl, mn, _ = get_read_signal(input_file, loc_prime=layout, chromosome_startswith="chr",
                                     output_dir=parent_path, output_prefix=str(os.getpid()))
     else:
-        log_assert(len(input_file[0]) == len(input_file[1]),
-                   "Must provide the same amount of bigwig files for both strands", logger)
-
         pl, mn, _ = get_coverage_bw(bw_pl=input_file[0], bw_mn=input_file[1],
                                     chromosome_startswith="chr",
                                     output_dir=parent_path,
@@ -84,6 +83,9 @@ def main(input_file, layout, div_file, bid_file, single_file, divergent_extensio
     bid = bid.loc[np.logical_or(bid[0].isin(pl), bid[0].isin(mn)), :]
     single = pd.read_csv(single_file, sep="\t", header=None)
     single = single.loc[np.logical_or(single[0].isin(pl), single[0].isin(mn)), :]
+    if save_to is not None:  # from here on, the *_file names only name the extended elements
+        div_file, bid_file, single_file = (os.path.join(save_to, os.path.basename(f))
+                                           for f in (div_file, bid_file, single_file))
     div["pl_summit"] = "0"
     div["mn_summit"] = "0"
     div["element_start"] = 0
@@ -236,10 +238,10 @@ def extend(args):
                      groups["divergent_calls"], groups["bidirectional_calls"], groups["unidirectional_calls"],
                      divergent_extension=(args.div_ext_left[j], args.div_ext_right[j]),
                      unidirectional_extension=(args.unidirectional_ext_left[j], args.unidirectional_ext_right[j]),
-                     promoter_bed=args.promoter_bed)
+                     promoter_bed=args.promoter_bed, save_to=args.save_to)
             else:
                 main((args.bw_pl[i - 1], args.bw_mn[i - 1]), None,
                      groups["divergent_calls"], groups["bidirectional_calls"], groups["unidirectional_calls"],
                      divergent_extension=(args.div_ext_left[j], args.div_ext_right[j]),
                      unidirectional_extension=(args.unidirectional_ext_left[j], args.unidirectional_ext_right[j]),
-                     promoter_bed=args.promoter_bed)
+                     promoter_bed=args.promoter_bed, save_to=args.save_to)

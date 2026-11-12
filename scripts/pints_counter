@@ -255,5 +255,5 @@ if __name__ == "__main__":
         pl_bws=args.pl_bws, conditions=args.conditions, condition_names=args.condition_names,
         replications=args.replicates, save_to=args.save_to,
         unidirectional_calls=args.unidirectional_calls, mn_bws=args.mn_bws,
-        print_deseq2=args.deseq2
+        max_dist=args.max_dist, print_deseq2=args.deseq2
     )

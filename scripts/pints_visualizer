@@ -259,7 +259,9 @@ if __name__ == "__main__":
     parser.add_argument("--chromosome-start-with", action="store", dest="chromosome_startswith",
                         type=str, required=False, default="chr",
                         help="Only keep reads mapped to chromosomes with this prefix")
-    parser.add_argument("-o", "--output-prefix", action="store", type=str)
+    parser.add_argument("-o", "--output-prefix", action="store", type=str,
+                        help="Output goes to <prefix>_pl.bw and <prefix>_mn.bw. "
+                             "Default: the BAM file name without .bam, in the current directory")
     parser.add_argument("-f", "--filters", action="store", type=str, nargs="*",
                         help="reads from chromosomes whose names contain any matches in filters will be ignored")
     parser.add_argument("-n", "--norm-fact", action="store", default=1., type=float,
@@ -270,8 +272,10 @@ if __name__ == "__main__":
     parser.add_argument("-v", "--version", action="version", version=__version__)
 
     args = parser.parse_args()
+    if args.output_prefix is None:
+        args.output_prefix = os.path.splitext(os.path.basename(args.bam))[0]
 
-    DEFAULT_PREFIX = "visualizing_" + datetime.datetime.now().strftime("%Y_%M_%d_%H_%M_%S")
+    DEFAULT_PREFIX = "visualizing_" + datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
     logger.addHandler(logging.FileHandler("{0}.log".format(DEFAULT_PREFIX)))
     logger.info("PINTS version: {0}".format(__version__))
     logger.info("Command: {0}".format(" ".join(sys.argv)))
