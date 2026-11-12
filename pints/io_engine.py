@@ -62,6 +62,24 @@ def determine_data_type(max_value):
     return data_type
 
 
+def _warn_fractional(values, bw_file, chromosome):
+    """PINTS models integer read counts; non-integer bigWig values are truncated by the integer cast.
+
+    Logs a warning (results are unchanged) so that normalised (CPM/RPM) tracks are not used silently.
+    Returns True if fractional values were found.
+    """
+    v = np.asarray(values)
+    if v.dtype.kind not in "fc":
+        return False
+    v = v[np.isfinite(v)]
+    if np.any(v != np.trunc(v)):
+        logging.getLogger(__logger_name__).warning(
+            "BigWig %s (%s) contains non-integer (float) values; PINTS expects raw read counts and truncates them "
+            "to integers. Please provide unnormalised bigWig files." % (bw_file, chromosome))
+        return True
+    return False
+
+
 def _get_coverage_bw(bw_file, chromosome_startswith, output_dir, output_prefix):
     """
     Get coverage information from bigwig files
@@ -110,6 +128,7 @@ def _get_coverage_bw(bw_file, chromosome_startswith, output_dir, output_prefix):
                     _chromosome_cov = np.nan_to_num(bw.values(chromosome, 0, csize, numpy=True))
                 else:
                     _chromosome_cov = np.nan_to_num(bw.values(chromosome, 0, csize))
+                _warn_fractional(_chromosome_cov, bw_file, chromosome)
                 _chromosome_cov[_chromosome_cov < 0] *= -1
                 _chromosome_cov = _chromosome_cov.astype(data_type, copy=False)
                 np.save(fn, _chromosome_cov)
