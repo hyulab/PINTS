@@ -1435,15 +1435,15 @@ def pair(sample_prefix, df_dict, fdr_target, stringent_only, specific_suffix="",
                                                                     "confidence"))
                 for str_col in ("tss_fwd", "tss_fwd_vals", "tss_rev", "tss_rev_vals"):
                     pri_merged_df[str_col] = pri_merged_df[str_col].astype(str)
-                fwd_tss_cols = pri_merged_df["tss_fwd"].str.split(",", expand=True).fillna(value=-1).astype(int)
-                fwd_tss_val_cols = pri_merged_df["tss_fwd_vals"].str.split(",", expand=True).fillna(value=-1).astype(
+                fwd_tss_cols = pri_merged_df["tss_fwd"].str.split(",", expand=True).fillna(value="-1").astype(int)
+                fwd_tss_val_cols = pri_merged_df["tss_fwd_vals"].str.split(",", expand=True).fillna(value="-1").astype(
                     int)
                 max_index = fwd_tss_val_cols.idxmax(axis=1)
                 pri_merged_df["tss_fwd"] = fwd_tss_cols.values[np.arange(fwd_tss_cols.shape[0]), max_index]
                 pri_merged_df["tss_fwd_val"] = fwd_tss_val_cols.values[np.arange(fwd_tss_cols.shape[0]), max_index]
 
-                rev_tss_cols = pri_merged_df["tss_rev"].str.split(",", expand=True).fillna(value=-1).astype(int)
-                rev_tss_val_cols = pri_merged_df["tss_rev_vals"].str.split(",", expand=True).fillna(value=-1).astype(
+                rev_tss_cols = pri_merged_df["tss_rev"].str.split(",", expand=True).fillna(value="-1").astype(int)
+                rev_tss_val_cols = pri_merged_df["tss_rev_vals"].str.split(",", expand=True).fillna(value="-1").astype(
                     int)
                 max_index = rev_tss_val_cols.idxmax(axis=1)
                 pri_merged_df["tss_rev"] = rev_tss_cols.values[np.arange(rev_tss_cols.shape[0]), max_index]
