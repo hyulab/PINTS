@@ -25,7 +25,6 @@ from pints import __version__
 try:
     import pysam
     import numpy as np
-    from Bio import SeqIO
     from pints.io_engine import log_assert
 
     from importlib.util import spec_from_loader, module_from_spec
@@ -81,8 +80,8 @@ def spikein_normalization(bam_files, spike_ins, exp_type, output_dir, cell_nums=
     else:
         cell_nums = np.ones(len(bam_files))
 
-    for spikein in SeqIO.parse(spike_ins, "fasta"):
-        spike_in_IDs.add(spikein.id)
+    for spikein in pysam.FastxFile(spike_ins):
+        spike_in_IDs.add(spikein.name)
     for sample_index, bam in enumerate(bam_files):
         _pysam_obj = pysam.AlignmentFile(bam)
         for read in _pysam_obj:
