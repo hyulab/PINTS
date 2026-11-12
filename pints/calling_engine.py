@@ -568,7 +568,7 @@ def cut_peaks_dry_run(annotation_gtf, pl_cov_files, mn_cov_files, tss_extension=
 
 
 def cut_peaks(window, donor_tolerance, ce_trigger, join_distance=1, peak_rel_height=1.,
-              max_distance=30):
+              max_distance=30, peak_width=None):
     """
     Cut peaks from the given window
 
@@ -586,12 +586,18 @@ def cut_peaks(window, donor_tolerance, ce_trigger, join_distance=1, peak_rel_hei
         Used for calculation of the peaks width, thus it is only used if width is given.
     max_distance : int
         max distance between two subpeaks to be joined, by default, 20
+    peak_width : int or None
+        Required width of peaks in samples (`width` of scipy.signal.find_peaks, measured at peak_rel_height).
+        None (default) applies no width requirement.
     Returns
     -------
     merged_intervals : list
         List of tuples of merged intervals [(start_1, end_1), ... , (start_n, end_n)]
     """
-    peaks, _ = find_peaks(window, rel_height=peak_rel_height)
+    if peak_width is None:
+        peaks, _ = find_peaks(window, rel_height=peak_rel_height)
+    else:
+        peaks, _ = find_peaks(window, rel_height=peak_rel_height, width=peak_width)
     _, _, starts, ends = peak_widths(window, peaks, rel_height=peak_rel_height)
     intervals = []
     for k, start in enumerate(starts):
@@ -948,12 +954,26 @@ def peaks_single_strand(per_base_cov, output_file, shared_peak_definitions, stra
 
     sub_dfs = [sdf for sdf in sub_dfs if sdf is not None]
     log_assert(len(sub_dfs) > 0, "No signal found across all chromosomes!", logger)
-    tmp_df = pd.concat(sub_dfs)
+    tmp_df = _concat_result_frames(sub_dfs)
 
     if kwargs.get("output_diagnostics", False):
         tmp_df.to_csv(output_file.replace(".bed", "_debug.csv"), index=False)
 
     return stratified_filtering(tmp_df=tmp_df, output_file=output_file, fdr_target=fdr_target, **kwargs)
+
+
+def _concat_result_frames(sub_dfs):
+    """
+    Concatenate per-chromosome result frames, leaving out empty ones.
+
+    A chromosome without any testable peak yields an empty frame whose columns are all object dtype.
+    Concatenating it with the other frames upcasts every integer column (start, end, reads, ...) to
+    object, which makes the quantiles in `independent_filtering` run on object arrays (tens of times
+    slower). Empty frames contribute no rows, so leaving them out changes only the dtypes, not the
+    values or their order.
+    """
+    non_empty = [sdf for sdf in sub_dfs if sdf.shape[0] > 0]
+    return pd.concat(non_empty if non_empty else sub_dfs)
 
 
 def merge_opposite_peaks(sig_peak_bed, peak_candidate_bed, divergent_output_bed, bidirectional_output_bed,
@@ -1180,7 +1200,7 @@ def show_parameter_info(input_bam, **kwargs):
 
 
 def unified_element_definition(coverage_dict, chromosome_of_interest, strand_sign, output_file,
-                               join_distance=1, ce_donor=1.0, ce_trigger=3):
+                               join_distance=1, ce_donor=1.0, ce_trigger=3, peak_width=None):
     """
     Unified element boundary definition
     If multiple replicates are present, then this function will merge all signal tracks together
@@ -1231,7 +1251,8 @@ def unified_element_definition(coverage_dict, chromosome_of_interest, strand_sig
             sub_peaks = cut_peaks(merged_coverage[row.start:row.end],
                                   donor_tolerance=ce_donor,
                                   ce_trigger=ce_trigger,
-                                  join_distance=join_distance)
+                                  join_distance=join_distance,
+                                  peak_width=peak_width)
             for sp in sub_peaks:
                 start = sp[0] + row.start
                 end = sp[1] + row.start
@@ -1348,6 +1369,16 @@ def get_epig_annotation(annotation_source, output_dir):
     return dst
 
 
+def _highlight_chromosome(kwargs):
+    """`--focused-chrom` is stored as `focused_chrom` by the CLI; `highlight_chromosome` by the API."""
+    return kwargs.get("highlight_chromosome", kwargs.get("focused_chrom", "chr1"))
+
+
+def _stringent_only(kwargs):
+    """`--stringent-pairs-only` is stored as `stringent_pairs_only` by the CLI; `stringent_only` by the API."""
+    return bool(kwargs.get("stringent_only", kwargs.get("stringent_pairs_only", False)))
+
+
 def pair(sample_prefix, df_dict, fdr_target, stringent_only, specific_suffix="", **kwargs):
     """
 
@@ -1421,10 +1452,11 @@ def pair(sample_prefix, df_dict, fdr_target, stringent_only, specific_suffix="",
                 tmp_mn_bed = BedTool(exp_mn_file)
                 if tmp_pl_bed.count() == 0 and tmp_mn_bed.count() == 0:
                     continue
-                elif tmp_pl_bed.count() == 0:
-                    pri_merged_file = tmp_mn_bed
-                elif tmp_mn_bed.count() == 0:
-                    pri_merged_file = tmp_pl_bed
+                elif tmp_pl_bed.count() == 0 or tmp_mn_bed.count() == 0:
+                    # only one strand produced pairs: merge it on its own (previously the raw 16-column
+                    # records were parsed with 8 names, giving a malformed BED)
+                    pri_merged_file = (tmp_mn_bed if tmp_pl_bed.count() == 0 else tmp_pl_bed).sort().merge(
+                        c=(12, 13, 14, 15, 16), o=("collapse", "collapse", "collapse", "collapse", "distinct"))
                 else:
                     pri_merged_file = BedTool.cat(*[BedTool(exp_pl_file),
                                                     BedTool(exp_mn_file)],
@@ -1778,7 +1810,7 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
     subpeak_pl_beds = {}
     subpeak_mn_beds = {}
     if kwargs.get("annotation_gtf", None) is not None:
-        highlight_chromosome = kwargs.get("highlight_chromosome", "chr1")
+        highlight_chromosome = _highlight_chromosome(kwargs)
         log_assert(os.path.exists(kwargs.get("annotation_gtf", None)), "Cannot find gene annotation file", logger)
         if highlight_chromosome in chromosome_coverage_pl[0]:
             kwargs["donor_tolerance"] = cut_peaks_dry_run(kwargs.get("annotation_gtf", None), chromosome_coverage_pl,
@@ -1797,7 +1829,8 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
                                                                  prefix + "_{0}.bed".format(strand_short),
                                                                  ce_donor=kwargs.get("donor_tolerance", 0.3),
                                                                  join_distance=kwargs.get("peak_distance", 1),
-                                                                 ce_trigger=kwargs.get("ce_trigger", 3))
+                                                                 ce_trigger=kwargs.get("ce_trigger", 3),
+                                                                 peak_width=kwargs.get("peak_width", None))
 
             if target_dict[chromosome] is not None:
                 housekeeping_files.append(target_dict[chromosome])
@@ -1859,7 +1892,7 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
 
         logger.info("Pairing peaks")
         (bid, div, unid), gc = pair(sample_prefix, df_dict=df_dict, fdr_target=fdr_target,
-                                    stringent_only=kwargs.get("stringent_only", False), **kwargs)
+                                    stringent_only=_stringent_only(kwargs), **kwargs)
         # reformat unidirectional output
         unid_df = pd.read_csv(unid, sep="\t", names=COMMON_HEADER)
         unid_df[["chromosome", "start", "end", "name", "padj", "strand",
@@ -1881,7 +1914,7 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
 
             relaxed_fdr = kwargs.get("relaxed_fdr_target", fdr_target * 2)
             (r_bid, r_div, r_unid), r_gc = pair(sample_prefix, df_dict=df_dict, fdr_target=relaxed_fdr,
-                                                stringent_only=kwargs.get("stringent_only", False),
+                                                stringent_only=_stringent_only(kwargs),
                                                 specific_suffix="_EA", **kwargs)
             r_unid_df = pd.read_csv(r_unid, sep="\t", names=COMMON_HEADER)
             r_unid_df[["chromosome", "start", "end", "name", "padj", "strand",
