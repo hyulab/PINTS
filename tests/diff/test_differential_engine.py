@@ -236,6 +236,40 @@ def test_tabix_fallback_path_equals_ref(monkeypatch, tiny_chunks):
         same(_run_pss(ce, da, covs, "+", dict(thread_n=3)), _run_pss(rce, db, covs, "+", dict(thread_n=1)))
 
 
+
+def _shuffle_spd(spd, seed):
+    """Rewrite each element-definition file with its records in a random order, so that phase 1's subpeak lines
+    are unsorted and the engine has to take the tabix fallback."""
+    import gzip
+    rng = np.random.default_rng(seed)
+    for path in spd.values():
+        if path is None:
+            continue
+        with gzip.open(path, "rt") as fh:
+            lines = fh.readlines()
+        lines = [lines[i] for i in rng.permutation(len(lines))]
+        with gzip.open(path, "wt") as fh:
+            fh.writelines(lines)
+        if os.path.exists(path + ".csi"):
+            os.remove(path + ".csi")
+
+
+@pytest.mark.parametrize("threads", [1, 3])
+def test_tabix_fallback_on_unsorted_subpeaks_equals_ref(tiny_chunks, threads):
+    """With unsorted subpeak lines the in-memory index is not supported; phase 2 must then test the subpeaks
+    in the order of the sorted, compressed subpeak bed, as the reference does."""
+    _globals()
+    covs = _covs(11)
+    outs = []
+    for mod, kw in ((ce, dict(thread_n=threads)), (rce, dict(thread_n=1))):
+        with tempfile.TemporaryDirectory() as d:
+            files = _write(d, covs)
+            spd = _spd(mod, d, files, "+")
+            _shuffle_spd(spd, 5)
+            outs.append(file_bytes(mod.peaks_single_strand(files, os.path.join(d, "s_1_pl.bed"), spd, "+", 0.1, **kw)))
+    same(outs[0], outs[1])
+
+
 # ------------------------------------------------------------------ subpeak beds kept in memory
 def _subpeak_files(d, prefix):
     return sorted(f for f in os.listdir(d) if f.startswith(prefix + "_subpeaks_"))

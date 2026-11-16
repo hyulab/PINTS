@@ -747,6 +747,8 @@ def check_window_chromosome(rc_file, output_file, strand_sign, chromosome_name, 
                           disable_qc=disable_qc, enable_eler=enable_eler, eler_min=eler_min)
     bins = []
     if ctx["error"] is None:
+        if not ctx["index"].is_supported():
+            _sorted_subpeaks(ctx)
         bins, err = _check_window_block(rc_file, chromosome_name, ctx["lines"], ctx["lines"], ctx,
                                         fdr_target, disable_ler, sensitive, fc_cutoff, init_dens_cutoff,
                                         init_height_cutoff,
@@ -1054,6 +1056,15 @@ def _read_subpeak_input(subpeak_file):
     opener = gzip.open if subpeak_file.endswith(".gz") else open  # plain from the pipeline's element definition
     with opener(subpeak_file, "rt") as peak_obj:
         return peak_obj.readlines()
+
+
+def _sorted_subpeaks(ctx):
+    """Tabix fallback (`ctx["index"]` does not support the lines): phase 2 tests the subpeaks in the order of the
+    sorted, compressed subpeak bed, as the original loop over that file did, so `ctx`'s lines and index are
+    replaced by that file's."""
+    lines = _read_subpeak_input(ctx["subpeak_bed"] + ".gz")
+    ctx["lines"] = lines
+    ctx["index"] = SubpeakIndex(ctx["chromosome"], lines)
 
 
 def _subpeak_thresholds(output_file, chromosome_name, subpeak_file, out_lines, all_peak_mus, error,
@@ -1547,12 +1558,13 @@ def evaluate_strand_jobs(jobs, fdr_target, pool=None, thread_n=1, **kwargs):
     for ui, (u, c) in enumerate(zip(units, ctxs)):
         if c["error"] is not None:
             continue
-        lines = c["lines"]
-        index = c["index"]
-        if not index.is_supported():  # tabix fallback reads the compressed subpeak bed
+        if not c["index"].is_supported():  # tabix fallback reads the compressed subpeak bed
             for r in pending_index:
                 r.get()
             pending_index = []
+            _sorted_subpeaks(c)
+        lines = c["lines"]
+        index = c["index"]
         slim = {k: v for k, v in c.items() if k not in ("lines", "index")}
         for lo, hi in (_segment_chunks(lines, target, index) if index.is_supported() else [(0, len(lines))]):
             if lo == 0 and hi == len(lines):
