@@ -1321,20 +1321,27 @@ def get_epig_annotation(annotation_source, output_dir):
     Parameters
     ----------
     annotation_source : str
-        Biosample name or a path to a local bigBed file
+        Biosample name or a path to a local bigBed file. A path to an existing file is used as is; anything else
+        is looked up on the PINTS web server.
     output_dir : str
         Download annotation to this directory, if necessary
 
     Returns
     -------
     dst : str
-        "" if no annotation is not available or a path to a bigBed file
+        "" if no annotation is available (the lookup or download failed, or the server has none for this
+        biosample), otherwise a path to a bigBed file
     """
-    # figure out what's the source
-    # first assume it's from PINTS webserver
+    if annotation_source is None or annotation_source == "":
+        logger.warning("No epigenomic annotation source given; skipping epigenomic annotation")
+        return ""
+    if os.path.isfile(annotation_source):
+        logger.info("Using local epigenomic annotation %s" % annotation_source)
+        return annotation_source
+
+    # otherwise, ask the PINTS web server
     dst = ""
     from urllib.request import urlretrieve
-    from urllib.error import URLError
     import urllib.parse
     import json
     import socket
@@ -1342,30 +1349,30 @@ def get_epig_annotation(annotation_source, output_dir):
         annotation_source=urllib.parse.quote(annotation_source)
     )
 
+    skip_msg = "; skipping epigenomic annotation"
+    old_timeout = socket.getdefaulttimeout()
     socket.setdefaulttimeout(30)  # if server doesn't respond in 30s, then raise error
     try:
-        if annotation_source is None or annotation_source == "":
-            raise ValueError("annotation_source cannot be empty")
-
         with urllib.request.urlopen(expected_url) as response:
             json_raw = response.read()
         parsed_json = json.loads(json_raw)
-        logger.info("Downloading epigenomic annotation")
-        socket.setdefaulttimeout(None)
         if parsed_json["status"] == 1:
             _, fn = os.path.split(parsed_json["msg"])
-            dst = output_dir + "_" + fn
-            if not os.path.exists(dst):
-                urlretrieve(parsed_json["msg"], dst)
+            target = output_dir + "_" + fn
+            if not os.path.exists(target):
+                logger.info("Downloading epigenomic annotation")
+                urlretrieve(parsed_json["msg"], target + ".part")  # a failed download leaves no file at target
+                os.replace(target + ".part", target)
+            dst = target
         else:
-            logger.error(parsed_json["msg"])
-
-    except URLError as ex:
-        logger.error(ex)
+            logger.warning("PINTS web server: %s%s" % (parsed_json["msg"], skip_msg))
     except json.JSONDecodeError as ex:
-        logger.error("Cannot parse returned info {s} from PINTS web server.".format(s=ex))
-    except Exception as ex:
-        logger.error(ex)
+        logger.warning("Cannot parse returned info {s} from PINTS web server{m}".format(s=ex, m=skip_msg))
+    except Exception as ex:  # URLError (including HTTP errors such as 502), timeouts, missing fields
+        logger.warning("Cannot get epigenomic annotation {a} from {u}: {e}{m}".format(
+            a=annotation_source, u=expected_url, e=ex, m=skip_msg))
+    finally:
+        socket.setdefaulttimeout(old_timeout)
     return dst
 
 
@@ -1537,7 +1544,7 @@ def annotate_tre_with_epig_info(peak_file, epig_bigbed_file, only_annotated_reco
             except Exception as ex:
                 logger.warning(ex)
             finally:
-                annotations.append(",".join(cache) if len(cache) > 0 else ".")
+                annotations.append(",".join(sorted(cache)) if len(cache) > 0 else ".")  # sorted: set order varies by run
     peak_df["epig_annotation"] = annotations
 
     if only_annotated_records:
@@ -1906,6 +1913,7 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
         if epig_annotation is not None and epig_annotation != "":
             logger.info(f"Calling get_epig_annotation with {epig_annotation}, {prefix}")
             epig_annotation = get_epig_annotation(epig_annotation, prefix)
+        if epig_annotation:  # "" when the annotation could not be obtained: the peak calls are left as they are
 
             # in situ update canonical peak calls
             annotate_tre_with_epig_info(bid, epig_annotation)
