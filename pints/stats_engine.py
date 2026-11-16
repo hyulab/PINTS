@@ -32,6 +32,26 @@ except ImportError as e:
 __CACHE_KEY_FORMAT__ = "%d-%d"
 
 
+def ler_candidate_background(coverage_info, b, s, query_end_left, query_start_right):
+    """Background of a LER candidate [b, s): 2.5 kb on each side, with the peak under test masked.
+
+    `coverage_info[b - 2500:b]` is empty when b < 2500 (negative slice start), and the mask offsets are only valid
+    when the tested peak lies inside the candidate's flank; otherwise they mask an unrelated part of the right flank.
+    """
+    background_window = np.concatenate((coverage_info[b - 2500:b], coverage_info[s:s + 2500]), axis=None)
+    # mask original peak in question
+    # this is important to assays which have clean bg/sequenced shallowly
+    if query_start_right < b:
+        rs = query_end_left - (b - 2500)
+        re = query_start_right - (b - 2500)
+        background_window[rs:re] = -1
+    elif s < query_end_left:
+        rs = query_end_left - (s - 2500)
+        re = query_start_right - (s - 2500)
+        background_window[rs:re] = -1
+    return background_window[background_window >= 0]
+
+
 def pval_dist(pval_list, logger, output_diagnostics=True, output_to=None):
     """
     Plot pval distribution (histogram)
@@ -767,20 +787,8 @@ class bgIQR(IQR):
 
             for k, (b, s) in enumerate(uncertain_re_l):
                 cache_key = __CACHE_KEY_FORMAT__ % (re_coords[k][0], re_coords[k][1])
-                background_window = np.concatenate((coverage_info[b - 2500:b],
-                                                    coverage_info[s:s + 2500]),
-                                                   axis=None)
-                # mask original peak in question
-                # this is important to assays which have clean bg/sequenced shallowly
-                if query_start_right < b:
-                    rs = query_end_left - (b - 2500)
-                    re = query_start_right - (b - 2500)
-                    background_window[rs:re] = -1
-                elif s < query_end_left:
-                    rs = query_end_left - (s - 2500)
-                    re = query_start_right - (s - 2500)
-                    background_window[rs:re] = -1
-                background_window = background_window[background_window >= 0]
+                background_window = ler_candidate_background(coverage_info, b, s, query_end_left,
+                                                             query_start_right)
                 mu_pk, var_pk, pi_pk, llc_pk, _ = stat_tester.fit(coverage_info[b:s])
                 mu_bg, var_bg, pi_bg, llc_bg, _ = stat_tester.fit(background_window)
 
@@ -843,19 +851,8 @@ class pkIQR(IQR):
             re_l.extend(re_r)
             se_l.extend(se_r)
             for k, (b, s) in enumerate(re_l):
-                background_window = np.concatenate((coverage_info[b - 2500:b], coverage_info[s:s + 2500]),
-                                                   axis=None)
-                # mask original peak in question
-                # this is important to assays which have clean bg/sequenced shallowly
-                if query_start_right < b:
-                    rs = query_end_left - (b - 2500)
-                    re = query_start_right - (b - 2500)
-                    background_window[rs:re] = -1
-                elif s < query_end_left:
-                    rs = query_end_left - (s - 2500)
-                    re = query_start_right - (s - 2500)
-                    background_window[rs:re] = -1
-                background_window = background_window[background_window >= 0]
+                background_window = ler_candidate_background(coverage_info, b, s, query_end_left,
+                                                             query_start_right)
                 mu_pk, var_pk, pi_pk, llc_pk, _ = stat_tester.fit(coverage_info[b:s])
                 mu_bg, var_bg, pi_bg, llc_bg, _ = stat_tester.fit(background_window)
 
