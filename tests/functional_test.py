@@ -15,12 +15,12 @@ import unittest
 import os
 import pandas as pd
 import pybedtools
-from pandas.api.types import is_object_dtype, is_integer_dtype, is_numeric_dtype
+from pandas.api.types import is_string_dtype, is_integer_dtype, is_numeric_dtype
 from pints.calling_engine import peak_calling
 from pints.extension_engine import extend
 
 
-__CHR_TYPE_ERR__ = "dtype for the Chromosome column should be object"
+__CHR_TYPE_ERR__ = "dtype for the Chromosome column should be strings"
 __START_TYPE_ERR__ = "dtype for the Start column should be integers"
 __END_TYPE_ERR__ = "dtype for the End column should be integers"
 __TSS_RE__ = "^[0-9,]*$"
@@ -129,12 +129,12 @@ class FunctionalTestCase(unittest.TestCase):
 
     def check_bid_div_peak_df(self, df):
         self.assertTrue(df.shape[1] == 6 or df.shape[1] == 7, "Expecting 6 or 7 columns in the output file")
-        self.assertTrue(is_object_dtype(df[0]), __CHR_TYPE_ERR__)
+        self.assertTrue(is_string_dtype(df[0]), __CHR_TYPE_ERR__)
         self.assertTrue(is_integer_dtype(df[1]), __START_TYPE_ERR__)
         self.assertTrue(is_integer_dtype(df[2]), __END_TYPE_ERR__)
         self.assertTrue(sum(df[3].str.contains("Stringent|Relaxed|Marginal")) == df.shape[0],
                         "Confidence level must be the combinations of Stringent, Relaxed, and Marginal")
-        self.assertTrue(is_object_dtype(df[3]), "dtype for the Confidence column should be object")
+        self.assertTrue(is_string_dtype(df[3]), "dtype for the Confidence column should be strings")
         self.assertTrue(sum(df[4].map(str).str.match(__TSS_RE__)),
                         "Major TSSs on the forward strand must be integers or integers separated by comma")
         self.assertTrue(df.apply(
@@ -148,14 +148,14 @@ class FunctionalTestCase(unittest.TestCase):
 
     def check_unid_peak_df(self, df):
         self.assertTrue(df.shape[1] == 9 or df.shape[1] == 10, "Expecting 9 or 10 columns in the output file")
-        self.assertTrue(is_object_dtype(df[0]), __CHR_TYPE_ERR__)
+        self.assertTrue(is_string_dtype(df[0]), __CHR_TYPE_ERR__)
         self.assertTrue(is_integer_dtype(df[1]), __START_TYPE_ERR__)
         self.assertTrue(is_integer_dtype(df[2]), __END_TYPE_ERR__)
-        self.assertTrue(is_object_dtype(df[3]), "dtype for the Peak ID column should be object")
+        self.assertTrue(is_string_dtype(df[3]), "dtype for the Peak ID column should be strings")
         self.assertTrue(is_numeric_dtype(df[4]), "dtype for the Q-value column should be numeric")
         self.assertTrue(((0 <= df[4]) & (df[4] <= self.relaxed_fdr_target)).sum() == df.shape[0],
                         "Q-values should be in the range of [0, fdr_target]")
-        self.assertTrue(is_object_dtype(df[5]), "dtype for the Strand column should be object")
+        self.assertTrue(is_string_dtype(df[5]), "dtype for the Strand column should be strings")
         self.assertTrue(sum(df[5].map(str).str.match(__STRAND_RE__)), "Strand must either be + or -")
         self.assertTrue(is_integer_dtype(df[6]), "dtype for the Read counts column should be integers")
         self.assertTrue(sum(df[7].map(str).str.match(__TSS_RE__)),
@@ -188,17 +188,17 @@ class FunctionalTestCase(unittest.TestCase):
 
     def check_bid_div_ele_df(self, df):
         self.assertTrue(df.shape[1] == 8 or df.shape[1] == 9, "Expecting 8 or 9 columns in the output file")
-        self.assertTrue(is_object_dtype(df[0]), __CHR_TYPE_ERR__)
+        self.assertTrue(is_string_dtype(df[0]), __CHR_TYPE_ERR__)
         self.assertTrue(is_integer_dtype(df[1]), __START_TYPE_ERR__)
         self.assertTrue(is_integer_dtype(df[2]), __END_TYPE_ERR__)
         self.assertTrue(sum(df[4].str.contains("Stringent|Relaxed|Marginal")) == df.shape[0],
                         "Confidence level must be the combinations of Stringent, Relaxed, and Marginal")
-        self.assertTrue(is_object_dtype(df[4]), "dtype for the Confidence column should be object")
+        self.assertTrue(is_string_dtype(df[4]), "dtype for the Confidence column should be strings")
         self.assertTrue(sum(df[7].map(str).str.match(__TSS_RE__)),
                         "Major TSSs on the forward strand must be integers or integers separated by comma")
         self.assertTrue(sum(df[6].map(str).str.match(__TSS_RE__)),
                         "Major TSSs on the reverse strand must be integers or integers separated by comma")
-        self.assertTrue(is_object_dtype(df[3]), "dtype for the ID column should be object")
+        self.assertTrue(is_string_dtype(df[3]), "dtype for the ID column should be strings")
         self.assertTrue(sum(df[3].str.contains("Bidirectional|Divergent")) == df.shape[0],
                         "Element ID must start with Bidirectional or Divergent")
         # check boundary values
@@ -209,14 +209,14 @@ class FunctionalTestCase(unittest.TestCase):
 
     def check_unid_ele_df(self, df):
         self.assertTrue(df.shape[1] == 8 or df.shape[1] == 9, "Expecting 8 or 9 columns in the output file")
-        self.assertTrue(is_object_dtype(df[0]), __CHR_TYPE_ERR__)
+        self.assertTrue(is_string_dtype(df[0]), __CHR_TYPE_ERR__)
         self.assertTrue(is_integer_dtype(df[1]), __START_TYPE_ERR__)
         self.assertTrue(is_integer_dtype(df[2]), __END_TYPE_ERR__)
-        self.assertTrue(is_object_dtype(df[3]), "dtype for the Peak ID column should be object")
+        self.assertTrue(is_string_dtype(df[3]), "dtype for the Peak ID column should be strings")
         self.assertTrue(is_numeric_dtype(df[4]), "dtype for the Q-value column should be numeric")
         self.assertTrue(((0 <= df[4]) & (df[4] <= self.relaxed_fdr_target)).sum() == df.shape[0],
                         "Q-values should be in the range of [0, fdr_target]")
-        self.assertTrue(is_object_dtype(df[5]), "dtype for the Strand column should be object")
+        self.assertTrue(is_string_dtype(df[5]), "dtype for the Strand column should be strings")
         self.assertTrue(sum(df[5].map(str).str.match(__STRAND_RE__)), "Strand must either be + or -")
         self.assertTrue(sum(df[6].map(str).str.match(__TSS_RE__)),
                         "Position of the summit TSS must be integers or integers separated by comma")
