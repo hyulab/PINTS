@@ -1535,11 +1535,14 @@ def evaluate_strand_jobs(jobs, fdr_target, pool=None, thread_n=1, **kwargs):
     if pool is not None:
         def indexer(path):
             pending_index.append(pool.apply_async(_index_bed_task, (path,)))
+    by_unit = [[] for _ in units]  # each unit's phase-1 results, in block order
+    for owner, res in zip(p1_owner, p1_res):
+        by_unit[owner].append(res)
     for ui, u in enumerate(units):
         out_lines, mus, err, starts, ends = [], [], None, [], []
-        for owner, (ol, m, e, (st, en)) in zip(p1_owner, p1_res):
-            if owner != ui or err is not None:
-                continue
+        for ol, m, e, (st, en) in by_unit[ui]:
+            if err is not None:
+                break
             out_lines.extend(ol)
             mus.extend(m)
             starts.append(st)
