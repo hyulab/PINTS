@@ -3026,14 +3026,15 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
 
     # element definition reads the un-normalised sample coverage
     ued_coverage_pl, ued_coverage_mn = list(chromosome_coverage_pl), list(chromosome_coverage_mn)
+    # The control and the normalised coverage are built before the pool forks: pool workers reach tracks only
+    # through the registry they inherit then, and control parsing and normalisation start pools of their own,
+    # which should not fork from a process whose persistent pool already runs threads.
+    _phase("input parsing")
+    pre_norm = control_and_normalise()
     if COVERAGE_STORE:
-        # pool workers reach tracks only through the registry they inherit when the pool forks, so the control
-        # and the normalised tracks are built first
-        _phase("input parsing")
-        pre_norm = control_and_normalise()
         release_coverage_files(input_coverage_pl + input_coverage_mn,
                                chromosome_coverage_pl + chromosome_coverage_mn + pre_norm)
-        _phase("control parsing+normalisation")
+    _phase("control parsing+normalisation")
 
     # one persistent worker pool for all parallel stages (None -> everything runs inline, as before)
     pool = _make_pool(thread_n) if thread_n > 1 else None
@@ -3051,8 +3052,6 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
                               kwargs.get("donor_tolerance", 0.3), kwargs.get("peak_distance", 1),
                               kwargs.get("ce_trigger", 3), kwargs.get("peak_width", None)))
             ued_costs.append(_coverage_cost(chrom_coverage, chromosome))
-    if not COVERAGE_STORE:
-        _phase("input parsing")
     ued_res = _run_tasks(pool, _element_definition_task, ued_tasks, costs=ued_costs)
     _phase("element definition")
     # results are consumed in the original (chromosome, strand) order
@@ -3065,13 +3064,11 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
     _phase("subpeak bookkeeping")
     if COVERAGE_STORE:
         release_coverage_files(ued_coverage_pl + ued_coverage_mn, chromosome_coverage_pl + chromosome_coverage_mn)
-    else:
-        pre_norm = control_and_normalise()
-        if len(ircs) > 0:
-            # un-normalised experiment and control dumps are not read again
-            release_coverage_files(pre_norm + input_coverage_pl + input_coverage_mn,
-                                   chromosome_coverage_pl + chromosome_coverage_mn, defer=pool is not None)
-        _phase("control parsing+normalisation")
+    elif len(ircs) > 0:
+        # element definition has read the un-normalised experiment dumps; neither they nor the control's are
+        # read again
+        release_coverage_files(pre_norm + input_coverage_pl + input_coverage_mn,
+                               chromosome_coverage_pl + chromosome_coverage_mn, defer=pool is not None)
     fdr_target = kwargs.pop("fdr_target", 0.1)
     # window evaluation for every sample x strand at once (shared pool, longest tasks first)
     precomputed = {}
