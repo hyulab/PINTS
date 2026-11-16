@@ -25,6 +25,7 @@ import pints.calling_engine as ce
 
 DATASETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "datasets")
 LOCAL_BIGBED = os.path.join(DATASETS, "ENCFF948HPU.bigBed")
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def _server_down(*args, **kwargs):
@@ -97,3 +98,30 @@ def test_peak_calling_without_the_annotation_when_the_server_is_down(monkeypatch
     for kind in ("bidirectional", "divergent", "unidirectional"):
         assert filecmp.cmp(tmp_path / f"ea_1_{kind}_peaks.bed", tmp_path / f"plain_1_{kind}_peaks.bed",
                            shallow=False), kind
+
+
+def test_annotation_marks_are_sorted_and_reproducible(tmp_path):
+    """Each peak's marks were joined in set order, which changes with the hash seed of the process."""
+    import pyBigWig
+    import subprocess
+    import sys
+    with pyBigWig.open(LOCAL_BIGBED) as bb:
+        entries = bb.entries("chr22", 0, bb.chroms("chr22"))[:400]
+    peaks = tmp_path / "peaks.bed"
+    # peaks spanning a few neighbouring annotation records, so many get several marks
+    peaks.write_text("".join(f"chr22\t{entries[i][0]}\t{entries[i + 3][1]}\tp{i}\t0\t+\n"
+                             for i in range(0, len(entries) - 3, 4)))
+    script = ("import shutil, sys; import pints.calling_engine as ce; shutil.copy(sys.argv[1], sys.argv[2]); "
+              "ce.annotate_tre_with_epig_info(sys.argv[2], sys.argv[3])")
+    outputs = []
+    for seed in ("1", "2", "3"):
+        out = tmp_path / f"annotated_{seed}.bed"
+        env = dict(os.environ, PYTHONHASHSEED=seed,
+                   PYTHONPATH=os.pathsep.join(filter(None, [ROOT, os.environ.get("PYTHONPATH")])))
+        subprocess.run([sys.executable, "-c", script, str(peaks), str(out), LOCAL_BIGBED], check=True, env=env)
+        outputs.append(out.read_text())
+    assert outputs[0] == outputs[1] == outputs[2]
+    marks = [line.split("\t")[-1] for line in outputs[0].splitlines()]
+    multi = [m for m in marks if "," in m]
+    assert len(multi) > 10
+    assert all(m.split(",") == sorted(m.split(",")) for m in multi)

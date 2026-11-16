@@ -1544,7 +1544,7 @@ def annotate_tre_with_epig_info(peak_file, epig_bigbed_file, only_annotated_reco
             except Exception as ex:
                 logger.warning(ex)
             finally:
-                annotations.append(",".join(cache) if len(cache) > 0 else ".")
+                annotations.append(",".join(sorted(cache)) if len(cache) > 0 else ".")  # sorted: set order varies by run
     peak_df["epig_annotation"] = annotations
 
     if only_annotated_records:
