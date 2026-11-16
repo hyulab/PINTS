@@ -21,7 +21,7 @@ try:
     import pysam
     import numpy as np
     from scipy.stats import poisson, chi2
-    from scipy.special import gamma, digamma, polygamma, gammaln, psi, factorial
+    from scipy.special import gamma, digamma, polygamma, gammaln, psi, factorial, xlogy
     from scipy.optimize import fmin_l_bfgs_b as BFGS
     from abc import ABC, abstractmethod
     from collections import defaultdict
@@ -30,6 +30,57 @@ except ImportError as e:
     sys.exit("Please install %s first!" % missing_package)
 
 __CACHE_KEY_FORMAT__ = "%d-%d"
+
+# Options of `peak_calling` that set state of this module used inside the statistical tests. Each is registered
+# next to the code it controls. `peak_calling` applies them before any worker process exists, and the pool passes
+# the same values to every worker (so they do not rely on inheritance at fork).
+_OPTIONS = {}
+_ACTIVE_OPTIONS = {}
+
+
+def register_option(name, default, apply):
+    """Register keyword argument `name` of `peak_calling`. `apply(value)` sets the module state; it returns None or
+    a warning message for the log."""
+    _OPTIONS[name] = (default, apply)
+
+
+def configure_options(values):
+    """Apply every registered option from `values` (a dict; missing names take their defaults). Returns the
+    warning messages of the options."""
+    _ACTIVE_OPTIONS.clear()
+    messages = []
+    for name, (default, apply) in _OPTIONS.items():
+        value = values.get(name, default)
+        _ACTIVE_OPTIONS[name] = value
+        message = apply(value)
+        if message:
+            messages.append(message)
+    return messages
+
+
+def active_options():
+    """The option values last applied by `configure_options`, for handing to worker processes."""
+    return dict(_ACTIVE_OPTIONS)
+
+
+def ler_candidate_background(coverage_info, b, s, query_end_left, query_start_right):
+    """Background of a LER candidate [b, s): 2.5 kb on each side, with the peak under test masked.
+
+    `coverage_info[b - 2500:b]` is empty when b < 2500 (negative slice start), and the mask offsets are only valid
+    when the tested peak lies inside the candidate's flank; otherwise they mask an unrelated part of the right flank.
+    """
+    background_window = np.concatenate((coverage_info[b - 2500:b], coverage_info[s:s + 2500]), axis=None)
+    # mask original peak in question
+    # this is important to assays which have clean bg/sequenced shallowly
+    if query_start_right < b:
+        rs = query_end_left - (b - 2500)
+        re = query_start_right - (b - 2500)
+        background_window[rs:re] = -1
+    elif s < query_end_left:
+        rs = query_end_left - (s - 2500)
+        re = query_start_right - (s - 2500)
+        background_window[rs:re] = -1
+    return background_window[background_window >= 0]
 
 
 def pval_dist(pval_list, logger, output_diagnostics=True, output_to=None):
@@ -65,6 +116,124 @@ def pval_dist(pval_list, logger, output_diagnostics=True, output_to=None):
         plt.savefig(output_to, transparent=True, bbox_inches="tight")
         plt.close()
         logger.info("Diagnostic plot for p-values was wrote to %s" % output_to)
+
+
+def _poisson_pmf(k, mu):
+    """Bit-exact replica of ``scipy.stats.poisson.pmf(k, mu)`` for integer ``k`` >= 0 and scalar ``mu``.
+
+    scipy's generic rv_discrete.pmf wrapper (argument parsing, support checks, argsreduce, place) costs
+    ~50 us per call; the arithmetic below is the identical sequence of ufunc calls
+    (k is promoted to int64 exactly as ``asarray(k) - asarray(loc)`` does in scipy).
+    Falls back to scipy for anything outside that contract.
+    """
+    k = np.asarray(k)
+    if k.ndim != 1 or k.dtype.kind not in "iu" or np.ndim(mu) != 0:
+        return poisson.pmf(k, mu)
+    k = k - np.asarray(0)
+    if not (mu >= 0):
+        return np.full(k.shape, np.nan)
+    if k.shape[0] == 0 or k.min() < 0:
+        return poisson.pmf(k, mu)
+    mu_b = np.broadcast_to(np.asarray(mu), k.shape).ravel()
+    return np.clip(np.exp(xlogy(k, mu_b) - gammaln(k + 1) - mu_b), 0, 1)
+
+
+# ---------------------------------------------------------------------------------------------------
+# Exact EM helpers. numpy reduces a contiguous float64 array in buffered blocks of 8192 elements, each
+# block summed pairwise (8 accumulators, blocks <= 128 unrolled, split point n/2 rounded down to a
+# multiple of 8), starting from 0.0. `_masked_sum` reproduces that summation tree for an array that is
+# `a` where mask is True and `b` elsewhere, without materialising it, so the result is bit-identical to
+# ``np.where(mask, a, b).sum()``.
+# ---------------------------------------------------------------------------------------------------
+try:
+    import numba as _nb
+
+    @_nb.njit(cache=True)
+    def _pw_masked(mask, lo, n, a, b):
+        if n < 8:
+            res = 0.0
+            for i in range(lo, lo + n):
+                res += a if mask[i] else b
+            return res
+        elif n <= 128:
+            r0 = a if mask[lo] else b
+            r1 = a if mask[lo + 1] else b
+            r2 = a if mask[lo + 2] else b
+            r3 = a if mask[lo + 3] else b
+            r4 = a if mask[lo + 4] else b
+            r5 = a if mask[lo + 5] else b
+            r6 = a if mask[lo + 6] else b
+            r7 = a if mask[lo + 7] else b
+            i = 8
+            m = n - (n % 8)
+            while i < m:
+                r0 += a if mask[lo + i] else b
+                r1 += a if mask[lo + i + 1] else b
+                r2 += a if mask[lo + i + 2] else b
+                r3 += a if mask[lo + i + 3] else b
+                r4 += a if mask[lo + i + 4] else b
+                r5 += a if mask[lo + i + 5] else b
+                r6 += a if mask[lo + i + 6] else b
+                r7 += a if mask[lo + i + 7] else b
+                i += 8
+            res = ((r0 + r1) + (r2 + r3)) + ((r4 + r5) + (r6 + r7))
+            while i < n:
+                res += a if mask[lo + i] else b
+                i += 1
+            return res
+        else:
+            n2 = n // 2
+            n2 -= n2 % 8
+            return _pw_masked(mask, lo, n2, a, b) + _pw_masked(mask, lo + n2, n - n2, a, b)
+
+    @_nb.njit(cache=True)
+    def _masked_sum(mask, a, b):
+        res = 0.0
+        n = mask.shape[0]
+        lo = 0
+        while lo < n:
+            m = min(8192, n - lo)
+            res += _pw_masked(mask, lo, m, a, b)
+            lo += m
+        return res
+
+    _HAS_NUMBA = True
+except ImportError:  # pragma: no cover
+    _HAS_NUMBA = False
+
+
+def numba_warmup():
+    """Initialise/compile the Numba kernels once, so forked pool workers inherit them instead of each
+    paying the compiler start-up (~2-3 s per process). No effect on results."""
+    if _HAS_NUMBA:
+        m = np.zeros(300, dtype=bool)
+        m[::3] = True
+        _masked_sum(m, 0.5, 1.0)
+
+
+_EPS = np.finfo(float).eps
+
+
+class _LLCache:
+    """Per-fit invariants of the ZIP log-likelihood over the unique counts of a window."""
+    __slots__ = ("k", "logfact", "counts", "zero_first")
+
+    def __init__(self, u_ele, c_ele):
+        self.k = u_ele - np.asarray(0)   # same promotion as scipy's ``asarray(k) - asarray(loc)``
+        self.logfact = gammaln(self.k + 1)
+        self.counts = c_ele
+        self.zero_first = u_ele[0] == 0  # u_ele is sorted and unique
+
+    @staticmethod
+    def supported(u_ele):
+        return u_ele.ndim == 1 and u_ele.dtype.kind in "iu" and u_ele.shape[0] > 0 and u_ele[0] >= 0
+
+    def log_likelihood(self, pi, lamb):
+        """Bit-identical to ``ZIP._log_likelihood_core(u_ele, c_ele, pi, lamb)`` for lamb >= 0."""
+        u_pmf = (1 - pi) * np.minimum(np.exp(xlogy(self.k, lamb) - self.logfact - lamb), 1.)
+        if self.zero_first:
+            u_pmf[0] += pi
+        return (np.log(np.maximum(u_pmf, _EPS)) * self.counts).sum()
 
 
 class StatModel(ABC):
@@ -184,7 +353,7 @@ class ZIP(StatModel):
         smallest = np.finfo(float).eps
         # estimate log likelihood
         # compute the Poisson PMF scaled by the non-zero-inflation component (i.e., the "Poisson part").
-        u_pmf = (1 - pi) * poisson.pmf(count, lamb)
+        u_pmf = (1 - pi) * _poisson_pmf(count, lamb)
         # handle the zero-inflation part correctly
         u_pmf[np.where(count == 0)] += pi
         u_pmf[u_pmf < smallest] = smallest
@@ -271,6 +440,10 @@ class ZIP(StatModel):
         prev_likelihood = 0.
         likelihoods = []
         u_ele, c_ele = np.unique(window, return_counts=True)
+        if _HAS_NUMBA and not self.debug and window.ndim == 1:
+            fast = self._fit_fast(window, zero_elements, u_ele, c_ele, I, lamb, pi)
+            if fast is not None:
+                return fast
         while True:
             # expectation
             hat_z[zero_elements] = pi / (pi + np.exp(-lamb) * (1 - pi))
@@ -290,6 +463,39 @@ class ZIP(StatModel):
                         plt.xlabel('Iteration')
                         plt.tight_layout()
                         plt.savefig(self.output_to, bbox_inches="tight", transparent=True)
+                    return lamb, lamb, pi, likelihood, True
+                if n_iter > self.max_iter:
+                    return lamb, lamb, pi, likelihood, False
+            prev_likelihood = likelihood
+            n_iter += 1
+
+    def _fit_fast(self, window, zero_elements, u_ele, c_ele, I, lamb, pi):
+        """
+        Same EM iterations as `fit`, without materialising hat_z / indicator arrays.
+
+        hat_z is v on zero positions and 0 elsewhere, indicator = 1 - hat_z, so their sums are masked
+        sums with numpy's summation tree, and for 0 <= v <= 1 (indicator * window) equals the float64
+        cast of window bit for bit. Returns None (caller runs the original loop from the start) whenever
+        a precondition does not hold, so results are always identical to the original implementation.
+        """
+        sum_w = window.astype(np.float64).sum()
+        if not np.isfinite(sum_w) or not _LLCache.supported(u_ele):
+            return None
+        llc = _LLCache(u_ele, c_ele)
+        mask = np.ascontiguousarray(zero_elements)
+        n_iter = 0
+        prev_likelihood = 0.
+        while True:
+            v = pi / (pi + np.exp(-lamb) * (1 - pi))
+            if not (0. <= v <= 1.):
+                return None
+            pi = np.float64(_masked_sum(mask, float(v), 0.)) / I        # == hat_z.sum() / I
+            lamb = sum_w / np.float64(_masked_sum(mask, float(1 - v), 1.))  # == (ind * w).sum() / ind.sum()
+            if not (lamb >= 0):
+                return None
+            likelihood = llc.log_likelihood(pi, lamb)
+            if n_iter > 0:
+                if abs(likelihood - prev_likelihood) < self.stop_diff:
                     return lamb, lamb, pi, likelihood, True
                 if n_iter > self.max_iter:
                     return lamb, lamb, pi, likelihood, False
@@ -612,20 +818,8 @@ class bgIQR(IQR):
 
             for k, (b, s) in enumerate(uncertain_re_l):
                 cache_key = __CACHE_KEY_FORMAT__ % (re_coords[k][0], re_coords[k][1])
-                background_window = np.concatenate((coverage_info[b - 2500:b],
-                                                    coverage_info[s:s + 2500]),
-                                                   axis=None)
-                # mask original peak in question
-                # this is important to assays which have clean bg/sequenced shallowly
-                if query_start_right < b:
-                    rs = query_end_left - (b - 2500)
-                    re = query_start_right - (b - 2500)
-                    background_window[rs:re] = -1
-                elif s < query_end_left:
-                    rs = query_end_left - (s - 2500)
-                    re = query_start_right - (s - 2500)
-                    background_window[rs:re] = -1
-                background_window = background_window[background_window >= 0]
+                background_window = ler_candidate_background(coverage_info, b, s, query_end_left,
+                                                             query_start_right)
                 mu_pk, var_pk, pi_pk, llc_pk, _ = stat_tester.fit(coverage_info[b:s])
                 mu_bg, var_bg, pi_bg, llc_bg, _ = stat_tester.fit(background_window)
 
@@ -688,19 +882,8 @@ class pkIQR(IQR):
             re_l.extend(re_r)
             se_l.extend(se_r)
             for k, (b, s) in enumerate(re_l):
-                background_window = np.concatenate((coverage_info[b - 2500:b], coverage_info[s:s + 2500]),
-                                                   axis=None)
-                # mask original peak in question
-                # this is important to assays which have clean bg/sequenced shallowly
-                if query_start_right < b:
-                    rs = query_end_left - (b - 2500)
-                    re = query_start_right - (b - 2500)
-                    background_window[rs:re] = -1
-                elif s < query_end_left:
-                    rs = query_end_left - (s - 2500)
-                    re = query_start_right - (s - 2500)
-                    background_window[rs:re] = -1
-                background_window = background_window[background_window >= 0]
+                background_window = ler_candidate_background(coverage_info, b, s, query_end_left,
+                                                             query_start_right)
                 mu_pk, var_pk, pi_pk, llc_pk, _ = stat_tester.fit(coverage_info[b:s])
                 mu_bg, var_bg, pi_bg, llc_bg, _ = stat_tester.fit(background_window)
 
@@ -710,6 +893,75 @@ class pkIQR(IQR):
                     new_local_env[se_l[k][0]:se_l[k][1]] = -1
                     ler_count += 1
         return new_local_env[new_local_env >= 0], ler_count
+
+
+def _bh_sorted(pvals_sorted, alpha):
+    """Benjamini-Hochberg on ascending p-values: (reject, padj), as statsmodels' fdrcorrection(is_sorted=True)"""
+    ecdffactor = np.arange(1, len(pvals_sorted) + 1) / float(len(pvals_sorted))
+    reject = pvals_sorted <= ecdffactor * alpha
+    if reject.any():
+        reject[:max(np.nonzero(reject)[0])] = True
+    pvals_corrected = np.minimum.accumulate((pvals_sorted / ecdffactor)[::-1])[::-1]
+    pvals_corrected[pvals_corrected > 1] = 1
+    return reject, pvals_corrected
+
+
+def adjust_pvalues(pvals, alpha=0.05, method="fdr_bh"):
+    """
+    Adjusted p-values for multiple testing, in the input order. The same operations as
+    ``statsmodels.stats.multitest.multipletests(pvals, alpha, method)[1]`` (statsmodels 0.12-0.14), so the
+    results are bit-identical, for the methods pints_caller offers.
+
+    Parameters
+    ----------
+    pvals : array-like
+        p-values
+    alpha : float
+        FDR target (used by the two-stage methods)
+    method : str
+        fdr_bh (Benjamini-Hochberg), bonferroni, fdr_tsbh (two-stage BH) or fdr_tsbky (Benjamini, Krieger
+        and Yekutieli 2006, Definition 6)
+
+    Returns
+    -------
+    padj : np.ndarray
+
+    Raises
+    ------
+    ZeroDivisionError
+        For no p-values, as statsmodels does
+    """
+    pvals = np.asarray(pvals)
+    ntests = len(pvals)
+    if ntests == 0:  # statsmodels fails here too (computing the Sidak level), and the callers rely on it
+        raise ZeroDivisionError("no p-values to adjust")
+    sortind = np.argsort(pvals)
+    pvals = np.take(pvals, sortind)
+    method = method.lower()
+    if method == "bonferroni":
+        pvals_corrected = pvals * float(ntests)
+    elif method == "fdr_bh":
+        pvals_corrected = _bh_sorted(pvals, alpha)[1]
+    elif method in ("fdr_tsbh", "fdr_tsbky"):  # statsmodels' fdrcorrection_twostage with maxiter=1
+        fact = (1. + alpha) if method == "fdr_tsbky" else 1.
+        alpha_prime = alpha / fact if method == "fdr_tsbky" else alpha
+        rej, pvals_corrected = _bh_sorted(pvals, alpha_prime)
+        r1 = rej.sum()
+        if r1 == 0 or r1 == ntests:
+            pvals_corrected *= fact
+        else:
+            ntests0 = 1.0 * ntests - r1
+            rej, pvals_corrected = _bh_sorted(pvals, alpha_prime * ntests / ntests0)
+            pvals_corrected *= ntests0 * 1.0 / ntests
+            if method == "fdr_tsbky":
+                pvals_corrected *= (1. + alpha)
+        pvals_corrected[pvals_corrected > 1] = 1
+    else:
+        raise ValueError("method not recognized: %s" % method)
+    pvals_corrected[pvals_corrected > 1] = 1
+    out = np.empty_like(pvals_corrected)
+    out[sortind] = pvals_corrected
+    return out
 
 
 def independent_filtering(df, fdr_target=0.1, output_to=None, logger=None, **kwargs):
@@ -740,7 +992,6 @@ def independent_filtering(df, fdr_target=0.1, output_to=None, logger=None, **kwa
          Independent filtering increases detection power for high-throughput experiments.
          PNAS 107, 9546–9551 (2010).
     """
-    from statsmodels.stats.multitest import multipletests
     from pints.io_engine import log_assert
     import pandas as pd
 
@@ -754,36 +1005,49 @@ def independent_filtering(df, fdr_target=0.1, output_to=None, logger=None, **kwa
     select_probe = None
     read_counts_threshold = 0
     try:
-        direct_padj = multipletests(df["pval"], alpha=fdr_target, method=adjust_method)[1]
+        direct_padj = adjust_pvalues(df["pval"], alpha=fdr_target, method=adjust_method)
     except ZeroDivisionError:
         direct_padj = df["pval"] * df.shape[0]
-    for quantile in np.arange(0, 1, 0.005):
-        threshold = df.reads.quantile(quantile)
-        tmp_probe = df["reads"] > threshold
-        filtered_df = df.loc[tmp_probe, :].copy()
-        try:
-            mult_res = multipletests(filtered_df["pval"], alpha=fdr_target, method=adjust_method)
-            read_out = mult_res[1]
-        except ZeroDivisionError:
-            # if we cannot run BH, then we use Bonferroni correction
-            read_out = filtered_df["pval"] * filtered_df.shape[0]
-        filtered_df["padj"] = read_out
-        # filtered_df.drop(columns="pval", inplace=True)
-        filtered_df["name"] = "."
-        filtered_df = filtered_df.loc[:, ("chromosome", "start", "end", "name", "padj", "strand", "reads")]
-        quantiles_tested.append(quantile)
-        windows_remain.append(filtered_df.shape[0])
-        windows_rejected.append(sum(read_out < fdr_target))
+    # Every quantile threshold defines a subset; identical thresholds give identical subsets, so the
+    # multiple-testing correction is computed once per distinct threshold. Only the selected subset is
+    # materialised as a DataFrame (same construction as before, so the result is identical).
+    def _materialise(probe, read_out):
+        filtered = df.loc[probe, :].copy()
+        filtered["padj"] = read_out
+        filtered["name"] = "."
+        return filtered.loc[:, ("chromosome", "start", "end", "name", "padj", "strand", "reads")]
 
-        if len(windows_rejected) > 0:
-            if windows_rejected[-1] >= max(windows_rejected):
-                adjusted_df = filtered_df
-                select_probe = tmp_probe
-                read_counts_threshold = threshold
-        else:
-            adjusted_df = filtered_df
+    reads_col = df["reads"]
+    pval_col = df["pval"]
+    per_threshold = {}
+    selected = None
+    # all thresholds from one quantile call: pandas computes a scalar quantile as the list [q], so each value
+    # is bitwise the one a separate call returns
+    quantiles = np.arange(0, 1, 0.005)
+    for quantile, threshold in zip(quantiles, reads_col.quantile(quantiles).to_numpy()):
+        hit = per_threshold.get(threshold) if threshold == threshold else None
+        if hit is None:
+            tmp_probe = reads_col > threshold
+            sub_p = pval_col.loc[tmp_probe]
+            try:
+                read_out = adjust_pvalues(sub_p, alpha=fdr_target, method=adjust_method)
+            except ZeroDivisionError:
+                # if we cannot run BH, then we use Bonferroni correction
+                read_out = sub_p * sub_p.shape[0]
+            hit = (tmp_probe, read_out, int(sub_p.shape[0]), sum(read_out < fdr_target))
+            if threshold == threshold:
+                per_threshold[threshold] = hit
+        tmp_probe, read_out, n_remain, n_rejected = hit
+        quantiles_tested.append(quantile)
+        windows_remain.append(n_remain)
+        windows_rejected.append(n_rejected)
+
+        if windows_rejected[-1] >= max(windows_rejected):
+            selected = (tmp_probe, read_out)
             select_probe = tmp_probe
             read_counts_threshold = threshold
+    if selected is not None:
+        adjusted_df = _materialise(*selected)
 
     optimized_threshold = np.argmax(windows_rejected)
     logger.info("Optimized filters from independent filtering: percentile %f, rejection %d" % (
