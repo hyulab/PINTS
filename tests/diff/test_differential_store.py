@@ -47,13 +47,13 @@ def test_bam_tracks_equal_reference_dumps(rr, lib, rc, threads, filters, fast):
     with tempfile.TemporaryDirectory() as d:
         bam = make_bam(os.path.join(d, "x.bam"), contigs, reads)
         os.makedirs(os.path.join(d, "a")); os.makedirs(os.path.join(d, "b"))
-        pl, mn, total, cache = io._read_signal(bam, lib, "", os.path.join(d, "a"), "p", reverse_complement=rc,
-                                               thread_n=threads, filters=filters, fast_bam=fast, as_tracks=True)
+        pl, mn, total = io._read_signal(bam, lib, "", os.path.join(d, "a"), "p", reverse_complement=rc,
+                                        thread_n=threads, filters=filters, fast_bam=fast, as_tracks=True)
         b = rio.get_read_signal(bam, lib, "", os.path.join(d, "b"), "p", reverse_complement=rc, filters=filters)
         same(total, b[2])
         _assert_tracks_equal_dumps(pl, b[0])
         _assert_tracks_equal_dumps(mn, b[1])
-        assert cache == [] and _npys(os.path.join(d, "a")) == []
+        assert _npys(os.path.join(d, "a")) == []
 
 
 @SLOW
@@ -73,8 +73,8 @@ def test_bam_region_tracks_equal_reference_dumps(rr, lib, threads, span, seed):
         with tempfile.TemporaryDirectory() as d:
             bam = make_bam(os.path.join(d, "x.bam"), contigs, reads)
             os.makedirs(os.path.join(d, "a")); os.makedirs(os.path.join(d, "b"))
-            pl, mn, total, _ = io._read_signal(bam, lib, "", os.path.join(d, "a"), "p", thread_n=threads,
-                                               as_tracks=True)
+            pl, mn, total = io._read_signal(bam, lib, "", os.path.join(d, "a"), "p", thread_n=threads,
+                                            as_tracks=True)
             b = rio.get_read_signal(bam, lib, "", os.path.join(d, "b"), "p")
             same(total, b[2])
             _assert_tracks_equal_dumps(pl, b[0])
@@ -95,11 +95,10 @@ def test_bam_tracks_ignore_old_dumps(rr, lib):
         os.makedirs(out); os.makedirs(fresh)
         dumps = io.get_read_signal(bam, lib, "", fresh, "p")
         stale = _make_stale(io.get_read_signal(bam, lib, "", out, "p")[:2])
-        pl, mn, total, cache = io._read_signal(bam, lib, "", out, "p", as_tracks=True)
+        pl, mn, total = io._read_signal(bam, lib, "", out, "p", as_tracks=True)
         same(total, dumps[2])
         _assert_tracks_equal_dumps(pl, dumps[0])
         _assert_tracks_equal_dumps(mn, dumps[1])
-        assert cache == []
         assert {f: open(f, "rb").read() for f in stale} == stale
 
 
@@ -144,13 +143,13 @@ def test_bigwig_tracks_equal_reference_dumps(seed, vmax, threads, prefix_filter,
             m = _runs_bigwig(os.path.join(d, "m.bw"), mn_chroms, rng, vmax)
             os.makedirs(os.path.join(d, "a")); os.makedirs(os.path.join(d, "b"))
             with np.errstate(invalid="ignore"):
-                pl, mn, total, cache = io._coverage_bw(p, m, prefix_filter, os.path.join(d, "a"), "q",
-                                                       threads=threads, as_tracks=True)
+                pl, mn, total = io._coverage_bw(p, m, prefix_filter, os.path.join(d, "a"), "q",
+                                                threads=threads, as_tracks=True)
                 b = rio.get_coverage_bw(p, m, prefix_filter, os.path.join(d, "b"), "q")
             same(total, b[2])
             _assert_tracks_equal_dumps(pl, b[0])
             _assert_tracks_equal_dumps(mn, b[1])
-            assert cache == [] and _npys(os.path.join(d, "a")) == []
+            assert _npys(os.path.join(d, "a")) == []
             for t in list(pl.values()) + list(mn.values()):
                 assert (t.values != 0).all()
     finally:
@@ -171,17 +170,16 @@ def test_bigwig_tracks_without_numpy_and_ignoring_old_dumps(monkeypatch):
             ref = rio.get_coverage_bw(p, m, "", b, "q")
             for numpy_flag in (0, 1):
                 monkeypatch.setattr(pyBigWig, "numpy", numpy_flag)
-                pl, mn, total, cache = io._coverage_bw(p, m, "", a, "q", as_tracks=True)
+                pl, mn, total = io._coverage_bw(p, m, "", a, "q", as_tracks=True)
                 same(total, ref[2])
                 _assert_tracks_equal_dumps(pl, ref[0]); _assert_tracks_equal_dumps(mn, ref[1])
-                assert cache == [] and _npys(a) == []
+                assert _npys(a) == []
             stale = _make_stale(io.get_coverage_bw(p, m, "", a, "q")[:2])  # dumps left with the same prefix
             for numpy_flag, threads in ((0, 1), (1, 1), (1, 3)):
                 monkeypatch.setattr(pyBigWig, "numpy", numpy_flag)
-                pl, mn, total, cache = io._coverage_bw(p, m, "", a, "q", threads=threads, as_tracks=True)
+                pl, mn, total = io._coverage_bw(p, m, "", a, "q", threads=threads, as_tracks=True)
                 same(total, ref[2])
                 _assert_tracks_equal_dumps(pl, ref[0]); _assert_tracks_equal_dumps(mn, ref[1])
-                assert cache == []
                 assert {f: open(f, "rb").read() for f in stale} == stale
 
 

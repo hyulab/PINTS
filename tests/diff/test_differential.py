@@ -429,7 +429,7 @@ def test_bed_is_empty_follows_count():
             fn = os.path.join(d, "x.bed")
             with open(fn, "w") as fh:
                 fh.write(text)
-            assert ce._bed_is_empty(fn) == (pybedtools.BedTool(fn).count() == 0), repr(text)
+            assert ce.bed_ops.is_empty(fn) == (pybedtools.BedTool(fn).count() == 0), repr(text)
 
 
 # ------------------------------------------------------------------ IO

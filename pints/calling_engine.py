@@ -1769,18 +1769,12 @@ def peaks_single_strand(per_base_cov, output_file, shared_peak_definitions, stra
     """
     global housekeeping_files
 
-    args = []
-    for chrom, pbc_npy in per_base_cov.items():
+    # the per-chromosome files phase 1 and 2 may write, deleted at the end
+    for chrom in per_base_cov:
         if shared_peak_definitions[chrom] is None:  # bypass chromosomes without signals
             continue
         sub_peaks_name = output_file.replace(".bed", __SUB_PEAK_TPL__ % chrom)
         merged_name = output_file.replace(".bed", "_%s_merged_windows.bed" % chrom)
-        args.append((pbc_npy, output_file, strand_sign, chrom, shared_peak_definitions[chrom], fdr_target,
-                     kwargs.get("small_peak_threshold", 5), kwargs.get("min_mu_percent", 0.1),
-                     kwargs.get("disable_qc", False), kwargs.get("disable_ler", False),
-                     kwargs.get("enable_eler", True), kwargs.get("eler_lower_bound", 1.),
-                     kwargs.get("sensitive", False), kwargs.get("fc_cutoff", 1.5),
-                     kwargs.get("init_dens_cutoff", 0.25), kwargs.get("init_height_cutoff", 4)))
         housekeeping_files.append(merged_name)
         housekeeping_files.append(sub_peaks_name + ".gz")
         housekeeping_files.append(sub_peaks_name + ".gz.csi")
@@ -2522,11 +2516,6 @@ def _pair_strands_by_chromosome(pool, strands):
     return generated_files
 
 
-def _bed_is_empty(path):
-    """`BedTool(path).count() == 0`, stopping at the first feature (same rules for header and blank lines)."""
-    return bed_ops.is_empty(path)
-
-
 def pair(sample_prefix, df_dict, fdr_target, stringent_only, specific_suffix="", pool=None, **kwargs):
     """
 
@@ -2588,7 +2577,7 @@ def _merge_strands(sample_prefix, specific_suffix, directionalities):
         exp_mn_file = sample_prefix + "%s_sig_mn_%s_peaks.bed" % (specific_suffix, directionality)
         if os.path.exists(exp_pl_file) and os.path.exists(exp_mn_file):
             if directionality != "singletons":
-                pl_empty, mn_empty = _bed_is_empty(exp_pl_file), _bed_is_empty(exp_mn_file)
+                pl_empty, mn_empty = bed_ops.is_empty(exp_pl_file), bed_ops.is_empty(exp_mn_file)
                 if pl_empty and mn_empty:
                     continue
                 else:
@@ -2757,12 +2746,10 @@ def on_the_fly_qc(output_prefix, min_mu_percent, top_peak_threshold, significant
                 logger.warning(msg)
 
 
-def _add_coverage(pl_cov_target, mn_cov_target, rc_target, plc, mnc, rc, cached, sample):
-    """Append one sample's coverage: registry keys for tracks (its reused .npy cache is deleted at the end, as
-    dumps are), else the dump paths, which are deleted at the end."""
+def _add_coverage(pl_cov_target, mn_cov_target, rc_target, plc, mnc, rc, sample):
+    """Append one sample's coverage: registry keys for tracks, else the dump paths, which are deleted at the end."""
     if COVERAGE_STORE:
         plc, mnc = _register_coverage(plc, sample, "pl"), _register_coverage(mnc, sample, "mn")
-        housekeeping_files.extend(cached)
     else:
         housekeeping_files.extend(plc.values())
         housekeeping_files.extend(mnc.values())
@@ -2828,15 +2815,15 @@ def parse_input_files(output_dir, output_prefix, filters, pl_cov_target, mn_cov_
         for i, bf in enumerate(bam_files):
             log_assert(os.path.exists(bf), "Cannot find input bam file %s" % bf, logger)
             logger.info("Loading {0}...".format(bf))
-            plc, mnc, rc, cached = _read_signal(input_bam=bf,
-                                                loc_prime=kwargs["bam_parser"],
-                                                chromosome_startswith=kwargs.pop("chromosome_startswith", ""),
-                                                reverse_complement=kwargs.get("seq_rc", False),
-                                                output_dir=output_dir,
-                                                output_prefix=output_prefix + "_%d" % i,
-                                                filters=filters, as_tracks=COVERAGE_STORE,
-                                                **kwargs)
-            _add_coverage(pl_cov_target, mn_cov_target, rc_target, plc, mnc, rc, cached, output_prefix + "_%d" % i)
+            plc, mnc, rc = _read_signal(input_bam=bf,
+                                        loc_prime=kwargs["bam_parser"],
+                                        chromosome_startswith=kwargs.pop("chromosome_startswith", ""),
+                                        reverse_complement=kwargs.get("seq_rc", False),
+                                        output_dir=output_dir,
+                                        output_prefix=output_prefix + "_%d" % i,
+                                        filters=filters, as_tracks=COVERAGE_STORE,
+                                        **kwargs)
+            _add_coverage(pl_cov_target, mn_cov_target, rc_target, plc, mnc, rc, output_prefix + "_%d" % i)
             logger.info("{0} loaded.".format(bf))
     elif bw_pl_files is not None and bw_mn_files is not None:
         log_assert(len(bw_pl_files) == len(bw_mn_files),
@@ -2846,12 +2833,12 @@ def parse_input_files(output_dir, output_prefix, filters, pl_cov_target, mn_cov_
             log_assert(os.path.exists(bw_pl), "Cannot find bigwig file %s" % bw_pl, logger)
             log_assert(os.path.exists(bw_mn_files[i]), "Cannot find bigwig file %s" % bw_mn_files[i], logger)
             logger.info("Loading {0} and {1}...".format(bw_pl, bw_mn_files[i]))
-            plc, mnc, rc, cached = _coverage_bw(bw_pl=bw_pl, bw_mn=bw_mn_files[i],
-                                                chromosome_startswith=kwargs.get("chromosome_startswith", ""),
-                                                output_dir=output_dir,
-                                                output_prefix=output_prefix + "_%d" % i,
-                                                threads=kwargs.get("thread_n", 1), as_tracks=COVERAGE_STORE)
-            _add_coverage(pl_cov_target, mn_cov_target, rc_target, plc, mnc, rc, cached, output_prefix + "_%d" % i)
+            plc, mnc, rc = _coverage_bw(bw_pl=bw_pl, bw_mn=bw_mn_files[i],
+                                        chromosome_startswith=kwargs.get("chromosome_startswith", ""),
+                                        output_dir=output_dir,
+                                        output_prefix=output_prefix + "_%d" % i,
+                                        threads=kwargs.get("thread_n", 1), as_tracks=COVERAGE_STORE)
+            _add_coverage(pl_cov_target, mn_cov_target, rc_target, plc, mnc, rc, output_prefix + "_%d" % i)
             logger.info("{0} and {1} loaded.".format(bw_pl, bw_mn_files[i]))
 
     if merge_replicates and len(pl_cov_target) > 1 and COVERAGE_STORE:

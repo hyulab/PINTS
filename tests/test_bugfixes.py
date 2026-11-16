@@ -160,5 +160,5 @@ def test_in_memory_bigwig_tracks_report_fractional_values(tmp_path, caplog):
     bw.addEntries("chr1", list(range(100, 110)), values=[0.5] * 10, span=1)
     bw.close()
     with caplog.at_level(logging.WARNING):
-        total, _, _ = io._bw_chrom_track(path, "chr1", 1000, np.int32, str(tmp_path / "f_chr1.npy"))
+        total, _ = io._bw_chrom_track(path, "chr1", 1000, np.int32, str(tmp_path / "f_chr1.npy"))
     assert total == 0 and any("non-integer" in r.getMessage() for r in caplog.records)

@@ -455,7 +455,7 @@ def _get_coverage_bw(bw_file, chromosome_startswith, output_dir, output_prefix, 
     output_prefix : str
         Prefix of outputs
     as_tracks : bool
-        Return `CoverageTrack`s instead of dump paths, and the dumps reused from the cache as a third value
+        Return `CoverageTrack`s instead of dump paths (no dumps are written or read)
 
     Returns
     -------
@@ -480,7 +480,6 @@ def _get_coverage_bw(bw_file, chromosome_startswith, output_dir, output_prefix, 
     chrom_size_list = []
     read_counts = 0
 
-    cache_files = []
     for chromosome, csize in bw.chroms().items():
         if chromosome.startswith(chromosome_startswith):
             fn = os.path.join(output_dir, "%s_%s" % (output_prefix, chromosome))
@@ -506,8 +505,6 @@ def _get_coverage_bw(bw_file, chromosome_startswith, output_dir, output_prefix, 
             chromosome_reads_dict[chromosome] = 0
     
     bw.close()
-    if as_tracks:
-        return chromosome_coverage, read_counts, cache_files
     return chromosome_coverage, read_counts
 
 
@@ -658,7 +655,7 @@ def _bw_dense_points(bw, chromosome, csize, data_type, block, bw_file=None):
 
 def _bw_chrom_track(bw_file, chromosome, csize, data_type, npy_file, block=None):
     """
-    `_bw_chrom_worker` without the dump: (sum, (starts, ends, values), None). ends is None for the points form.
+    `_bw_chrom_worker` without the dump: (sum, (starts, ends, values)). ends is None for the points form.
     An existing dump at `npy_file` is not read (the store never reads dumps).
     """
     import pyBigWig
@@ -672,7 +669,7 @@ def _bw_chrom_track(bw_file, chromosome, csize, data_type, npy_file, block=None)
     finally:
         bw.close()
     from .coverage_store import CoverageTrack
-    return CoverageTrack(csize, data_type, runs[0], runs[2], runs[1]).sum(), runs, None
+    return CoverageTrack(csize, data_type, runs[0], runs[2], runs[1]).sum(), runs
 
 
 def _bw_chrom_worker(bw_file, chromosome, csize, data_type, npy_file, block=None, as_tracks=False):
@@ -732,8 +729,8 @@ def _get_coverage_bw_tasks(bw_file, chromosome_startswith, output_dir, output_pr
 
 def _get_coverage_bw_parallel(bw_files, chromosome_startswith, output_dir, prefixes, threads, as_tracks=False):
     """Load several bigWigs with one process pool (inline, in file order, when threads <= 1); same files, dicts
-    (same order) and read counts. With `as_tracks`, the dicts hold `CoverageTrack`s (no dumps), and each result
-    also lists the dumps reused from the cache: (coverage, read_counts, cache_files)."""
+    (same order) and read counts, as (coverage, read_counts) per file. With `as_tracks`, the dicts hold
+    `CoverageTrack`s (no dumps)."""
     from multiprocessing import get_context
     plans = [_get_coverage_bw_tasks(f, chromosome_startswith, output_dir, p) for f, p in zip(bw_files, prefixes)]
     jobs, owners = [], []
@@ -753,18 +750,15 @@ def _get_coverage_bw_parallel(bw_files, chromosome_startswith, output_dir, prefi
     for k, (dt, tasks) in enumerate(plans):
         coverage = {}
         read_counts = 0
-        cache_files = []
         for (chromosome, csize, npy), (owner, s) in zip(tasks, [(o, x) for o, x in zip(owners, sums) if o == k]):
             if as_tracks:
                 from .coverage_store import CoverageTrack
-                s, (starts, ends, values), cached = s
-                coverage[chromosome] = CoverageTrack(csize, values.dtype if cached else dt, starts, values, ends)
-                if cached:
-                    cache_files.append(cached)
+                s, (starts, ends, values) = s
+                coverage[chromosome] = CoverageTrack(csize, dt, starts, values, ends)
             else:
                 coverage[chromosome] = npy
             read_counts += s  # accumulated in file order, as in the serial loader
-        results.append((coverage, read_counts, cache_files) if as_tracks else (coverage, read_counts))
+        results.append((coverage, read_counts))
     return results
 
 
@@ -796,15 +790,14 @@ def get_coverage_bw(bw_pl, bw_mn, chromosome_startswith, output_dir, output_pref
     rc : int
         Number of total read counts
     """
-    return _coverage_bw(bw_pl, bw_mn, chromosome_startswith, output_dir, output_prefix, threads=threads)[:3]
+    return _coverage_bw(bw_pl, bw_mn, chromosome_startswith, output_dir, output_prefix, threads=threads)
 
 
 def _coverage_bw(bw_pl, bw_mn, chromosome_startswith, output_dir, output_prefix, threads=1, as_tracks=False):
     """
-    `get_coverage_bw`, returning (pl, mn, read_counts, cache_files). With `as_tracks`, pl and mn map chromosomes
-    to `CoverageTrack`s holding what the dumps would hold, and no dumps are written; dumps reused from the
-    output directory are listed in cache_files (deleted like dumps by the caller). Otherwise cache_files is
-    empty.
+    `get_coverage_bw`, returning (pl, mn, read_counts). With `as_tracks`, pl and mn map chromosomes to
+    `CoverageTrack`s holding what the dumps would hold; no dumps are written, and dumps already in the output
+    directory are not read.
     """
     logger = logging.getLogger(__logger_name__)
     try:
@@ -820,8 +813,7 @@ def _coverage_bw(bw_pl, bw_mn, chromosome_startswith, output_dir, output_prefix,
         extra = (True,) if as_tracks else ()  # as_tracks, only when set (keeps the original call)
         loaded = [_get_coverage_bw(bw_pl, chromosome_startswith, output_dir, output_prefix + "_pl", *extra),
                   _get_coverage_bw(bw_mn, chromosome_startswith, output_dir, output_prefix + "_mn", *extra)]
-    (pl, pc), (mn, mc) = [x[:2] for x in loaded]
-    cache_files = [f for x in loaded for f in (x[2] if as_tracks else ())]
+    (pl, pc), (mn, mc) = loaded
 
     pl_chrs = set(pl.keys())
     mn_chrs = set(mn.keys())
@@ -849,7 +841,7 @@ def _coverage_bw(bw_pl, bw_mn, chromosome_startswith, output_dir, output_prefix,
         pc -= c0
         c1 = _clean(mn, allowed_bws)
         mc -= c1
-    return pl, mn, pc + mc, cache_files
+    return pl, mn, pc + mc
 
 
 class BamParsers:
@@ -1107,16 +1099,15 @@ def get_read_signal(input_bam, loc_prime, chromosome_startswith, output_dir, out
         Total read counts passing filters
     """
     return _read_signal(input_bam, loc_prime, chromosome_startswith, output_dir, output_prefix, filters=filters,
-                        reverse_complement=reverse_complement, **kwargs)[:3]
+                        reverse_complement=reverse_complement, **kwargs)
 
 
 def _read_signal(input_bam, loc_prime, chromosome_startswith, output_dir, output_prefix, filters=(),
                  reverse_complement=False, as_tracks=False, **kwargs):
     """
-    `get_read_signal`, returning (pl, mn, read_counts, cache_files). With `as_tracks`, pl and mn map chromosomes
-    to `CoverageTrack`s holding what the dumps would hold, and no dumps are written; dumps found in the output
-    directory (the cache) are loaded into tracks and listed in cache_files, so the caller can delete them as it
-    deletes dumps. Without `as_tracks`, cache_files is empty (the returned paths are the files).
+    `get_read_signal`, returning (pl, mn, read_counts). With `as_tracks`, pl and mn map chromosomes to
+    `CoverageTrack`s holding what the dumps would hold; no dumps are written, and dumps already in the output
+    directory are not read.
     """
     logger = logging.getLogger(__logger_name__)
     supported_protocols = {
@@ -1197,7 +1188,6 @@ def _read_signal(input_bam, loc_prime, chromosome_startswith, output_dir, output
                                    rc=bool(reverse_complement), output_dir=output_dir, output_prefix=output_prefix,
                                    threads=kwargs.get("thread_n", 1), as_tracks=as_tracks)
 
-    cache_files = []
     if load_cache_flag:
         logger.info("Loading cache from previous result, if you want to re-parse the bam file, "
                     "please delete all files end with npy first.")
@@ -1261,7 +1251,8 @@ def _read_signal(input_bam, loc_prime, chromosome_startswith, output_dir, output
                     fn = os.path.join(output_dir, output_prefix + "_mn_%s" % chrom)
                     result_mn[chrom] = _store_or_save(chromosome_coverage_mn[chrom], fn, as_tracks)
                     break
-    return result_pl, result_mn, read_counts, cache_files
+    bam.close()
+    return result_pl, result_mn, read_counts
 
 
 def _store_or_save(arr, fn, as_tracks):
