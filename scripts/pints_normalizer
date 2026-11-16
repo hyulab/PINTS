@@ -48,6 +48,11 @@ logging.basicConfig(format="%(name)s - %(asctime)s - %(levelname)s: %(message)s"
 logger = logging.getLogger("PINTS - Normalizer")
 
 
+def _output_pref(bam_file, output_dir):
+    """<output_dir>/<bam file name without .bam>, so the bigWigs are <prefix>_pl.bw and <prefix>_mn.bw"""
+    return os.path.join(output_dir, os.path.splitext(os.path.basename(bam_file))[0])
+
+
 def spikein_normalization(bam_files, spike_ins, exp_type, output_dir, cell_nums=(), spikein_scale=1000000, **kwargs):
     """
     Normalize samples using spike-in counts and cell counts
@@ -114,10 +119,8 @@ def spikein_normalization(bam_files, spike_ins, exp_type, output_dir, cell_nums=
 
     for i in range(spikein_scales.shape[0]):
         logger.info("Normalizing %s" % bam_files[i])
-        fn, ext = os.path.splitext(bam_files[i])
-        output_prefix = fn.replace(ext, "")
-        bam_to_bigwig(bam_files[i], exp_type=exp_type, output_pref=os.path.join(output_dir, output_prefix),
-                      normalization_factor=spikein_scales[i], chromosome_startswith=kwargs["chromosome_startswith"])
+        visualizer.bam_to_bigwig(bam_files[i], exp_type=exp_type, output_pref=_output_pref(bam_files[i], output_dir),
+                                 normalization_factor=spikein_scales[i], **kwargs)
         logger.info("Done: normalizing %s" % bam_files[i])
 
 
@@ -143,8 +146,8 @@ def RPM_normalization(bam_files, exp_type, output_dir, rc=False, **kwargs):
     """
     for bam in bam_files:
         logger.info("Working on %s" % bam)
-        bam_to_bigwig(bam, exp_type=exp_type, output_dir=output_dir, normalization_factor=1, rpm=True, rc=rc, **kwargs)
-        bam_to_bigwig(bam, exp_type=exp_type, output_dir=output_dir, normalization_factor=1, rpm=True, rc=rc, **kwargs)
+        visualizer.bam_to_bigwig(bam, exp_type=exp_type, output_pref=_output_pref(bam, output_dir),
+                                 normalization_factor=1, rpm=True, rc=rc, **kwargs)
 
 
 if __name__ == "__main__":
@@ -153,7 +156,7 @@ if __name__ == "__main__":
     parser.add_argument("-b", "--bam", nargs="+", required=True)
     parser.add_argument("-f", "--fasta-spike-in")
     parser.add_argument("-e", "--exp-type")
-    parser.add_argument("-o", "--output-dir")
+    parser.add_argument("-o", "--output-dir", default=".")
     parser.add_argument("-c", "--cell-numbers", nargs="+", required=False, type=int)
     parser.add_argument("-r", "--reverse-complement", action="store_true", dest="seq_reverse_complement",
                         required=False, default=False,
@@ -167,8 +170,9 @@ if __name__ == "__main__":
     parser.add_argument("-v", "--version", action="version", version=__version__)
     args = parser.parse_args()
 
-    DEFAULT_PREFIX = "normalizing_" + datetime.datetime.now().strftime("%Y_%M_%d_%H_%M_%S")
-    logger.addHandler(logging.FileHandler(os.path.join(args.output_prefix, "{0}.log".format(DEFAULT_PREFIX))))
+    log_assert(os.path.isdir(args.output_dir), "Cannot access output directory %s" % args.output_dir, logger)
+    DEFAULT_PREFIX = "normalizing_" + datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+    logger.addHandler(logging.FileHandler(os.path.join(args.output_dir, "{0}.log".format(DEFAULT_PREFIX))))
     logger.info("PINTS version: {0}".format(__version__))
     logger.info("Command: {0}".format(" ".join(sys.argv)))
 

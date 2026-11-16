@@ -66,7 +66,8 @@ if __name__ == "__main__":
     parser.add_argument("--unidirectional-files", help="Unidirectional peak call(s)", nargs="+")
     parser.add_argument("--promoter-bed", default=None,
                         help="Promoter bed, if specified, will create a separate bed file for distal elements")
-    parser.add_argument("--save-to", default=".", help="save elements to")
+    parser.add_argument("--save-to", default=None,
+                        help="Save extended elements to this folder. Default: next to the peak calls")
     parser.add_argument("--div-ext-left", action="store", dest="div_ext_left", nargs="+",
                         type=int, required=False, default=(60,), help="divergent extension left")
     parser.add_argument("--div-ext-right", action="store", dest="div_ext_right", nargs="+",
@@ -82,7 +83,10 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     DEFAULT_PREFIX = "boundary_extension_" + datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
-    handler = logging.FileHandler(os.path.join(args.save_to, "{0}_{1}.log".format(DEFAULT_PREFIX, os.getpid())))
+    log_dir = args.save_to if args.save_to is not None else "."
+    if not os.path.isdir(log_dir):
+        sys.exit("Cannot access the output folder %s" % log_dir)
+    handler = logging.FileHandler(os.path.join(log_dir, "{0}_{1}.log".format(DEFAULT_PREFIX, os.getpid())))
     formatter = logging.Formatter("%(name)s - %(asctime)s - %(levelname)s: %(message)s")
     handler.setFormatter(formatter)
     logger.addHandler(handler)

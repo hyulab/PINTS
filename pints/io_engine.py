@@ -769,8 +769,9 @@ def parse_gtf(filename, cache=1, cache_suffix="_pd_cache.csv"):
     """
     assert os.path.exists(filename), "Cannot access the file you provided."
 
-    if cache and os.path.exists(filename + cache_suffix):
-        return pd.read_csv(filename + cache_suffix, index_col=None)
+    cache_file = filename + cache_suffix
+    if cache and os.path.exists(cache_file) and os.path.getmtime(cache_file) >= os.path.getmtime(filename):
+        return pd.read_csv(cache_file, index_col=None)
 
     result = defaultdict(list)
 
@@ -784,7 +785,10 @@ def parse_gtf(filename, cache=1, cache_suffix="_pd_cache.csv"):
 
     df = pd.DataFrame(result)
     if cache:
-        df.to_csv(filename + cache_suffix, index=False)
+        try:
+            df.to_csv(cache_file, index=False)
+        except OSError:  # e.g. the annotation sits in a read-only folder; the cache is only a speed-up
+            pass
     if not pd.api.types.is_numeric_dtype(df["start"]):
         df["start"] = df["start"].astype(int)
     if not pd.api.types.is_numeric_dtype(df["end"]):
