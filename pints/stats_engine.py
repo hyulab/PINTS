@@ -31,6 +31,37 @@ except ImportError as e:
 
 __CACHE_KEY_FORMAT__ = "%d-%d"
 
+# Options of `peak_calling` that set state of this module used inside the statistical tests. Each is registered
+# next to the code it controls. `peak_calling` applies them before any worker process exists, and the pool passes
+# the same values to every worker (so they do not rely on inheritance at fork).
+_OPTIONS = {}
+_ACTIVE_OPTIONS = {}
+
+
+def register_option(name, default, apply):
+    """Register keyword argument `name` of `peak_calling`. `apply(value)` sets the module state; it returns None or
+    a warning message for the log."""
+    _OPTIONS[name] = (default, apply)
+
+
+def configure_options(values):
+    """Apply every registered option from `values` (a dict; missing names take their defaults). Returns the
+    warning messages of the options."""
+    _ACTIVE_OPTIONS.clear()
+    messages = []
+    for name, (default, apply) in _OPTIONS.items():
+        value = values.get(name, default)
+        _ACTIVE_OPTIONS[name] = value
+        message = apply(value)
+        if message:
+            messages.append(message)
+    return messages
+
+
+def active_options():
+    """The option values last applied by `configure_options`, for handing to worker processes."""
+    return dict(_ACTIVE_OPTIONS)
+
 
 def ler_candidate_background(coverage_info, b, s, query_end_left, query_start_right):
     """Background of a LER candidate [b, s): 2.5 kb on each side, with the peak under test masked.

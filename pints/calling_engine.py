@@ -1254,24 +1254,27 @@ def _context_for(index, lines, lo, hi):
     return [lines[i] for i in sel.tolist()], bounds
 
 
-def _worker_init(model_name, iqr_name):
-    """Pool initializer: make the statistical model/IQR strategy available in every worker (spawn-safe)."""
+def _worker_init(model_name, iqr_name, options=None):
+    """Pool initializer: make the statistical model/IQR strategy and the options of the statistical tests
+    (`stats_engine.register_option`) available in every worker (spawn-safe)."""
     global stat_tester, iqr_obj
     from . import stats_engine as _se
+    if options:
+        _se.configure_options(options)
     stat_tester = getattr(_se, model_name)() if model_name else None
     iqr_obj = getattr(_se, iqr_name)() if iqr_name else None
 
 
 def _make_pool(n):
     import multiprocessing as mp
-    from .stats_engine import numba_warmup
+    from .stats_engine import numba_warmup, active_options
     numba_warmup()
     try:
         ctx = mp.get_context("fork")
     except ValueError:  # pragma: no cover - platforms without fork
         ctx = mp.get_context()
     init_args = (type(stat_tester).__name__ if stat_tester is not None else None,
-                 type(iqr_obj).__name__ if iqr_obj is not None else None)
+                 type(iqr_obj).__name__ if iqr_obj is not None else None, active_options())
     # The workers' cyclic GC never visits objects that exist at the fork, so it doesn't write to (and copy) the
     # parent's pages in every worker; the parent collects them again after the fork.
     import gc
@@ -2902,6 +2905,10 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
         except ImportError:
             log_assert(False, "--debug saves diagnostic plots, which need matplotlib: pip install 'pyPINTS[plots]'",
                        logger)
+    # options of the statistical tests (stats_engine.register_option); set before any worker process exists
+    from .stats_engine import configure_options
+    for message in configure_options(kwargs):
+        logger.warning(message)
     if model == "ZIP":
         stat_tester = ZIP()
     elif model == "Poisson":
