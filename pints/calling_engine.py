@@ -81,6 +81,7 @@ def check_update():
     logger.info("Checking for updates...")
     import json
     import time
+    import urllib.error
     import urllib.request
 
     try:
@@ -89,7 +90,9 @@ def check_update():
                 with urllib.request.urlopen("https://pypi.org/pypi/pyPINTS/json", timeout=10) as response:
                     rj = json.load(response)
                 break
-            except OSError:  # URLError, HTTPError and timeouts
+            except urllib.error.HTTPError:  # the server answered (e.g. 403 from a proxy): urllib3 did not retry
+                raise
+            except OSError:  # connection errors and timeouts
                 if wait is None:
                     raise
                 time.sleep(wait)

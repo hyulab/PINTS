@@ -52,3 +52,19 @@ def test_check_update_offline_only_logs(monkeypatch, caplog):
         ce.check_update()  # does not raise
     assert len(calls) == 4 and waits == [0, 6, 12]
     assert "offline" in caplog.text
+
+
+def test_check_update_http_error_is_not_retried(monkeypatch, caplog):
+    """An HTTP error (e.g. 403 from a proxy) is an answer, not a connection failure: urllib3 did not retry it."""
+    calls, waits = [], []
+
+    def urlopen(url, timeout):
+        calls.append(url)
+        raise urllib.error.HTTPError(url, 403, "Forbidden", {}, None)
+
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    monkeypatch.setattr("time.sleep", waits.append)
+    with caplog.at_level(logging.ERROR):
+        ce.check_update()  # does not raise
+    assert len(calls) == 1 and waits == []
+    assert "403" in caplog.text

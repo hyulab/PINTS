@@ -53,8 +53,10 @@ def prepare_regions(primary_regions, additional_regions=None, max_dist=0):
     all_files = list(primary_regions)
     if additional_regions:
         all_files.extend(list(additional_regions))
-    # BedTool.cat(*all_files, postmerge=False).sort().merge(d=max_dist)
-    merged = bed_ops.merge_lines(bed_ops.sort_lines(bed_ops.cat_lines(all_files)), distance=max_dist)
+    # BedTool.cat(*all_files, postmerge=False).sort().merge(d=max_dist); the files are the user's, so they may be
+    # gzip-compressed or carry header, track or browser lines, which bedtools skipped
+    merged = bed_ops.merge_lines(bed_ops.sort_lines(bed_ops.cat_parts([bed_ops.read_records(p) for p in all_files])),
+                                 distance=max_dist)
     return [ln.rstrip("\n").split("\t") for ln in merged]
 
 

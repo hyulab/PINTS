@@ -130,3 +130,25 @@ def test_counter_prepare_regions(max_dist, tmp_path):
     expected = pybedtools.BedTool.cat(*[pybedtools.BedTool(f) for f in paths], postmerge=False).sort().merge(
         d=max_dist).saveas()
     assert [[r[0], int(r[1]), int(r[2])] for r in got] == [[r[0], r.start, r.end] for r in expected]
+
+
+def test_counter_prepare_regions_reads_users_files(tmp_path):
+    """Region files are the user's: gzip-compressed ones and header, track and browser lines work, as with
+    bedtools."""
+    import gzip
+    pybedtools = pytest.importorskip("pybedtools")
+    rng = random.Random(7)
+    plain = str(tmp_path / "0.bed")
+    _write(plain, _pair_records(rng, 300, ["chr1", "chr2"], 100_000))
+    with open(plain) as fh:
+        records = fh.read()
+    headed = str(tmp_path / "1.bed")
+    with open(headed, "w") as fh:
+        fh.write("track name=calls\nbrowser position chr1:1-1000\n#chrom\tstart\tend\n" + records)
+    compressed = str(tmp_path / "2.bed.gz")
+    with gzip.open(compressed, "wt") as fh:
+        fh.writelines(_single_records(rng, 300, ["chr1", "chr2"], 100_000))
+    got = _load_counter().prepare_regions([plain, headed], [compressed], max_dist=0)
+    expected = pybedtools.BedTool.cat(*[pybedtools.BedTool(f) for f in (plain, headed, compressed)],
+                                      postmerge=False).sort().merge().saveas()
+    assert [[r[0], int(r[1]), int(r[2])] for r in got] == [[r[0], r.start, r.end] for r in expected]
