@@ -187,7 +187,9 @@ if __name__ == "__main__":
     group = parser.add_argument_group("Other")
     group.add_argument("--epig-annotation", action="store", dest="epig_annotation", type=str, required=False,
                        help="Refine peak calls with compiled epigenomic annotation from the PINTS web server."
-                            " Values should be the name of the biosample, for example, K562.")
+                            " Values should be the name of the biosample, for example, K562, or a path to a"
+                            " local bigBed file. If the annotation cannot be obtained, peaks are called"
+                            " without it (with a warning).")
     group.add_argument("--relaxed-fdr-target", action="store", dest="relaxed_fdr_target", default=0.2,
                        type=float, required=False, help="Relaxed FDR cutoff for TREs overlap with epigenomic annotations")
     group.add_argument("--chromosome-start-with", action="store", dest="chromosome_startswith",
