@@ -25,6 +25,12 @@ Alternatively, you can clone this repo to a local directory, then run the follow
 python setup.py install
 ```
 
+Two optional extras add packages that PINTS can use but does not need:
+
+* `pip install 'pyPINTS[fast]'` installs [Numba](https://numba.pydata.org), which compiles the statistical kernels
+  used during peak calling. Results are the same with and without it; only the run time differs.
+* `pip install 'pyPINTS[plots]'` installs matplotlib, which `--debug` needs for its diagnostic plots.
+
 ## Get started
 
 PINTS can call peaks from either bigWig or BAM files. If you have signals for the forward and reverse strands in
@@ -150,6 +156,10 @@ For all three types of TREs, if a valid biosample name for `--epig-annotation` i
 * `--sensitive`: Call peaks in a more sensitive mode (LRT+FC).
 
 More parameters can be seen by running `pints_caller -h`.
+
+To see where a run spends its time, set the environment variable `PINTS_PHASE_TIMING=1`: PINTS then writes the
+wall time of each stage (input parsing, element definition, the two testing phases, filtering and pairing) to
+stderr as `[phase]` lines, each measured from the end of the previous one. It does not change any output.
 
 ## Case Study: Identify Differentially Expressed TREs
 In this section, we try to identify differentially expressed TREs (promoters and enhancers) from two conditions.

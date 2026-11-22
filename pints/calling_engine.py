@@ -14,10 +14,12 @@
 #  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 #  GNU General Public License for more details.
 
-import datetime
 import gzip
+import io
 import logging
 import os
+import re
+import shutil
 import sys
 from collections import namedtuple
 from glob import glob
@@ -36,15 +38,18 @@ try:
     import pandas as pd
     import pysam
     import pyBigWig
-    import pybedtools
     from scipy.stats import poisson
     from scipy.signal import find_peaks, peak_widths
     from scipy.ndimage import gaussian_filter1d
-    from pybedtools import BedTool
     from .stats_engine import Poisson, ZIP, pval_dist, bgIQR, pkIQR, \
         independent_filtering, get_elbow
-    from .io_engine import get_read_signal, get_coverage_bw, log_assert, normalize_using_input, \
-        index_bed_file, peak_bed_to_gtf, merge_replicates_bw
+    from .io_engine import get_read_signal, get_coverage_bw, log_assert, normalize_using_input, is_zero_track, \
+        npy_layout, npy_read, NPY_BLOCK, \
+        index_bed_file, peak_bed_to_gtf, merge_replicates_bw, _read_signal, _coverage_bw, merge_replicate_tracks, \
+        normalize_tracks_using_input
+    from . import bed_ops
+    from .coverage_store import register as register_track, lookup as lookup_track, release as release_tracks, \
+        is_key
     from pints import __version__
 except ImportError as e:
     missing_package = str(e).replace("No module named '", "").replace("'", "")
@@ -52,6 +57,9 @@ except ImportError as e:
     sys.exit(-1)
 
 housekeeping_files = []
+# Coverage lives in the in-memory store (pints/coverage_store.py, reached by registry keys) instead of per-base
+# .npy dumps. PINTS_COVERAGE_STORE=0 uses the dumps (same results; kept for differential testing).
+COVERAGE_STORE = os.environ.get("PINTS_COVERAGE_STORE", "1") != "0"
 COMMON_HEADER = ('chromosome', 'start', 'end', 'name', 'padj', 'strand', 'reads',
                  'pval', 'mu_0', 'pi_0', 'mu_1', 'pi_1', 'var_1', 'ler_1', 'ler_2', 'ler_3',
                  'non_zeros', 'summit', 'summit_val')
@@ -71,34 +79,34 @@ def check_update():
 
     """
     logger.info("Checking for updates...")
-    import requests
-    from requests.adapters import HTTPAdapter
-    from urllib3.util import Retry
+    import json
     import time
-    requests.packages.urllib3.disable_warnings()
-    retry_strategy = Retry(
-        total=3,
-        backoff_factor=3
-    )
-    adapter = HTTPAdapter(max_retries=retry_strategy)
+    import urllib.error
+    import urllib.request
 
-    with requests.Session() as http:
-        http.mount("https://", adapter)
-
-        try:
-            req = http.get(url="https://pypi.org/pypi/pyPINTS/json", timeout=10)
-            rj = req.json()
-            remote_version = rj["info"]["version"]
-            import pints
-            if pints.__version__ == remote_version:
-                logger.info("You are using the latest version of PINTS")
-            else:
-                logger.warning("!!!Your PINTS version is out-dated ({cv} vs. {rv})!!!".format(cv=pints.__version__,
-                                                                                              rv=remote_version))
-                logger.warning("Please run `pip install -U pyPINTS` to update!")
-                time.sleep(10)
-        except Exception as ex:
-            logger.error(ex)
+    try:
+        for wait in (0, 6, 12, None):  # up to 3 retries, backing off as requests/urllib3 did
+            try:
+                with urllib.request.urlopen("https://pypi.org/pypi/pyPINTS/json", timeout=10) as response:
+                    rj = json.load(response)
+                break
+            except urllib.error.HTTPError:  # the server answered (e.g. 403 from a proxy): urllib3 did not retry
+                raise
+            except OSError:  # connection errors and timeouts
+                if wait is None:
+                    raise
+                time.sleep(wait)
+        remote_version = rj["info"]["version"]
+        import pints
+        if pints.__version__ == remote_version:
+            logger.info("You are using the latest version of PINTS")
+        else:
+            logger.warning("!!!Your PINTS version is out-dated ({cv} vs. {rv})!!!".format(cv=pints.__version__,
+                                                                                          rv=remote_version))
+            logger.warning("Please run `pip install -U pyPINTS` to update!")
+            time.sleep(10)
+    except Exception as ex:
+        logger.error(ex)
 
 
 def handle_exception(exc_type, exc_value, exc_traceback):
@@ -157,7 +165,7 @@ def run_command(cmd, repress_log=False):
 
 def runtime_check(check_updates=True):
     """
-    Runtime check, make sure all dependent tools are callable
+    Runtime check (PINTS no longer calls external tools: bgzip, tabix and bedtools are not needed)
 
     Parameters
     ----------
@@ -168,15 +176,8 @@ def runtime_check(check_updates=True):
     -------
 
     """
-    import shutil
     if sys.platform == "win32":
         logger.warning("No test had performed on Windows, so it might be buggy.")
-    dependent_tools = ("bgzip", "tabix", "bedtools")
-    for tool in dependent_tools:
-        full_path = shutil.which(tool)
-        if full_path is None:
-            logger.error("Required tool %s is not callable" % tool)
-            sys.exit(1)
     if check_updates:
         check_update()
 
@@ -259,9 +260,79 @@ def sliding_window(chromosome_coverage, window_size=100, step_size=100):
         end = start + window_size
 
 
+def window_sums(chromosome_coverage, window_size=100, step_size=100):
+    """
+    Vectorized equivalent of `sliding_window` for integer coverage arrays.
+
+    Returns the same window read counts (same dtype as ``np.sum`` of an integer slice, i.e. the
+    platform integer) and window start coordinates, without a Python-level loop.
+    Floating-point input falls back to per-window ``np.sum`` so that summation order is unchanged.
+
+    Returns
+    -------
+    sums : np.ndarray
+        Read counts per window
+    starts : np.ndarray
+        0-based start coordinates of the windows (ends are ``starts + window_size``)
+    """
+    if step_size < 1:
+        logger.error("step_size must >= 1")
+        raise ValueError("step_size must >= 1")
+    if len(chromosome_coverage) < 1:
+        logger.error("chromosome_coverage must >= 1")
+        raise ValueError("chromosome_coverage must >= 1")
+    total_bins = int(np.floor(chromosome_coverage.shape[0] / step_size - window_size / step_size + 1))
+    total_bins = max(total_bins, 0)
+    starts = np.arange(total_bins, dtype=np.int64) * step_size
+    cov = np.asarray(chromosome_coverage)
+    if total_bins == 0:
+        return np.zeros(0, dtype=np.sum(cov[:0]).dtype), starts
+    if not np.issubdtype(cov.dtype, np.integer):
+        sums = np.array([np.sum(cov[s:s + window_size]) for s in starts])
+        return sums, starts
+    acc = np.sum(cov[:0]).dtype  # accumulator dtype numpy uses for an integer sum (int64 / uint64)
+    if step_size == window_size:
+        sums = cov[:total_bins * window_size].reshape(total_bins, window_size).sum(axis=1, dtype=acc)
+    else:
+        cs = np.zeros(cov.shape[0] + 1, dtype=acc)
+        np.cumsum(cov, dtype=acc, out=cs[1:])
+        sums = cs[starts + window_size] - cs[starts]
+    return sums, starts
+
+
+def nonzero_window_regions(chromosome_coverage, window_size=100, step_size=100):
+    """
+    Regions formed by merging consecutive windows with positive read counts.
+
+    Equivalent to building a bed of windows with ``reads > 0`` (from `sliding_window`) and running
+    ``bedtools merge`` (overlapping / book-ended features are merged).
+
+    Returns
+    -------
+    regions : list of tuples
+        (start, end) of merged regions, sorted by start
+    """
+    sums, starts = window_sums(chromosome_coverage, window_size, step_size)
+    keep = sums > 0
+    if not keep.any():
+        return []
+    s = starts[keep]
+    e = s + window_size
+    # a new region starts when a window begins after the end of the previous window
+    breaks = np.ones(s.shape[0], dtype=bool)
+    if step_size >= window_size:
+        breaks[1:] = s[1:] > e[:-1]
+        idx = np.flatnonzero(breaks)
+        ends = np.maximum.reduceat(e, idx)
+        return [(int(a), int(b)) for a, b in zip(s[idx], ends)]
+    # overlapping windows: generic interval merge
+    return [tuple(x) for x in merge_intervals(list(zip(s.tolist(), e.tolist())))]
+
+
 def check_window(coord_start, coord_end, mu_peak, var_peak, pi_peak, chromosome_coverage, peak_in_bg_threshold,
                  mu_bkg_minimum, sp_bed_handler, chromosome_name, fdr_target, cache, small_window_threshold=5,
-                 flanking=(10000, 5000, 1000), disable_ler=False, enable_eler=True, top_peak_mu=None):
+                 flanking=(10000, 5000, 1000), disable_ler=False, enable_eler=True, top_peak_mu=None,
+                 compute_lrt=True):
     """
     Calculate p-value for a peak
 
@@ -301,6 +372,9 @@ def check_window(coord_start, coord_end, mu_peak, var_peak, pi_peak, chromosome_
         Set it to False to disable enhanced LER
     top_peak_mu : float
         Density threshold for peaks in local environments to be considered as potential true peaks
+    compute_lrt : bool
+        Whether to run the likelihood-ratio test. Its p-value is only consumed in sensitive mode,
+        so callers can skip it otherwise (the returned lrt_pval is then a 1.0 placeholder).
 
     Returns
     -------
@@ -350,8 +424,9 @@ def check_window(coord_start, coord_end, mu_peak, var_peak, pi_peak, chromosome_
                                                   peak_threshold=top_peak_mu)
 
         mu_, var_, pi_, _, _ = stat_tester.fit(bg)
-        w, pval = stat_tester.lrt(selected_window, bg)
-        lrt_pvals.append(pval)
+        if compute_lrt:
+            w, pval = stat_tester.lrt(selected_window, bg)
+            lrt_pvals.append(pval)
         mus.append(mu_)
         variances.append(var_)
         pis.append(pi_)
@@ -365,7 +440,7 @@ def check_window(coord_start, coord_end, mu_peak, var_peak, pi_peak, chromosome_
 
     pvalue = stat_tester.sf(mu_peak, var_peak, pi_peak, mu_0, var_0, pi_0)
 
-    return pvalue, window_value, mu_0, pi_0, ler_counts, np.mean(lrt_pvals), sig_dens
+    return pvalue, window_value, mu_0, pi_0, ler_counts, np.mean(lrt_pvals) if compute_lrt else 1., sig_dens
 
 
 def quasi_max_score_segment(candidates, donor_tolerance, ce_trigger, max_distance):
@@ -432,7 +507,7 @@ def quasi_max_score_segment(candidates, donor_tolerance, ce_trigger, max_distanc
     return fwd_search, rev_search
 
 
-def merge_covs(covs, chromosome_of_interest):
+def merge_covs(covs, chromosome_of_interest, skip_if_empty=False):
     """
     Merge coverage tracks
 
@@ -448,9 +523,12 @@ def merge_covs(covs, chromosome_of_interest):
     merged_coverage : np.ndarray
         merged coverage tracks
     """
+    if skip_if_empty and all(is_zero_track(_resolve_coverage(cd[chromosome_of_interest])) for cd in covs):
+        return None
     merged_coverage = None
     for cd in covs:
-        cov = np.load(cd[chromosome_of_interest])
+        ref = _resolve_coverage(cd[chromosome_of_interest])
+        cov = np.load(ref) if isinstance(ref, str) else ref.dense()
         if merged_coverage is None:
             merged_coverage = np.zeros(cov.shape[0], dtype=np.int32)
 
@@ -497,12 +575,13 @@ def cut_peaks_dry_run(annotation_gtf, pl_cov_files, mn_cov_files, tss_extension=
     pct_tss = pct_bed.loc[:, ("seqname", "start", "end", "transcript_id", "gene_name", "strand")]
     pct_tss["start"] = pct_tss.apply(lambda x: x["start"] if x["strand"] == "+" else x["end"] - 1, axis=1)
     pct_tss["end"] = pct_tss.apply(lambda x: x["start"] + 1 if x["strand"] == "+" else x["end"], axis=1)
-    pct_tss.drop_duplicates(subset=["seqname", "start", "end"], inplace=True)
-    pct_tss_bed = BedTool.from_dataframe(pct_tss)
+    pct_tss = pct_tss.drop_duplicates(subset=["seqname", "start", "end"])
+    pct_tss_bed = bed_ops.frame_lines(pct_tss)
     pct_tss["start"] -= tss_extension
     pct_tss["end"] += tss_extension
-    tss_window = BedTool.from_dataframe(pct_tss).sort().merge(s=True, c=(4, 5, 6),
-                                                              o=("distinct", "distinct", "distinct"))
+    merged_windows = bed_ops.merge_lines(bed_ops.sort_lines(bed_ops.frame_lines(pct_tss)), (4, 5, 6),
+                                         ("distinct", "distinct", "distinct"), strand=True)
+    tss_window = [(int(f[1]), int(f[2]), f[5]) for f in (ln.rstrip("\n").split("\t") for ln in merged_windows)]
     logger.info("%d annotated TSSs loaded" % pct_tss.shape[0])
     pl_cov = merge_covs(pl_cov_files, highlight_chromosome)
     mn_cov = merge_covs(mn_cov_files, highlight_chromosome)
@@ -523,20 +602,21 @@ def cut_peaks_dry_run(annotation_gtf, pl_cov_files, mn_cov_files, tss_extension=
     median_sizes = np.zeros(search_range.shape[0])
     for i, dt in enumerate(search_range):
         predicted_peaks_dicts = []
-        for window in tss_window:
-            if window.strand == "+":
+        for w_start, w_stop, w_strand in tss_window:
+            if w_strand == "+":
                 cov_obj = pl_cov
             else:
                 cov_obj = mn_cov
-            if np.sum(cov_obj[window.start:window.stop]) > 0:
-                ss, es = cp_atom(cov_obj, window.start, window.stop, donor_tolerance=dt)
+            if np.sum(cov_obj[w_start:w_stop]) > 0:
+                ss, es = cp_atom(cov_obj, w_start, w_stop, donor_tolerance=dt)
                 for sc, ec in zip(ss, es):
                     predicted_peaks_dicts.append({"seqname": highlight_chromosome,
                                                   "start": sc, "end": ec, "name": ".",
-                                                  "score": ".", "strand": window.strand})
-        predicted_peaks = BedTool.from_dataframe(pd.DataFrame(predicted_peaks_dicts))
-        tmp_result = predicted_peaks.intersect(pct_tss_bed, c=True, s=True)
-        tmp_df = tmp_result.to_dataframe(names=("seqname", "start", "end", "name", "score", "strand", "hits"))
+                                                  "score": ".", "strand": w_strand})
+        predicted_peaks = bed_ops.frame_lines(pd.DataFrame(predicted_peaks_dicts))
+        tmp_result = bed_ops.intersect_lines(predicted_peaks, pct_tss_bed, "c", strand=True)
+        tmp_df = pd.read_csv(io.StringIO("".join(tmp_result)), sep="\t",
+                             names=("seqname", "start", "end", "name", "score", "strand", "hits"))
         lens = tmp_df["end"] - tmp_df["start"]
         ambiguous_rate = tmp_df.loc[np.logical_and(lens > 2, tmp_df.hits > 1), :].shape[0] / \
                          tmp_df.loc[lens > 2, :].shape[0]
@@ -665,43 +745,360 @@ def check_window_chromosome(rc_file, output_file, strand_sign, chromosome_name, 
         Window bed in dataframe
     """
     global housekeeping_files
-    per_base_cov = np.load(rc_file, allow_pickle=True)
-    subpeak_bed = output_file.replace(".bed", __SUB_PEAK_TPL__ % chromosome_name)
-    if fc_cutoff > 0:
-        real_fc_cutoff = 1. / fc_cutoff
-    else:
-        real_fc_cutoff = 1.
+    ctx = _subpeak_phase1(rc_file, output_file, strand_sign, chromosome_name, subpeak_file,
+                          small_peak_threshold=small_peak_threshold, min_mu_percent=min_mu_percent,
+                          disable_qc=disable_qc, enable_eler=enable_eler, eler_min=eler_min)
     bins = []
+    if ctx["error"] is None:
+        if not ctx["index"].is_supported():
+            _sorted_subpeaks(ctx)
+        bins, err = _check_window_block(rc_file, chromosome_name, ctx["lines"], ctx["lines"], ctx,
+                                        fdr_target, disable_ler, sensitive, fc_cutoff, init_dens_cutoff,
+                                        init_height_cutoff,
+                                        context_bounds=(ctx["index"].start_arr, ctx["index"].end_arr))
+        if err is not None:
+            logger.error(str(chromosome_name) + "\t" + str(subpeak_file))
+            logger.error(err)
+    return _bins_to_df(bins, strand_sign)
+
+# ---------------------------------------------------------------------------------------------------
+# Window evaluation engine (phase 1: subpeak statistics + thresholds; phase 2: local-environment tests)
+#
+# Phase 2 is sequential within a chromosome only through the LER cache, whose keys are (clipped)
+# coordinates of subpeaks overlapping the flanks (<= max(flanking) // 2 bp) of the tested peak. Two
+# runs of subpeaks separated by a gap of more than 2 * max flank can never share a cache key, so they
+# can be evaluated independently (each with a fresh cache) and concatenated in file order. This is
+# what allows splitting a chromosome into chunks without changing any output byte.
+# ---------------------------------------------------------------------------------------------------
+_FLANK_MAX_HALF = 10000 // 2
+_SEGMENT_GAP = 15000  # > 2 * _FLANK_MAX_HALF, conservative
+_MIN_P1_BLOCK = 500  # minimum subpeaks per phase-1 task (tests lower these to force splitting)
+_MIN_P2_CHUNK = 200  # minimum subpeaks per phase-2 chunk
+_RESULT_COLUMNS = ("chromosome", "start", "end", "name", "pval", "reads",
+                   "mu_0", "pi_0", "mu_1", "pi_1", "var_1", "summit", "summit_val",
+                   "ler_1", "ler_2", "ler_3", "non_zeros")
+
+
+def _resolve_coverage(ref):
+    """A coverage dict value as readers use it: the track for a registry key, otherwise the path itself."""
+    return lookup_track(ref) if is_key(ref) else ref
+
+
+def _register_coverage(coverage, sample, strand):
+    """Register the tracks of a chromosome -> CoverageTrack dict; returns chromosome -> key (same order)."""
+    return {c: register_track(sample, strand, c, t) for c, t in coverage.items()}
+
+
+def _load_coverage(rc_file, lo=0, hi=None):
+    """
+    Read-only, page-cache-shared view of a coverage dump (same values/dtype as np.load). For a registry key,
+    a fresh full-length array of the track's dense dtype holding its bases in [lo, hi) and zeros elsewhere:
+    callers only read inside that span, and pages of `np.zeros` that are never written cost no memory.
+    """
+    if is_key(rc_file):
+        track = lookup_track(rc_file)
+        buf = track.empty_buffer()
+        track.fill(buf, lo, hi)
+        return buf
+    try:
+        return np.asarray(np.load(rc_file, mmap_mode="r"))
+    except ValueError:
+        return np.load(rc_file, allow_pickle=True)
+
+
+# Phase 2 reads coverage at most _FLANK_MAX_HALF bases beyond a tested peak (check_window's flanks) and 2500
+# bases beyond a subpeak overlapping those flanks (remove_peaks_in_local_env), and every such subpeak is in the
+# task's context lines.
+_PHASE2_REACH = _FLANK_MAX_HALF + 2500 + 2
+
+
+class SubpeakIndex:
+    """
+    In-memory stand-in for ``pysam.TabixFile`` over one chromosome's subpeak bed.
+
+    ``fetch`` reproduces tabix semantics for 0-based half-open BED records: records with
+    ``start < query_end`` and ``end > query_start`` are returned in file order; an empty query
+    (``query_end <= query_start``) returns nothing. Records must be sorted by start and have positive
+    length (`is_supported`); otherwise callers keep using tabix.
+
+    `starts`/`ends` (the lines' start and end columns, e.g. from the phase-1 worker that wrote them) spare
+    parsing the lines. The main process only needs the arrays (support check, chunking, contexts), so the
+    split fields and list copies that `fetch` uses are built on the first query.
+    """
+
+    def __init__(self, chromosome, lines, starts=None, ends=None):
+        from bisect import bisect_left, bisect_right
+        self._bl, self._br = bisect_left, bisect_right
+        self.chromosome = chromosome
+        self.lines = lines
+        if starts is None:
+            starts, ends = _line_bounds(lines)
+        self.start_arr = np.asarray(starts, dtype=np.int64)
+        self.end_arr = np.asarray(ends, dtype=np.int64)
+        self.prefix_max_end_arr = np.maximum.accumulate(self.end_arr)
+        self._supported = None
+        self._query = None
+
+    def is_supported(self):
+        if self._supported is None:
+            st, en = self.start_arr, self.end_arr
+            # strictly increasing starts: then file order is the unique (chrom, start)-sorted order that
+            # `bedtools sort` (unstable for ties) produces for the tabix file
+            self._supported = bool((en > st).all() and (st[1:] > st[:-1]).all())
+        return self._supported
+
+    def _query_state(self):
+        if self._query is None:
+            self._query = ([ln.split("\t") for ln in self.lines], self.start_arr.tolist(), self.end_arr.tolist(),
+                           self.prefix_max_end_arr.tolist())
+        return self._query
+
+    def indices(self, start, end):
+        if end <= start:
+            return range(0)
+        _, starts, ends, prefix_max_end = self._query_state()
+        hi = self._bl(starts, end)
+        lo = self._br(prefix_max_end, start)
+        return [i for i in range(lo, hi) if ends[i] > start]
+
+    def overlapping(self, start, end):
+        """`indices` as an int array, without building the query state (sorted starts only)."""
+        if end <= start:
+            return np.empty(0, dtype=np.intp)
+        hi = int(np.searchsorted(self.start_arr, end, side="left"))
+        lo = int(np.searchsorted(self.prefix_max_end_arr, start, side="right"))
+        return np.flatnonzero(self.end_arr[lo:hi] > start) + lo
+
+    def fetch(self, chromosome, start, end, parser=None):
+        if chromosome != self.chromosome:
+            raise ValueError("could not create iterator for region '%s:%d-%d'" % (chromosome, start + 1, end))
+        if start < 0:
+            raise ValueError("start out of range (%d)" % start)
+        f = self._query_state()[0]
+        return [f[i] for i in self.indices(start, end)]
+
+
+def _line_bounds(lines):
+    """Start and end columns of BED lines, as int64 arrays."""
+    fields = [ln.split("\t", 3) for ln in lines]
+    return (np.array([int(f[1]) for f in fields], dtype=np.int64),
+            np.array([int(f[2]) for f in fields], dtype=np.int64))
+
+
+class PeakBedIndex:
+    """
+    In-memory stand-in for ``pysam.TabixFile(path).fetch(chrom, start, end, parser=pysam.asTuple())``
+    over a bgzipped BED file written by `stratified_filtering` (sorted by chromosome, then start).
+
+    Lines are read from the very file that tabix indexes, so file order (including ties in start) is
+    the order tabix returns. ``fetch`` returns the tab-split fields of records with
+    ``start < query_end`` and ``end > query_start`` in file order; argument errors and unknown
+    chromosomes raise ValueError and empty regions return nothing, as with pysam. `open_peak_index`
+    only uses this class when every record has positive length, starts are non-decreasing within each
+    chromosome, each chromosome is one contiguous block, and there are no header/comment lines or
+    carriage returns; otherwise it falls back to tabix.
+    """
+
+    def __init__(self, blocks):
+        from bisect import bisect_left, bisect_right
+        self._bl, self._br = bisect_left, bisect_right
+        self._blocks = blocks  # chromosome -> (lines, starts, ends, prefix_max_end)
+
+    @classmethod
+    def from_file(cls, path):
+        """Return a PeakBedIndex, or None when the file is outside the supported subset."""
+        blocks = {}
+        chrom, lines, starts, ends, pme, m = None, None, None, None, None, -1
+        with gzip.open(path, "rt", newline="") as fh:  # bgzip output is multi-member gzip
+            for line in fh:
+                if not line.endswith("\n") or "\r" in line or line.startswith("#"):
+                    return None
+                parts = line.split("\t", 3)
+                if len(parts) < 4:
+                    return None
+                if not (parts[1].isascii() and parts[1].isdigit() and parts[2].isascii() and parts[2].isdigit()):
+                    return None
+                s, e = int(parts[1]), int(parts[2])
+                if parts[0] != chrom:
+                    if parts[0] in blocks:
+                        return None  # chromosome not contiguous
+                    chrom, lines, starts, ends, pme, m = parts[0], [], [], [], [], -1
+                    blocks[chrom] = (lines, starts, ends, pme)
+                elif s < starts[-1]:
+                    return None
+                if e <= s or s < 0:
+                    return None
+                lines.append(line)
+                starts.append(s)
+                ends.append(e)
+                m = e if e > m else m
+                pme.append(m)
+        return cls(blocks)
+
+    @classmethod
+    def from_tabix(cls, path, chromosomes):
+        """
+        PeakBedIndex of the records of `chromosomes` only, read through the file's tabix index, so that
+        building it decompresses those chromosomes' blocks only. A chromosome the index lacks gets no block, so
+        fetching it raises ValueError as tabix does. Returns None when a name is one tabix might parse as a
+        region, or the records are outside the supported subset.
+        """
+        tbx = pysam.TabixFile(path, index=path + ".csi")
+        try:
+            blocks = {}
+            contigs = set(tbx.contigs)
+            for chrom in chromosomes:
+                if not _TABIX_SAFE_NAME.match(chrom):
+                    return None
+                if chrom not in contigs:
+                    continue
+                lines, starts, ends, pme, m = [], [], [], [], -1
+                for rec in tbx.fetch(chrom):
+                    parts = rec.split("\t", 3)
+                    if "\r" in rec or len(parts) < 4 or parts[0] != chrom:
+                        return None
+                    if not (parts[1].isascii() and parts[1].isdigit() and parts[2].isascii() and parts[2].isdigit()):
+                        return None
+                    s, e = int(parts[1]), int(parts[2])
+                    if (starts and s < starts[-1]) or e <= s or s < 0:
+                        return None
+                    lines.append(rec + "\n")
+                    starts.append(s)
+                    ends.append(e)
+                    m = e if e > m else m
+                    pme.append(m)
+                blocks[chrom] = (lines, starts, ends, pme)
+        finally:
+            tbx.close()
+        return cls(blocks)
+
+    def fetch(self, chromosome, start, end, parser=None):
+        # argument checks in pysam's order: end, start, start > end, empty region, then the contig
+        if end < 0:
+            raise ValueError("end out of range (%d)" % end)
+        if start < 0:
+            raise ValueError("start out of range (%d)" % start)
+        if start > end:
+            raise ValueError("start (%d) >= end (%d)" % (start, end))
+        if start == end:
+            return []
+        block = self._blocks.get(chromosome)
+        if block is None:
+            raise ValueError("could not create iterator for region '%s:%d-%d'" % (chromosome, start + 1, end))
+        lines, starts, ends, pme = block
+        hi = self._bl(starts, end)
+        lo = self._br(pme, start)
+        return [lines[i][:-1].split("\t") for i in range(lo, hi) if ends[i] > start]
+
+
+_PEAK_INDEX_BYTES_PER_QUERY = 2000
+_TABIX_SAFE_NAME = re.compile(r"[A-Za-z0-9_.\-]+\Z")  # contig names a region string cannot misparse
+
+
+def open_peak_index(path, n_queries=None):
+    """
+    `PeakBedIndex` for `path` when supported and worthwhile, else a pysam.TabixFile over the same file.
+
+    Building the index costs ~1.2 us per record and a tabix query ~0.15 ms, so tabix is kept when there
+    are few queries relative to the file (compressed size is ~15-22 bytes per record). Either object
+    returns the same records, so this choice affects speed only.
+    """
+    if n_queries is None or n_queries * _PEAK_INDEX_BYTES_PER_QUERY >= os.path.getsize(path):
+        idx = PeakBedIndex.from_file(path)
+        if idx is not None:
+            return idx
+    return pysam.TabixFile(path, index=path + ".csi")
+
+
+def _subpeak_block_stats(rc_file, chromosome_name, strand_sign, raw_lines, small_peak_threshold):
+    """Phase-1 worker: per-subpeak statistics, formatted exactly as the subpeak bed lines, and their bounds."""
+    if is_key(rc_file):  # each subpeak reads its own bases only
+        starts, ends = _line_bounds(raw_lines)
+        per_base_cov = _load_coverage(rc_file, int(starts.min()), int(ends.max())) if len(raw_lines) else None
+    else:
+        per_base_cov = _load_coverage(rc_file)
+    out_lines = []
+    starts, ends = [], []
     all_peak_mus = []
     try:
-        with open(subpeak_bed, "w") as spb_fh, gzip.open(subpeak_file, "rt") as peak_obj:
-            for line in peak_obj:
-                items = line.strip().split("\t")
-                start = int(items[1])
-                end = int(items[2])
-                peak_region = per_base_cov[start:end]
-                window_value = peak_region.sum()
-                n_start_sizes = sum(peak_region > 0)  # if n start sizes is smaller than 3, then ZIP shouldn't be used
-                peak_len = end - start
-                if peak_len < small_peak_threshold \
-                        or window_value == 0 or n_start_sizes <= 3:
-                    mu_peak = window_value / peak_len
-                    var_peak = np.var(np.log2(peak_region + np.finfo(float).eps))
-                    pi_peak = 0
-                else:
-                    mu_peak, var_peak, pi_peak, _, _ = stat_tester.fit(peak_region)
-                    all_peak_mus.append(mu_peak)
-                x = np.argmax(peak_region)
-                summit_coord = start + x
-                non_zero_loci = (peak_region > 0).sum()
+        for line in raw_lines:
+            items = line.strip().split("\t")
+            start = int(items[1])
+            end = int(items[2])
+            peak_region = per_base_cov[start:end]
+            window_value = peak_region.sum()
+            n_start_sizes = sum(peak_region > 0)  # if n start sizes is smaller than 3, then ZIP shouldn't be used
+            peak_len = end - start
+            if peak_len < small_peak_threshold \
+                    or window_value == 0 or n_start_sizes <= 3:
+                mu_peak = window_value / peak_len
+                var_peak = np.var(np.log2(peak_region + np.finfo(float).eps))
+                pi_peak = 0
+            else:
+                mu_peak, var_peak, pi_peak, _, _ = stat_tester.fit(peak_region)
+                all_peak_mus.append(mu_peak)
+            x = np.argmax(peak_region)
+            summit_coord = start + x
+            non_zero_loci = (peak_region > 0).sum()
 
-                spb_fh.write("%s\t%d\t%d\t%s\t%f\t%s\t%s\t%f\t%d\t%d\t%d\n" % (
-                    chromosome_name, start, end, items[3], mu_peak, var_peak, strand_sign, pi_peak, non_zero_loci, 
-                    summit_coord, peak_region[x]))
+            out_lines.append("%s\t%d\t%d\t%s\t%f\t%s\t%s\t%f\t%d\t%d\t%d\n" % (
+                chromosome_name, start, end, items[3], mu_peak, var_peak, strand_sign, pi_peak, non_zero_loci,
+                summit_coord, peak_region[x]))
+            starts.append(start)
+            ends.append(end)
+    except TypeError as ex:
+        return out_lines, all_peak_mus, ex, _bounds(starts, ends)
+    return out_lines, all_peak_mus, None, _bounds(starts, ends)
 
-        index_bed_file(subpeak_bed, logger=logger)
 
-        bed_handler = pysam.TabixFile(subpeak_bed + ".gz", index=subpeak_bed + ".gz.csi")
+def _bounds(starts, ends):
+    return np.array(starts, dtype=np.int64), np.array(ends, dtype=np.int64)
+
+
+def _read_subpeak_input(subpeak_file):
+    opener = gzip.open if subpeak_file.endswith(".gz") else open  # plain from the pipeline's element definition
+    with opener(subpeak_file, "rt") as peak_obj:
+        return peak_obj.readlines()
+
+
+def _sorted_subpeaks(ctx):
+    """Tabix fallback (`ctx["index"]` does not support the lines): phase 2 tests the subpeaks in the order of the
+    sorted, compressed subpeak bed, as the original loop over that file did, so `ctx`'s lines and index are
+    replaced by that file's."""
+    lines = _read_subpeak_input(ctx["subpeak_bed"] + ".gz")
+    ctx["lines"] = lines
+    ctx["index"] = SubpeakIndex(ctx["chromosome"], lines)
+
+
+def _subpeak_thresholds(output_file, chromosome_name, subpeak_file, out_lines, all_peak_mus, error,
+                        min_mu_percent=0.1, disable_qc=False, enable_eler=True, eler_min=1., indexer=None,
+                        bounds=(None, None)):
+    """Phase-1 reduce: derive the per-chromosome thresholds, and write + index the subpeak bed when needed.
+
+    Phase 2 reads the subpeak bed through `ctx["index"]` (a `SubpeakIndex` over `out_lines`). Only when that
+    index does not support the lines (ties, unsorted or empty records) is the bed written, compressed and
+    indexed for the tabix fallback, as before. `indexer`, if given, is called instead of `index_bed_file`
+    (used to compress/index on the pool while the parent continues). `bounds` are the lines' start and end
+    columns, if known.
+    """
+    subpeak_bed = output_file.replace(".bed", __SUB_PEAK_TPL__ % chromosome_name)
+    ctx = {"lines": out_lines, "error": None, "chromosome": chromosome_name, "subpeak_file": subpeak_file,
+           "subpeak_bed": subpeak_bed}
+    if error is not None:
+        ctx["error"] = error
+        logger.error(str(chromosome_name) + "\t" + str(subpeak_file))
+        logger.error(error)
+        return ctx
+    index = SubpeakIndex(chromosome_name, out_lines, *bounds)
+    ctx["index"] = index
+    try:
+        if not index.is_supported():
+            with open(subpeak_bed, "w") as spb_fh:
+                spb_fh.writelines(out_lines)
+            if indexer is None:
+                index_bed_file(subpeak_bed, logger=logger)
+            else:
+                indexer(subpeak_bed)
         if len(all_peak_mus) == 0:
             peak_threshold = 1
             bkg_mu_threshold = 0
@@ -739,45 +1136,476 @@ def check_window_chromosome(rc_file, output_file, strand_sign, chromosome_name, 
                     "background".format(
                         empirical_true_peak_threshold, chromosome_name)
                 )
-        global_cache = {}
-        with gzip.open(subpeak_bed + ".gz", "rt") as peak_obj:
-            for peak in peak_obj:
-                candidate_peak = peak.split("\t")
-                peak_start = int(candidate_peak[1])
-                peak_end = int(candidate_peak[2])
-                peak_id = candidate_peak[3]
-                mu_peak = float(candidate_peak[4])
-                peak_var = float(candidate_peak[5])
-                pi_peak = float(candidate_peak[7])
-                peak_non_zeros = int(candidate_peak[8])
-                peak_summit = int(candidate_peak[9])
-                peak_summit_val = int(candidate_peak[10])
-
-                pval, wv, mu_bg, pi_bg, lerc, lrtp, sig_dens = check_window(
-                    coord_start=peak_start, coord_end=peak_end, mu_peak=mu_peak,
-                    var_peak=peak_var, pi_peak=pi_peak, chromosome_coverage=per_base_cov,
-                    peak_in_bg_threshold=peak_threshold, mu_bkg_minimum=bkg_mu_threshold,
-                    sp_bed_handler=bed_handler, chromosome_name=chromosome_name,
-                    fdr_target=fdr_target, cache=global_cache, disable_ler=disable_ler,
-                    enable_eler=enable_eler, top_peak_mu=empirical_true_peak_threshold)
-                if wv > 0:
-                    use_lrt = sensitive and pi_peak > 0. and pi_bg > 0. and (
-                                mu_bg / mu_peak < real_fc_cutoff) and sig_dens > init_dens_cutoff and peak_summit_val > init_height_cutoff
-                    bins.append(
-                        (chromosome_name, peak_start, peak_end, peak_id, lrtp if use_lrt else pval,
-                         wv, mu_bg, pi_bg, mu_peak, pi_peak, peak_var, peak_summit, peak_summit_val,
-                         lerc[0], lerc[1], lerc[2], peak_non_zeros))
     except TypeError as ex:
+        ctx["error"] = ex
         logger.error(str(chromosome_name) + "\t" + str(subpeak_file))
         logger.error(ex)
-    result_df = pd.DataFrame(bins, columns=("chromosome", "start", "end", "name", "pval", "reads",
-                                            "mu_0", "pi_0", "mu_1", "pi_1", "var_1", "summit", "summit_val",
-                                            "ler_1", "ler_2", "ler_3", "non_zeros"))
+        return ctx
+    ctx.update(peak_threshold=peak_threshold, bkg_mu_threshold=bkg_mu_threshold,
+               empirical_true_peak_threshold=empirical_true_peak_threshold, enable_eler=enable_eler)
+    return ctx
+
+
+def _subpeak_phase1(rc_file, output_file, strand_sign, chromosome_name, subpeak_file, small_peak_threshold=5,
+                    min_mu_percent=0.1, disable_qc=False, enable_eler=True, eler_min=1.):
+    raw = _read_subpeak_input(subpeak_file)
+    out_lines, mus, err, bounds = _subpeak_block_stats(rc_file, chromosome_name, strand_sign, raw,
+                                                       small_peak_threshold)
+    return _subpeak_thresholds(output_file, chromosome_name, subpeak_file, out_lines, mus, err,
+                               min_mu_percent=min_mu_percent, disable_qc=disable_qc, enable_eler=enable_eler,
+                               eler_min=eler_min, bounds=bounds)
+
+
+def _check_window_block(rc_file, chromosome_name, peak_lines, context_lines, ctx, fdr_target, disable_ler=False,
+                        sensitive=False, fc_cutoff=1.5, init_dens_cutoff=0.25, init_height_cutoff=4,
+                        chromosome_coverage=None, context_bounds=(None, None)):
+    """
+    Phase-2 worker: evaluate `peak_lines` (consecutive subpeak bed lines) with a fresh LER cache.
+
+    `context_lines` must contain every subpeak overlapping the flanks of the tested peaks (in file
+    order); `context_bounds`, if given, are their start and end columns. Returns (bins, error) where error is a
+    caught TypeError (as in the original loop) or None.
+    """
+    if chromosome_coverage is not None:
+        per_base_cov = chromosome_coverage
+    elif is_key(rc_file):
+        ctx_starts, ctx_ends = context_bounds if context_bounds[0] is not None else _line_bounds(context_lines)
+        if len(ctx_starts):
+            per_base_cov = _load_coverage(rc_file, int(ctx_starts.min()) - _PHASE2_REACH,
+                                          int(ctx_ends.max()) + _PHASE2_REACH)
+        else:
+            per_base_cov = _load_coverage(rc_file, 0, 0)
+    else:
+        per_base_cov = _load_coverage(rc_file)
+    if fc_cutoff > 0:
+        real_fc_cutoff = 1. / fc_cutoff
+    else:
+        real_fc_cutoff = 1.
+    index = SubpeakIndex(chromosome_name, context_lines, *context_bounds)
+    if index.is_supported():
+        bed_handler = index
+    else:  # ties / unsorted / empty records: use the tabix file itself
+        bed_handler = pysam.TabixFile(ctx["subpeak_bed"] + ".gz", index=ctx["subpeak_bed"] + ".gz.csi")
+    peak_threshold = ctx["peak_threshold"]
+    bkg_mu_threshold = ctx["bkg_mu_threshold"]
+    enable_eler = ctx["enable_eler"]
+    empirical_true_peak_threshold = ctx["empirical_true_peak_threshold"]
+    bins = []
+    global_cache = {}
+    try:
+        for peak in peak_lines:
+            candidate_peak = peak.split("\t")
+            peak_start = int(candidate_peak[1])
+            peak_end = int(candidate_peak[2])
+            peak_id = candidate_peak[3]
+            mu_peak = float(candidate_peak[4])
+            peak_var = float(candidate_peak[5])
+            pi_peak = float(candidate_peak[7])
+            peak_non_zeros = int(candidate_peak[8])
+            peak_summit = int(candidate_peak[9])
+            peak_summit_val = int(candidate_peak[10])
+
+            pval, wv, mu_bg, pi_bg, lerc, lrtp, sig_dens = check_window(
+                coord_start=peak_start, coord_end=peak_end, mu_peak=mu_peak,
+                var_peak=peak_var, pi_peak=pi_peak, chromosome_coverage=per_base_cov,
+                peak_in_bg_threshold=peak_threshold, mu_bkg_minimum=bkg_mu_threshold,
+                sp_bed_handler=bed_handler, chromosome_name=chromosome_name,
+                fdr_target=fdr_target, cache=global_cache, disable_ler=disable_ler,
+                enable_eler=enable_eler, top_peak_mu=empirical_true_peak_threshold,
+                compute_lrt=sensitive)
+            if wv > 0:
+                use_lrt = sensitive and pi_peak > 0. and pi_bg > 0. and (
+                        mu_bg / mu_peak < real_fc_cutoff) and sig_dens > init_dens_cutoff and \
+                          peak_summit_val > init_height_cutoff
+                bins.append(
+                    (chromosome_name, peak_start, peak_end, peak_id, lrtp if use_lrt else pval,
+                     wv, mu_bg, pi_bg, mu_peak, pi_peak, peak_var, peak_summit, peak_summit_val,
+                     lerc[0], lerc[1], lerc[2], peak_non_zeros))
+    except TypeError as ex:
+        return bins, ex
+    return bins, None
+
+
+def _bins_to_df(bins, strand_sign):
+    result_df = pd.DataFrame(bins, columns=_RESULT_COLUMNS)
     result_df["strand"] = strand_sign
     result_df = result_df.loc[:, ("chromosome", "start", "end", "name", "pval", "strand", "reads",
                                   "mu_0", "pi_0", "mu_1", "pi_1", "var_1",
                                   "summit", "summit_val", "ler_1", "ler_2", "ler_3", "non_zeros")]
     return result_df
+
+
+def _segment_chunks(lines, target, index=None):
+    """
+    Split subpeak lines (file order) into chunks of whole independent segments (gap >= _SEGMENT_GAP)
+    with roughly `target` lines each. Returns list of (lo, hi) line-index ranges. `index`, a SubpeakIndex
+    over `lines`, supplies the bounds without parsing the lines again.
+    """
+    if target <= 0 or len(lines) <= target:
+        return [(0, len(lines))]
+    if index is None:
+        index = SubpeakIndex(None, lines)
+    # line i can start a chunk if it starts >= _SEGMENT_GAP after the end of every earlier line
+    gaps = np.flatnonzero(index.start_arr[1:] - index.prefix_max_end_arr[:-1] >= _SEGMENT_GAP) + 1
+    chunks = []
+    lo = 0
+    for i in gaps.tolist():
+        if i - lo >= target:
+            chunks.append((lo, i))
+            lo = i
+    chunks.append((lo, len(lines)))
+    return chunks
+
+
+def _context_for(index, lines, lo, hi):
+    """Lines overlapping the flanks of lines[lo:hi] (superset of anything LER may query), and their bounds."""
+    q0 = max(int(index.start_arr[lo:hi].min()) - _FLANK_MAX_HALF - 2, 0)
+    q1 = int(index.prefix_max_end_arr[hi - 1]) + _FLANK_MAX_HALF + 2
+    sel = index.overlapping(q0, q1)
+    bounds = (index.start_arr[sel], index.end_arr[sel])
+    if sel.shape[0] and sel[-1] - sel[0] + 1 == sel.shape[0]:
+        return lines[sel[0]:sel[-1] + 1], bounds
+    return [lines[i] for i in sel.tolist()], bounds
+
+
+def _worker_init(model_name, iqr_name, options=None):
+    """Pool initializer: make the statistical model/IQR strategy and the options of the statistical tests
+    (`stats_engine.register_option`) available in every worker (spawn-safe)."""
+    global stat_tester, iqr_obj
+    from . import stats_engine as _se
+    if options:
+        _se.configure_options(options)
+    stat_tester = getattr(_se, model_name)() if model_name else None
+    iqr_obj = getattr(_se, iqr_name)() if iqr_name else None
+
+
+def _make_pool(n):
+    import multiprocessing as mp
+    from .stats_engine import numba_warmup, active_options
+    numba_warmup()
+    try:
+        ctx = mp.get_context("fork")
+    except ValueError:  # pragma: no cover - platforms without fork
+        ctx = mp.get_context()
+    init_args = (type(stat_tester).__name__ if stat_tester is not None else None,
+                 type(iqr_obj).__name__ if iqr_obj is not None else None, active_options())
+    # The workers' cyclic GC never visits objects that exist at the fork, so it doesn't write to (and copy) the
+    # parent's pages in every worker; the parent collects them again after the fork.
+    import gc
+    gc.collect()
+    gc.freeze()
+    try:
+        return ctx.Pool(n, initializer=_worker_init, initargs=init_args)
+    finally:
+        gc.unfreeze()
+
+
+def _run_tasks(pool, func, tasks, costs=None):
+    """Run star-tasks (ordered results) on `pool` (or inline when pool is None), longest first."""
+    if pool is None or len(tasks) <= 1:
+        return [func(*t) for t in tasks]
+    order = list(range(len(tasks)))
+    if costs is not None:
+        order.sort(key=lambda i: -costs[i])
+    out = [None] * len(tasks)
+    res = pool.starmap(_indexed_call, [(i, func, tasks[i]) for i in order], chunksize=1)
+    for i, r in res:
+        out[i] = r
+    return out
+
+
+def _indexed_call(i, func, args):
+    return i, func(*args)
+
+
+def _index_bed_task(path):
+    index_bed_file(path, logger=logger)
+
+
+def _pair_task(sample_prefix, df_dict, fdr_target, stringent_only, kwargs):
+    """`pair` + the unidirectional-output reformat of `peak_calling`, for one sample (pool task)."""
+    (bid, div, unid), gc = pair(sample_prefix, df_dict=df_dict, fdr_target=fdr_target,
+                                stringent_only=stringent_only, **kwargs)
+    unid_df = pd.read_csv(unid, sep="\t", names=COMMON_HEADER)
+    unid_df[["chromosome", "start", "end", "name", "padj", "strand",
+             "reads", "summit", "summit_val"]].to_csv(
+        unid, sep="\t", header=False, index=False)
+    return (bid, div, unid), tuple(gc)  # gc is a locally defined namedtuple (not picklable); only iterated
+
+
+def _read_peak_table(peaks_bed, window_size_threshold):
+    """One strand's filtered peaks as `peak_calling` reads them for pairing (also a pool task)."""
+    peak_df = pd.read_csv(peaks_bed, sep="\t", header=None, names=COMMON_HEADER)
+    return peak_df.loc[peak_df["end"] - peak_df["start"] < window_size_threshold, :]
+
+
+def _stratified_filtering_task(tmp_df, output_file, fdr_target, kwargs):
+    return stratified_filtering(tmp_df=tmp_df, output_file=output_file, fdr_target=fdr_target, **kwargs)
+
+
+_BGZF_EOF = bytes.fromhex("1f8b08040000000000ff0600424302001b0003000000000000000000")
+_BGZF_BLOCK = 0xff00  # uncompressed bytes per BGZF block, as in htslib
+_PARALLEL_WRITE_MIN_ROWS = 1  # empty tables are written by `stratified_filtering` itself
+
+
+def bgzf_compress(data, level=6):
+    """BGZF blocks (no EOF marker) holding `data`; any concatenation of these, plus _BGZF_EOF, is a BGZF file."""
+    import struct
+    import zlib
+    out = []
+    for a in range(0, len(data), _BGZF_BLOCK):
+        chunk = data[a:a + _BGZF_BLOCK]
+        c = zlib.compressobj(level, zlib.DEFLATED, -15)
+        cdata = c.compress(chunk) + c.flush()
+        if len(cdata) > 65536 - 26:  # incompressible: store
+            c = zlib.compressobj(0, zlib.DEFLATED, -15)
+            cdata = c.compress(chunk) + c.flush()
+        out.append(struct.pack("<4BI2BH2BHH", 31, 139, 8, 4, 0, 0, 255, 6, 66, 67, 2, len(cdata) + 25))
+        out.append(cdata)
+        out.append(struct.pack("<2I", zlib.crc32(chunk), len(chunk)))
+    return b"".join(out)
+
+
+def _filter_frame_task(tmp_df, output_file, fdr_target, kwargs):
+    """
+    Pool task: the stratified-filtering table, returned for `_ParallelIndexedBed` to write when the file can be
+    produced without bedtools sort, else written and indexed here exactly as `stratified_filtering` does.
+
+    index_bed_file sorts with `bedtools sort` (chromosome, then start; ties in no guaranteed order). The table
+    is already sorted by the same keys, so when no (chromosome, start) pair repeats, the sorted file is the
+    table as written.
+    """
+    result_df = _stratified_frame(tmp_df, output_file, fdr_target, **kwargs)
+    if result_df.shape[0] >= _PARALLEL_WRITE_MIN_ROWS and not result_df.duplicated(["chromosome", "start"]).any():
+        return "frame", result_df
+    result_df.to_csv(output_file, sep="\t", index=False, header=False)
+    index_bed_file(output_file, logger=logger)
+    return "path", output_file + ".gz"
+
+
+def _bed_chunk_task(chunk):
+    """Pool task: rows of the filtering table as `to_csv` writes them, BGZF-compressed."""
+    return bgzf_compress(chunk.to_csv(sep="\t", index=False, header=False).encode("utf-8"))
+
+
+def _bed_assemble_task(path, parts):
+    """Pool task: concatenate BGZF parts into `path` and build its CSI index (same index as index_bed_file)."""
+    with open(path, "wb") as fh:
+        for part in parts:
+            fh.write(part)
+        fh.write(_BGZF_EOF)
+    pysam.tabix_index(path, preset="bed", force=True, csi=True)
+    return path
+
+
+class _ParallelIndexedBed:
+    """
+    Stand-in for the AsyncResult of `_stratified_filtering_task`: get() returns the same .gz path, holding the
+    same lines. Filtering runs on one worker, then the table is formatted and compressed in row chunks across
+    the pool and indexed. Each step is submitted from the previous one's callback, so strands overlap.
+    """
+
+    def __init__(self, pool, tmp_df, output_file, fdr_target, kwargs, n_chunks):
+        import threading
+        self._pool, self._gz, self._n_chunks = pool, output_file + ".gz", max(1, n_chunks)
+        self._done = threading.Event()
+        self._value = self._error = None
+        pool.apply_async(_filter_frame_task, (tmp_df, output_file, fdr_target, kwargs),
+                         callback=self._filtered, error_callback=self._fail)
+
+    def _filtered(self, res):
+        try:
+            kind, payload = res
+            if kind == "path":
+                return self._finish(payload)
+            n = payload.shape[0]
+            step = -(-n // self._n_chunks)
+            chunks = [(payload.iloc[a:a + step],) for a in range(0, n, step)]
+            self._pool.starmap_async(_bed_chunk_task, chunks, chunksize=1,
+                                     callback=self._compressed, error_callback=self._fail)
+        except Exception as ex:
+            self._fail(ex)
+
+    def _compressed(self, parts):
+        try:
+            self._pool.apply_async(_bed_assemble_task, (self._gz, parts),
+                                   callback=self._finish, error_callback=self._fail)
+        except Exception as ex:
+            self._fail(ex)
+
+    def _finish(self, path):
+        self._value = path
+        self._done.set()
+
+    def _fail(self, ex):
+        self._error = ex
+        self._done.set()
+
+    def get(self):
+        self._done.wait()
+        if self._error is not None:
+            raise self._error
+        return self._value
+
+
+def _phase(label, t0=[None]):
+    """Wall-clock phase markers on stderr when PINTS_PHASE_TIMING is set (diagnostics only)."""
+    import time
+    now = time.perf_counter()
+    if label is not None and os.environ.get("PINTS_PHASE_TIMING"):
+        sys.stderr.write("[phase] %-28s %8.2fs\n" % (label, now - (t0[0] if t0[0] is not None else now)))
+    t0[0] = now
+
+
+def _element_definition_task(chrom_coverage, chromosome, sign, output_file, ce_donor, join_distance, ce_trigger,
+                             peak_width=None):
+    return unified_element_definition(chrom_coverage, chromosome, sign, output_file, ce_donor=ce_donor,
+                                      join_distance=join_distance, ce_trigger=ce_trigger, peak_width=peak_width,
+                                      compress=False)
+
+
+def _coverage_cost(coverage_dicts, chromosome):
+    """Scheduling weight of a chromosome: total on-disk size of its coverage tracks (dense size for tracks)."""
+    total = 0
+    for d in coverage_dicts:
+        f = d.get(chromosome)
+        if is_key(f):
+            t = lookup_track(f)
+            total += t.length * t.dtype.itemsize
+        elif isinstance(f, str) and os.path.exists(f):
+            total += os.path.getsize(f)
+    return total
+
+
+def evaluate_strand_jobs(jobs, fdr_target, pool=None, thread_n=1, **kwargs):
+    """
+    Evaluate candidate peaks for several (sample, strand) jobs at once.
+
+    Parameters
+    ----------
+    jobs : list of tuples
+        (per_base_cov, output_file, shared_peak_definitions, strand_sign) as in `peaks_single_strand`
+    fdr_target : float
+    pool : multiprocessing pool or None
+    thread_n : int
+        Used for chunk sizing only
+
+    Returns
+    -------
+    sub_dfs : list of lists of pd.DataFrame
+        For every job, the per-chromosome result frames (in per_base_cov order), identical to the
+        frames produced by `check_window_chromosome`.
+    """
+    small_peak_threshold = kwargs.get("small_peak_threshold", 5)
+    min_mu_percent = kwargs.get("min_mu_percent", 0.1)
+    disable_qc = kwargs.get("disable_qc", False)
+    disable_ler = kwargs.get("disable_ler", False)
+    enable_eler = kwargs.get("enable_eler", True)
+    eler_min = kwargs.get("eler_lower_bound", 1.)
+    sensitive = kwargs.get("sensitive", False)
+    fc_cutoff = kwargs.get("fc_cutoff", 1.5)
+    init_dens_cutoff = kwargs.get("init_dens_cutoff", 0.25)
+    init_height_cutoff = kwargs.get("init_height_cutoff", 4)
+
+    units = []  # (job index, chromosome, rc_file, output_file, strand, subpeak_file)
+    for j, (per_base_cov, output_file, spd, strand_sign) in enumerate(jobs):
+        for chrom, pbc_npy in per_base_cov.items():
+            if spd[chrom] is None:
+                continue
+            units.append((j, chrom, pbc_npy, output_file, strand_sign, spd[chrom]))
+
+    # ---- phase 1: per-subpeak statistics, in blocks
+    raws = [_read_subpeak_input(u[5]) for u in units]
+    total = sum(len(r) for r in raws)
+    workers = max(1, thread_n if pool is not None else 1)
+    block = max(_MIN_P1_BLOCK, total // (workers * 4) + 1) if pool is not None else 0
+    p1_tasks, p1_owner = [], []
+    for ui, (u, raw) in enumerate(zip(units, raws)):
+        if block <= 0 or len(raw) <= block:
+            ranges = [(0, len(raw))]
+        else:
+            ranges = [(a, min(a + block, len(raw))) for a in range(0, len(raw), block)]
+        for a, b in ranges:
+            p1_tasks.append((u[2], u[1], u[4], raw[a:b], small_peak_threshold))
+            p1_owner.append(ui)
+    _phase("phase1 setup")
+    p1_res = _run_tasks(pool, _subpeak_block_stats, p1_tasks, costs=[len(t[3]) for t in p1_tasks])
+    _phase("phase1 stats")
+
+    ctxs = []
+    pending_index = []
+    indexer = None
+    if pool is not None:
+        def indexer(path):
+            pending_index.append(pool.apply_async(_index_bed_task, (path,)))
+    by_unit = [[] for _ in units]  # each unit's phase-1 results, in block order
+    for owner, res in zip(p1_owner, p1_res):
+        by_unit[owner].append(res)
+    for ui, u in enumerate(units):
+        out_lines, mus, err, starts, ends = [], [], None, [], []
+        for ol, m, e, (st, en) in by_unit[ui]:
+            if err is not None:
+                break
+            out_lines.extend(ol)
+            mus.extend(m)
+            starts.append(st)
+            ends.append(en)
+            err = e
+        bounds = (np.concatenate(starts), np.concatenate(ends)) if starts else (None, None)
+        ctxs.append(_subpeak_thresholds(u[3], u[1], u[5], out_lines, mus, err, min_mu_percent=min_mu_percent,
+                                        disable_qc=disable_qc, enable_eler=enable_eler, eler_min=eler_min,
+                                        indexer=indexer, bounds=bounds))
+
+    _phase("phase1 thresholds")
+    # ---- phase 2: local-environment tests, in independent chunks
+    total2 = sum(len(c["lines"]) for c in ctxs if c["error"] is None)
+    target = max(_MIN_P2_CHUNK, total2 // (workers * 8) + 1) if pool is not None else 0
+    p2_tasks, p2_owner, p2_costs = [], [], []
+    for ui, (u, c) in enumerate(zip(units, ctxs)):
+        if c["error"] is not None:
+            continue
+        if not c["index"].is_supported():  # tabix fallback reads the compressed subpeak bed
+            for r in pending_index:
+                r.get()
+            pending_index = []
+            _sorted_subpeaks(c)
+        lines = c["lines"]
+        index = c["index"]
+        slim = {k: v for k, v in c.items() if k not in ("lines", "index")}
+        for lo, hi in (_segment_chunks(lines, target, index) if index.is_supported() else [(0, len(lines))]):
+            if lo == 0 and hi == len(lines):
+                context, bounds = lines, (index.start_arr, index.end_arr)
+            else:
+                context, bounds = _context_for(index, lines, lo, hi)
+            p2_tasks.append((u[2], u[1], lines[lo:hi], context, slim, fdr_target, disable_ler, sensitive,
+                             fc_cutoff, init_dens_cutoff, init_height_cutoff, None, bounds))
+            p2_owner.append(ui)
+            # a chunk's run time follows the subpeaks' total width more closely than their number (dense
+            # chromosomes such as chrEBV cost about twice as much per subpeak and cannot be split further)
+            p2_costs.append(int((index.end_arr[lo:hi] - index.start_arr[lo:hi]).sum()))
+    _phase("phase2 setup")
+    if pool is not None:
+        start_deferred_releases()  # the tests below write no files
+    p2_res = _run_tasks(pool, _check_window_block, p2_tasks, costs=p2_costs)
+    _phase("phase2 tests")
+    for r in pending_index:
+        r.get()
+
+    per_unit_bins = [[] for _ in units]
+    stopped = [False] * len(units)
+    for ui, (bins, err) in zip(p2_owner, p2_res):
+        if stopped[ui]:
+            continue
+        per_unit_bins[ui].extend(bins)
+        if err is not None:  # original loop stops at the first TypeError of a chromosome
+            stopped[ui] = True
+            logger.error(str(units[ui][1]) + "\t" + str(units[ui][5]))
+            logger.error(err)
+
+    sub_dfs = [[] for _ in jobs]
+    for ui, u in enumerate(units):
+        sub_dfs[u[0]].append(_bins_to_df(per_unit_bins[ui], u[4]))
+    return sub_dfs
 
 
 def stratified_filtering(tmp_df, output_file, fdr_target, dry_run=False, **kwargs):
@@ -801,6 +1629,14 @@ def stratified_filtering(tmp_df, output_file, fdr_target, dry_run=False, **kwarg
     result_df : str
         Path to a compressed and indexed bed file
     """
+    result_df = _stratified_frame(tmp_df, output_file, fdr_target, dry_run=dry_run, **kwargs)
+    result_df.to_csv(output_file, sep="\t", index=False, header=False)
+    index_bed_file(output_file, logger=logger)
+    return output_file + ".gz"
+
+
+def _stratified_frame(tmp_df, output_file, fdr_target, dry_run=False, **kwargs):
+    """The table `stratified_filtering` writes (same operations), sorted by chromosome and start."""
     if dry_run:
         result_df = tmp_df.copy()
         result_df["padj"] = result_df["pval"]
@@ -843,7 +1679,17 @@ def stratified_filtering(tmp_df, output_file, fdr_target, dry_run=False, **kwarg
             tmp_df = tmp_df.loc[big_peaks_probe, :]
             tmp_df_sm = None
         else:
-            tmp_df["pval"] = tmp_df.apply(cached_pois, axis=1)
+            if tmp_df.shape[0] > 0 and tmp_df["reads"].dtype.kind in "iuf":
+                # vectorised form of `cached_pois`: identical poisson.sf element-wise evaluations
+                lengths = tmp_df["end"] - tmp_df["start"]
+                small = (lengths <= small_peak_threshold).to_numpy()
+                pv = tmp_df["pval"].to_numpy(dtype=np.float64, copy=True)
+                if small.any():
+                    pv[small] = poisson.sf(tmp_df["reads"].to_numpy()[small],
+                                           (lamb_global * lengths).to_numpy()[small])
+                tmp_df["pval"] = pv
+            else:
+                tmp_df["pval"] = tmp_df.apply(cached_pois, axis=1)
 
             tmp_df_sm = independent_filtering(tmp_df.loc[small_peaks_probe, :], fdr_target=fdr_target,
                                               output_to=fn + "_idpf_sm.pdf",
@@ -893,14 +1739,12 @@ def stratified_filtering(tmp_df, output_file, fdr_target, dry_run=False, **kwarg
             result_df = tmp_df_bg
 
         result_df = result_df.loc[:, COMMON_HEADER]
-    result_df.sort_values(by=['chromosome', 'start'], inplace=True)
-    result_df.to_csv(output_file, sep="\t", index=False, header=False)
-    index_bed_file(output_file, logger=logger)
-    return output_file + ".gz"
+    result_df = result_df.sort_values(by=['chromosome', 'start'])
+    return result_df
 
 
 def peaks_single_strand(per_base_cov, output_file, shared_peak_definitions, strand_sign, fdr_target,
-                        **kwargs):
+                        precomputed=None, defer_filtering=False, **kwargs):
     """
     Calling peaks on one strand
 
@@ -925,40 +1769,37 @@ def peaks_single_strand(per_base_cov, output_file, shared_peak_definitions, stra
     """
     global housekeeping_files
 
-    args = []
-    for chrom, pbc_npy in per_base_cov.items():
+    # the per-chromosome files phase 1 and 2 may write, deleted at the end
+    for chrom in per_base_cov:
         if shared_peak_definitions[chrom] is None:  # bypass chromosomes without signals
             continue
         sub_peaks_name = output_file.replace(".bed", __SUB_PEAK_TPL__ % chrom)
         merged_name = output_file.replace(".bed", "_%s_merged_windows.bed" % chrom)
-        args.append((pbc_npy, output_file, strand_sign, chrom, shared_peak_definitions[chrom], fdr_target,
-                     kwargs.get("small_peak_threshold", 5), kwargs.get("min_mu_percent", 0.1),
-                     kwargs.get("disable_qc", False), kwargs.get("disable_ler", False),
-                     kwargs.get("enable_eler", True), kwargs.get("eler_lower_bound", 1.),
-                     kwargs.get("sensitive", False), kwargs.get("fc_cutoff", 1.5),
-                     kwargs.get("init_dens_cutoff", 0.25), kwargs.get("init_height_cutoff", 4)))
         housekeeping_files.append(merged_name)
         housekeeping_files.append(sub_peaks_name + ".gz")
         housekeeping_files.append(sub_peaks_name + ".gz.csi")
 
-    if kwargs.get("thread_n", 1) == 1:
-        # for debugging
-        sub_dfs = []
-        for arg_i in args:
-            sub_dfs.append(
-                check_window_chromosome(*arg_i)
-            )
+    if precomputed is not None:
+        sub_dfs = precomputed
+    elif kwargs.get("thread_n", 1) == 1:
+        sub_dfs = evaluate_strand_jobs([(per_base_cov, output_file, shared_peak_definitions, strand_sign)],
+                                       fdr_target, pool=None, **kwargs)[0]
     else:
-        with Pool(kwargs.get("thread_n", 1)) as pool:
-            sub_dfs = pool.starmap(check_window_chromosome, args)
+        with _make_pool(kwargs.get("thread_n", 1)) as pool:
+            sub_dfs = evaluate_strand_jobs([(per_base_cov, output_file, shared_peak_definitions, strand_sign)],
+                                           fdr_target, pool=pool, **kwargs)[0]
 
     sub_dfs = [sdf for sdf in sub_dfs if sdf is not None]
+    if defer_filtering and len(sub_dfs) == 0:
+        return None  # let the caller re-run inline so the failure surfaces at the original point
     log_assert(len(sub_dfs) > 0, "No signal found across all chromosomes!", logger)
     tmp_df = _concat_result_frames(sub_dfs)
 
     if kwargs.get("output_diagnostics", False):
         tmp_df.to_csv(output_file.replace(".bed", "_debug.csv"), index=False)
 
+    if defer_filtering:
+        return tmp_df
     return stratified_filtering(tmp_df=tmp_df, output_file=output_file, fdr_target=fdr_target, **kwargs)
 
 
@@ -977,7 +1818,7 @@ def _concat_result_frames(sub_dfs):
 
 
 def merge_opposite_peaks(sig_peak_bed, peak_candidate_bed, divergent_output_bed, bidirectional_output_bed,
-                         singleton_bed, fdr_target, stringent_only=False, **kwargs):
+                         singleton_bed, fdr_target, stringent_only=False, tbx=None, **kwargs):
     """
     Merge peaks on the opposite strand and generate divergent peak pairs
 
@@ -997,6 +1838,9 @@ def merge_opposite_peaks(sig_peak_bed, peak_candidate_bed, divergent_output_bed,
         FDR target
     stringent_only : bool
         Set it to True if you only want to keep significant pairs (both peaks needs to be significant)
+    tbx : None or object with tabix's fetch
+        Index of `peak_candidate_bed` (covering at least the chromosomes in `sig_peak_bed`); by default
+        `open_peak_index` opens one
 
     **kwargs :
         close_threshold : int
@@ -1008,7 +1852,10 @@ def merge_opposite_peaks(sig_peak_bed, peak_candidate_bed, divergent_output_bed,
     -------
 
     """
-    tbx = pysam.TabixFile(peak_candidate_bed, index=peak_candidate_bed + ".csi")
+    if tbx is None:
+        with open(sig_peak_bed, "r") as sig_fh:
+            n_queries = sum(1 for _ in sig_fh)
+        tbx = open_peak_index(peak_candidate_bed, n_queries=n_queries)
     fh = open(sig_peak_bed, "r")
     div_fh = open(divergent_output_bed, "w")
     bid_fh = open(bidirectional_output_bed, "w")
@@ -1128,7 +1975,62 @@ def merge_opposite_peaks(sig_peak_bed, peak_candidate_bed, divergent_output_bed,
     sfp_fh.close()
 
 
-def housekeeping(pybedtools_prefix=""):
+_background_deletions = []
+_deferred_deletions = []
+
+
+def release_coverage_files(old_dicts, live_dicts=(), defer=False):
+    """
+    Delete, on a background thread, the coverage dumps in `old_dicts` that no dict in `live_dicts` still
+    uses, and drop the in-memory tracks of `old_dicts` (registry keys) that no dict in `live_dicts` uses. They stay in `housekeeping_files`; `housekeeping` waits for the thread before its own pass.
+
+    Parameters
+    ----------
+    old_dicts : iterable of dict
+        chromosome -> .npy path maps that are no longer needed
+    live_dicts : iterable of dict
+        maps that are still in use (their paths are kept)
+    defer : bool
+        Only queue the files; `start_deferred_releases` deletes them. Unlinking tens of GB of cached dumps
+        slows down processes that write files at the same time, so the pool path starts the deletion when
+        the workers only compute.
+    """
+    old_dicts, live_dicts = list(old_dicts), list(live_dicts)
+    live_keys = {k for d in live_dicts for k in d.values() if is_key(k)}
+    release_tracks({k for d in old_dicts for k in d.values() if is_key(k)} - live_keys)  # in this process
+    live = {os.path.abspath(f) for d in live_dicts for f in d.values() if isinstance(f, str)}
+    paths = sorted({f for d in old_dicts for f in d.values()
+                    if isinstance(f, str) and f.endswith(".npy") and os.path.abspath(f) not in live})
+    if defer:
+        _deferred_deletions.extend(paths)
+    else:
+        _remove_in_background(paths)
+
+
+def start_deferred_releases():
+    """Start deleting the files queued by `release_coverage_files(..., defer=True)`."""
+    paths = list(_deferred_deletions)
+    del _deferred_deletions[:]
+    _remove_in_background(paths)
+
+
+def _remove_in_background(paths):
+    import threading
+
+    def _remove():
+        for f in paths:
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+
+    if paths:
+        t = threading.Thread(target=_remove, name="pints-release", daemon=True)
+        t.start()
+        _background_deletions.append(t)
+
+
+def housekeeping():
     """
     Delete intermediate files
 
@@ -1137,13 +2039,13 @@ def housekeeping(pybedtools_prefix=""):
 
     """
     global housekeeping_files
+    del _deferred_deletions[:]  # still in housekeeping_files
+    while _background_deletions:
+        _background_deletions.pop().join()
     try:
         for hf in housekeeping_files:
-            if os.path.exists(hf):
+            if isinstance(hf, str) and os.path.exists(hf):
                 os.remove(hf)
-        if pybedtools_prefix != "":
-            import shutil
-            shutil.rmtree(pybedtools_prefix)
     except Exception as ex:
         logger.warning(str(ex))
 
@@ -1199,8 +2101,127 @@ def show_parameter_info(input_bam, **kwargs):
             logger.info("%s: %s" % (k, v))
 
 
+def _release_free_heap():
+    """Return freed heap memory to the OS (glibc only; no-op elsewhere).
+
+    The block buffers are a few tens of MB; once glibc's dynamic mmap threshold has grown, such buffers come
+    from the heap and stay mapped in the (long-lived) worker after they are freed.
+    """
+    global _MALLOC_TRIM
+    if _MALLOC_TRIM is None:
+        try:
+            import ctypes
+            _MALLOC_TRIM = ctypes.CDLL("libc.so.6").malloc_trim
+        except (OSError, AttributeError):
+            _MALLOC_TRIM = False
+    if _MALLOC_TRIM:
+        _MALLOC_TRIM(0)
+
+
+_MALLOC_TRIM = None
+
+
+def _blockwise_element_definition(coverage_dict, chromosome_of_interest, subpeak_bed, join_distance, ce_donor,
+                                  ce_trigger, block=None, compress=True, peak_width=None):
+    """Block-wise form of the body of `unified_element_definition` (same file, same return value).
+
+    The merged int32 track is built one block at a time (``zeros(int32)`` then ``+=`` per replicate, the same
+    element-wise operations as `merge_covs`) instead of for the whole chromosome. Windows never straddle a
+    block (blocks are multiples of the window and start at multiples of it), and a region that touches the
+    end of a block is carried into the next buffer, so regions, sub-peaks and summits are exactly those of
+    the whole-chromosome computation. Returns False when the inputs are not plain 1-D integer .npy files of
+    one common length (the caller then runs the original code).
+    """
+    window = 100
+    block = NPY_BLOCK if block is None else int(block)
+    block = max(window, block // window * window)
+    tracks = []
+    n = None
+    for cd in coverage_dict:
+        path = _resolve_coverage(cd[chromosome_of_interest])
+        lay = npy_layout(path) if isinstance(path, str) else (None, path.dtype, path.length)
+        if lay is None or lay[1].kind not in "biu":
+            return False
+        if n is None:
+            n = lay[2]
+        elif lay[2] != n:
+            return False
+        if not is_zero_track(path):  # adding an all-zero track is a no-op
+            tracks.append((path, lay))
+    if n is None or n < 1:
+        return False
+
+    fhs = [open(p, "rb") if isinstance(p, str) else p for p, _ in tracks]  # tracks: windows instead of reads
+    spb_fh = None
+    index = 1
+    try:
+        def merged_slice(a, b):
+            m = np.zeros(b - a, dtype=np.int32)
+            for fh, (_, lay) in zip(fhs, tracks):
+                m += npy_read(fh, lay, a, b) if lay[0] is not None else fh.window(a, b)
+            return m
+
+        buf_start = 0
+        buf = None
+        pos = 0
+        while pos < n:
+            nxt = min(n, pos + block)
+            if n - nxt < window:  # final buffer extends to the end of the chromosome (partial window included)
+                nxt = n
+            fresh = merged_slice(pos, nxt)
+            buf = fresh if buf is None else np.concatenate((buf, fresh))
+            pos = nxt
+            final = pos >= n
+            regions = nonzero_window_regions(buf) if buf.shape[0] >= window else []
+            carry_from = None
+            if regions and not final and regions[-1][1] == buf.shape[0]:
+                carry_from = regions.pop()[0]  # may continue in the next block
+            for row_start, row_end in regions:
+                if spb_fh is None:
+                    spb_fh = open(subpeak_bed, "w")
+                sub_peaks = cut_peaks(buf[row_start:row_end],
+                                      donor_tolerance=ce_donor,
+                                      ce_trigger=ce_trigger,
+                                      join_distance=join_distance,
+                                      peak_width=peak_width)
+                for sp in sub_peaks:
+                    start = sp[0] + row_start
+                    end = sp[1] + row_start
+                    if end <= buf.shape[0] or final:
+                        peak_region = buf[start:end]
+                    else:
+                        peak_region = merged_slice(buf_start + start, min(n, buf_start + end))
+                    summit_coord = start + np.argmax(peak_region)
+                    spb_fh.write("%s\t%d\t%d\t%s-%d\t%d\n" % (
+                        chromosome_of_interest, start + buf_start, end + buf_start, chromosome_of_interest,
+                        index, summit_coord + buf_start))
+                    index += 1
+            if carry_from is None:
+                buf = None
+                buf_start = pos
+            else:
+                buf = buf[carry_from:].copy()
+                buf_start += carry_from
+    finally:
+        for (p, _), fh in zip(tracks, fhs):
+            if isinstance(p, str):
+                fh.close()
+        if spb_fh is not None:
+            spb_fh.close()
+        buf = fresh = None
+        _release_free_heap()
+
+    if index > 1:
+        if not compress:
+            return subpeak_bed
+        index_bed_file(subpeak_bed, logger=logger)
+        return subpeak_bed + ".gz"
+    return None
+
+
 def unified_element_definition(coverage_dict, chromosome_of_interest, strand_sign, output_file,
-                               join_distance=1, ce_donor=1.0, ce_trigger=3, peak_width=None):
+                               join_distance=1, ce_donor=1.0, ce_trigger=3, peak_width=None,
+                               compress=True):
     """
     Unified element boundary definition
     If multiple replicates are present, then this function will merge all signal tracks together
@@ -1221,6 +2242,9 @@ def unified_element_definition(coverage_dict, chromosome_of_interest, strand_sig
         Donor tolerance in best score segments
     ce_trigger : int
         Trigger for receptor tolerance checking
+    compress : bool
+        Compress and index the subpeak bed (returns the .gz path). The pipeline passes False: phase 1 only
+        reads the file from start to end, so it is left plain (same lines).
 
     Returns
     -------
@@ -1228,34 +2252,33 @@ def unified_element_definition(coverage_dict, chromosome_of_interest, strand_sig
         file name for the subpeak bed file, or None if there's no peak
     """
     subpeak_bed = output_file.replace(".bed", __SUB_PEAK_TPL__ % chromosome_of_interest)
-    bins = []
-    merged_coverage = merge_covs(coverage_dict, chromosome_of_interest)
-
-    for window, coord in sliding_window(merged_coverage):
-        if window > 0:  # no reads in the bin
-            bins.append((chromosome_of_interest, coord[0], coord[1], window))
-
-    tmp_df = pd.DataFrame(bins, columns=("chromosome", "start", "end", "reads"))
-    tmp_df["name"] = "."
-    tmp_df["strand"] = strand_sign
-    tmp_df = tmp_df.loc[:, ("chromosome", "start", "end", "name", "reads", "strand")]
-    if tmp_df.shape[0] == 0:  # no hit
+    if all(is_zero_track(_resolve_coverage(cd[chromosome_of_interest])) for cd in coverage_dict):
         return None
-    # merge windows in case peaks are split into different windows
-    bed_obj = BedTool(tmp_df.to_csv(sep="\t", index=False, header=False), from_string=True)
-    bed_obj = bed_obj.merge(c=(4, 5, 6), o=("distinct", "sum", "distinct"))
+    blockwise = _blockwise_element_definition(coverage_dict, chromosome_of_interest, subpeak_bed,
+                                              join_distance, ce_donor, ce_trigger, compress=compress,
+                                              peak_width=peak_width)
+    if blockwise is not False:
+        return blockwise
+    merged_coverage = merge_covs(coverage_dict, chromosome_of_interest, skip_if_empty=True)
+    if merged_coverage is None:  # all tracks are known to be empty for this chromosome
+        return None
+
+    # windows with reads, merged when book-ended (same as bedtools merge on the window bed)
+    regions = nonzero_window_regions(merged_coverage)
+    if len(regions) == 0:  # no hit
+        return None
 
     with open(subpeak_bed, "w") as spb_fh:
         index = 1
-        for _, row in enumerate(bed_obj):
-            sub_peaks = cut_peaks(merged_coverage[row.start:row.end],
+        for row_start, row_end in regions:
+            sub_peaks = cut_peaks(merged_coverage[row_start:row_end],
                                   donor_tolerance=ce_donor,
                                   ce_trigger=ce_trigger,
                                   join_distance=join_distance,
                                   peak_width=peak_width)
             for sp in sub_peaks:
-                start = sp[0] + row.start
-                end = sp[1] + row.start
+                start = sp[0] + row_start
+                end = sp[1] + row_start
                 peak_region = merged_coverage[start:end]
                 summit_coord = start + np.argmax(peak_region)
                 spb_fh.write("%s\t%d\t%d\t%s-%d\t%d\n" % (chromosome_of_interest, start, end, chromosome_of_interest,
@@ -1263,6 +2286,8 @@ def unified_element_definition(coverage_dict, chromosome_of_interest, strand_sig
                 index += 1
 
     if index > 1:
+        if not compress:
+            return subpeak_bed
         index_bed_file(subpeak_bed, logger=logger)
         return subpeak_bed + ".gz"
     return None
@@ -1291,27 +2316,25 @@ def inferring_elements_from_other_reps(prefix, n_samples):
         div_file = sample_prefix + "_divergent_peaks.bed"
         single_file = sample_prefix + "_unidirectional_peaks.bed"
         if os.path.exists(bid_file):
-            bids.append(BedTool(bid_file))
+            bids.append(bed_ops.read_lines(bid_file))
         if os.path.exists(div_file):
-            divs.append(BedTool(div_file))
+            divs.append(bed_ops.read_lines(div_file))
         if os.path.exists(single_file):
-            sigs.append(BedTool(single_file))
-    if len(bids) > 0:
-        merged_bids = BedTool.cat(*bids, c=(4, 5, 6,), o=("distinct", "distinct", "distinct",))
-    else:
-        merged_bids = None
-    if len(divs) > 0:
-        merged_divs = BedTool.cat(*divs, c=(4, 5, 6,), o=("distinct", "distinct", "distinct",))
-    else:
-        merged_divs = None
+            sigs.append(bed_ops.read_lines(single_file))
+
+    def merged(calls):  # BedTool.cat(*calls, c=(4, 5, 6), o=("distinct",) * 3)
+        return bed_ops.merge_lines(bed_ops.sort_lines(bed_ops.cat_parts(calls)), (4, 5, 6), ("distinct",) * 3)
+
+    merged_bids = merged(bids) if len(bids) > 0 else None
+    merged_divs = merged(divs) if len(divs) > 0 else None
 
     for separate_calls, pool, label in zip((bids, divs), (merged_bids, merged_divs), ("bidirectional", "divergent")):
         if pool is None:
             continue
         for i, separate_bed in enumerate(separate_calls):
-            not_reported_ele = pool.intersect(separate_bed, v=True).intersect(sigs[i], u=True)
-            BedTool.cat(*[separate_bed, not_reported_ele], postmerge=False).sort().saveas(
-                prefix + "_%d_%s_peaks.bed" % (i + 1, label))
+            not_reported_ele = bed_ops.intersect_lines(bed_ops.intersect_lines(pool, separate_bed, "v"), sigs[i], "u")
+            bed_ops.write_lines(bed_ops.sort_lines(bed_ops.cat_parts([separate_bed, not_reported_ele])),
+                                prefix + "_%d_%s_peaks.bed" % (i + 1, label))
 
 
 def get_epig_annotation(annotation_source, output_dir):
@@ -1379,7 +2402,121 @@ def _stringent_only(kwargs):
     return bool(kwargs.get("stringent_only", kwargs.get("stringent_pairs_only", False)))
 
 
-def pair(sample_prefix, df_dict, fdr_target, stringent_only, specific_suffix="", **kwargs):
+def _significant_bins(peak_df, fdr_target, kwargs):
+    """The rows of one strand's peak table that `pair` writes as its significant peaks."""
+    peak_df = peak_df.copy()
+    peak_df = peak_df.loc[peak_df["end"] - peak_df["start"] < kwargs.get("window_size_threshold", 2000), :]
+
+    sig_bins = peak_df.loc[peak_df["padj"] < fdr_target, :]
+    if kwargs.get("keep_sticks", True):
+        return sig_bins
+    return sig_bins.loc[sig_bins.non_zeros > 1, :]
+
+
+def _pair_strand(sample_prefix, label, anti_label, sig_bins, fdr_target, stringent_only, specific_suffix, kwargs):
+    """One strand of `pair`: write its significant peaks and pair them with the opposite strand's candidates.
+    Returns the intermediate files `pair` records for this strand."""
+    generated_files = []
+    generated_files.append(sample_prefix + __SIG_PEAK_TPL__ % (specific_suffix, label))
+    with open(sample_prefix + __SIG_PEAK_TPL__ % (specific_suffix, label), "w") as f:
+        sig_bins.to_csv(f, sep="\t", index=False, header=False)
+
+    if not os.path.exists(sample_prefix + __SIG_PEAK_TPL__ % (specific_suffix, label)):
+        return generated_files + ["", "", ""]
+    merge_opposite_peaks(sample_prefix + __SIG_PEAK_TPL__ % (specific_suffix, label),
+                         sample_prefix + "_%s.bed.gz" % anti_label,
+                         divergent_output_bed=sample_prefix + "%s_sig_%s_divergent_peaks.bed" % (
+                             specific_suffix, label),
+                         bidirectional_output_bed=sample_prefix + "%s_sig_%s_bidirectional_peaks.bed" % (
+                             specific_suffix, label),
+                         singleton_bed=sample_prefix + "%s_sig_%s_singletons_peaks.bed" % (specific_suffix, label),
+                         fdr_target=fdr_target, stringent_only=stringent_only,
+                         **kwargs)
+    generated_files.append(sample_prefix + "%s_sig_%s_divergent_peaks.bed" % (specific_suffix, label))
+    generated_files.append(sample_prefix + "%s_sig_%s_bidirectional_peaks.bed" % (specific_suffix, label))
+    generated_files.append(sample_prefix + "%s_sig_%s_singletons_peaks.bed" % (specific_suffix, label))
+    return generated_files
+
+
+_PAIR_CHUNK_LINES = 2000  # significant peaks per pairing task (consecutive chromosomes are grouped up to this)
+
+
+def _pair_chunk_task(sig_lines, chromosomes, candidate_bed, n_queries, part_prefix, fdr_target, stringent_only,
+                     kwargs):
+    """
+    Pool task: `merge_opposite_peaks` for consecutive lines of a strand's significant peaks, all on
+    `chromosomes`, against an index of those chromosomes' candidates only. Each output line depends only
+    on its query line and the candidates on the query's chromosome, so the parts of a strand, joined in
+    order, are the files one call over the whole strand writes.
+    """
+    tbx = PeakBedIndex.from_tabix(candidate_bed, chromosomes)
+    if tbx is None:
+        tbx = open_peak_index(candidate_bed, n_queries=n_queries)
+    sig_file = part_prefix + "_sig.bed"
+    with open(sig_file, "w") as fh:
+        fh.writelines(sig_lines)
+    outputs = tuple(part_prefix + "_%s.bed" % k for k in ("div", "bid", "single"))
+    try:
+        merge_opposite_peaks(sig_file, candidate_bed, divergent_output_bed=outputs[0],
+                             bidirectional_output_bed=outputs[1], singleton_bed=outputs[2],
+                             fdr_target=fdr_target, stringent_only=stringent_only, tbx=tbx, **kwargs)
+    finally:
+        os.remove(sig_file)
+    return outputs
+
+
+def _pair_strands_by_chromosome(pool, strands):
+    """
+    `_pair_strand` for every strand in `strands` (its argument tuples), with the opposite-peak search split
+    into pool tasks of consecutive chromosomes instead of one task per strand. Writes the same files.
+    """
+    pending = []
+    for sample_prefix, label, anti_label, sig_bins, fdr_target, stringent_only, specific_suffix, kwargs in strands:
+        sig_file = sample_prefix + __SIG_PEAK_TPL__ % (specific_suffix, label)
+        with open(sig_file, "w") as f:
+            sig_bins.to_csv(f, sep="\t", index=False, header=False)
+        with open(sig_file, "r") as f:
+            lines = f.readlines()
+        # runs of consecutive lines on one chromosome (as merge_opposite_peaks reads the chromosome)
+        runs = []
+        for line in lines:
+            chrom = line.strip().split("\t")[0]
+            if runs and runs[-1][0] == chrom:
+                runs[-1][1].append(line)
+            else:
+                runs.append((chrom, [line]))
+        chunks = []
+        for chrom, run in runs:
+            if chunks and len(chunks[-1][1]) < _PAIR_CHUNK_LINES:
+                chunks[-1][0].append(chrom)
+                chunks[-1][1].extend(run)
+            else:
+                chunks.append(([chrom], list(run)))
+        candidate_bed = sample_prefix + "_%s.bed.gz" % anti_label
+        tasks = [pool.apply_async(_pair_chunk_task, (
+            chunk_lines, sorted(set(chroms)), candidate_bed, len(lines),
+            sample_prefix + "%s_sig_%s_part%d" % (specific_suffix, label, i), fdr_target, stringent_only, kwargs))
+            for i, (chroms, chunk_lines) in enumerate(chunks)]
+        outputs = tuple(sample_prefix + "%s_sig_%s_%s_peaks.bed" % (specific_suffix, label, k)
+                        for k in ("divergent", "bidirectional", "singletons"))
+        pending.append((sig_file, outputs, tasks))
+
+    generated_files = []
+    for sig_file, outputs, tasks in pending:
+        parts = [t.get() for t in tasks]
+        for i, output in enumerate(outputs):
+            with open(output, "wb") as out:
+                for part in parts:
+                    with open(part[i], "rb") as fh:
+                        shutil.copyfileobj(fh, out)
+        for part in parts:
+            for f in part:
+                os.remove(f)
+        generated_files += [sig_file] + list(outputs)
+    return generated_files
+
+
+def pair(sample_prefix, df_dict, fdr_target, stringent_only, specific_suffix="", pool=None, **kwargs):
     """
 
     Parameters
@@ -1395,6 +2532,8 @@ def pair(sample_prefix, df_dict, fdr_target, stringent_only, specific_suffix="",
 
     specific_suffix : str
         If there's anything you want to add to the outputs
+    pool : multiprocessing pool or None
+        If given, the two strands are paired with the opposite strand's peaks on it, in parallel
 
     kwargs :
         window_size_threshold : int
@@ -1412,59 +2551,48 @@ def pair(sample_prefix, df_dict, fdr_target, stringent_only, specific_suffix="",
     data_structure = namedtuple("PairedIntermediateFiles", field_names=(
         "pl_sig_peaks", "div_sig_pl", "bid_sig_pl", "single_sig_pl",
         "mn_sig_peaks", "div_sig_mn", "bid_sig_mn", "single_sig_mn"))
-    generated_files = []
-    for label, anti_label in zip(("pl", "mn"), ("mn", "pl")):
-        peak_df = df_dict[label].copy()
-        peak_df = peak_df.loc[peak_df["end"] - peak_df["start"] < kwargs.get("window_size_threshold", 2000), :]
+    strands = [(sample_prefix, label, anti_label, _significant_bins(df_dict[label], fdr_target, kwargs), fdr_target,
+                stringent_only, specific_suffix, kwargs) for label, anti_label in zip(("pl", "mn"), ("mn", "pl"))]
+    if pool is None:
+        generated_files = sum((_pair_strand(*a) for a in strands), [])
+    else:  # the strands only read each other's candidate files, written before pairing
+        generated_files = _pair_strands_by_chromosome(pool, strands)
 
-        sig_bins = peak_df.loc[peak_df["padj"] < fdr_target, :]
-        generated_files.append(sample_prefix + __SIG_PEAK_TPL__ % (specific_suffix, label))
-        with open(sample_prefix + __SIG_PEAK_TPL__ % (specific_suffix, label), "w") as f:
-            if kwargs.get("keep_sticks", True):
-                sig_bins.to_csv(f, sep="\t", index=False, header=False)
-            else:
-                sig_bins.loc[sig_bins.non_zeros > 1, :].to_csv(f, sep="\t", index=False, header=False)
+    merges = [(sample_prefix, specific_suffix, (d,)) for d in ("bidirectional", "divergent", "singletons")]
+    if pool is None:
+        for a in merges:
+            _merge_strands(*a)
+    else:  # each writes its own output from its own two files
+        for r in [pool.apply_async(_merge_strands, a) for a in merges]:
+            r.get()
+    return (sample_prefix + "%s_bidirectional_peaks.bed" % specific_suffix,
+            sample_prefix + "%s_divergent_peaks.bed" % specific_suffix,
+            sample_prefix + "%s_unidirectional_peaks.bed" % specific_suffix), data_structure._make(generated_files)
 
-        if not os.path.exists(sample_prefix + __SIG_PEAK_TPL__ % (specific_suffix, label)):
-            generated_files.append("")
-            generated_files.append("")
-            generated_files.append("")
-            continue
-        merge_opposite_peaks(sample_prefix + __SIG_PEAK_TPL__ % (specific_suffix, label),
-                             sample_prefix + "_%s.bed.gz" % anti_label,
-                             divergent_output_bed=sample_prefix + "%s_sig_%s_divergent_peaks.bed" % (
-                                 specific_suffix, label),
-                             bidirectional_output_bed=sample_prefix + "%s_sig_%s_bidirectional_peaks.bed" % (
-                                 specific_suffix, label),
-                             singleton_bed=sample_prefix + "%s_sig_%s_singletons_peaks.bed" % (specific_suffix, label),
-                             fdr_target=fdr_target, stringent_only=stringent_only,
-                             **kwargs)
-        generated_files.append(sample_prefix + "%s_sig_%s_divergent_peaks.bed" % (specific_suffix, label))
-        generated_files.append(sample_prefix + "%s_sig_%s_bidirectional_peaks.bed" % (specific_suffix, label))
-        generated_files.append(sample_prefix + "%s_sig_%s_singletons_peaks.bed" % (specific_suffix, label))
 
-    for directionality in ("bidirectional", "divergent", "singletons"):
+def _merge_strands(sample_prefix, specific_suffix, directionalities):
+    """Joins the two strands' files of each of `directionalities` into the sample's output file (for `pair`)."""
+    for directionality in directionalities:
         exp_pl_file = sample_prefix + "%s_sig_pl_%s_peaks.bed" % (specific_suffix, directionality)
         exp_mn_file = sample_prefix + "%s_sig_mn_%s_peaks.bed" % (specific_suffix, directionality)
         if os.path.exists(exp_pl_file) and os.path.exists(exp_mn_file):
             if directionality != "singletons":
-                tmp_pl_bed = BedTool(exp_pl_file)
-                tmp_mn_bed = BedTool(exp_mn_file)
-                if tmp_pl_bed.count() == 0 and tmp_mn_bed.count() == 0:
+                pl_empty, mn_empty = bed_ops.is_empty(exp_pl_file), bed_ops.is_empty(exp_mn_file)
+                if pl_empty and mn_empty:
                     continue
-                elif tmp_pl_bed.count() == 0 or tmp_mn_bed.count() == 0:
-                    # only one strand produced pairs: merge it on its own (previously the raw 16-column
-                    # records were parsed with 8 names, giving a malformed BED)
-                    pri_merged_file = (tmp_mn_bed if tmp_pl_bed.count() == 0 else tmp_pl_bed).sort().merge(
-                        c=(12, 13, 14, 15, 16), o=("collapse", "collapse", "collapse", "collapse", "distinct"))
                 else:
-                    pri_merged_file = BedTool.cat(*[BedTool(exp_pl_file),
-                                                    BedTool(exp_mn_file)],
-                                                  c=(12, 13, 14, 15, 16),
-                                                  o=("collapse", "collapse", "collapse", "collapse", "distinct"))
-                pri_merged_df = pri_merged_file.to_dataframe(names=("chrom", "start", "end", "tss_fwd",
-                                                                    "tss_fwd_vals", "tss_rev", "tss_rev_vals",
-                                                                    "confidence"))
+                    # BedTool.cat(pl, mn, c=..., o=...): concatenate, bedtools sort, bedtools merge; when only one
+                    # strand produced pairs, BedTool(that strand).sort().merge(c=..., o=...) (previously the raw
+                    # 16-column records were parsed with 8 names, giving a malformed BED)
+                    lines = (bed_ops.read_lines(exp_mn_file) if pl_empty else bed_ops.read_lines(exp_pl_file)
+                             if mn_empty else bed_ops.cat_lines((exp_pl_file, exp_mn_file)))
+                    pri_merged_file = io.StringIO("".join(bed_ops.merge_lines(
+                        bed_ops.sort_lines(lines), (12, 13, 14, 15, 16),
+                        ("collapse", "collapse", "collapse", "collapse", "distinct"))))
+                # as BedTool.to_dataframe(names=...) reads it
+                pri_merged_df = pd.read_csv(pri_merged_file, sep="\t", names=("chrom", "start", "end", "tss_fwd",
+                                                                              "tss_fwd_vals", "tss_rev",
+                                                                              "tss_rev_vals", "confidence"))
                 for str_col in ("tss_fwd", "tss_fwd_vals", "tss_rev", "tss_rev_vals"):
                     pri_merged_df[str_col] = pri_merged_df[str_col].astype(str)
                 fwd_tss_cols = pri_merged_df["tss_fwd"].str.split(",", expand=True).fillna(value="-1").astype(int)
@@ -1480,17 +2608,13 @@ def pair(sample_prefix, df_dict, fdr_target, stringent_only, specific_suffix="",
                 max_index = rev_tss_val_cols.idxmax(axis=1)
                 pri_merged_df["tss_rev"] = rev_tss_cols.values[np.arange(rev_tss_cols.shape[0]), max_index]
                 pri_merged_df["tss_rev_val"] = rev_tss_val_cols.values[np.arange(rev_tss_cols.shape[0]), max_index]
-                BedTool.from_dataframe(
-                    pri_merged_df.loc[:, ("chrom", "start", "end", "confidence", "tss_fwd", "tss_rev")]).saveas(
-                    sample_prefix + "%s_%s_peaks.bed" % (specific_suffix, directionality))
-            else:
-                BedTool.cat(*[BedTool(exp_pl_file),
-                              BedTool(exp_mn_file)],
-                            postmerge=False).sort().saveas(
-                    sample_prefix + "%s_unidirectional_peaks.bed" % specific_suffix)
-    return (sample_prefix + "%s_bidirectional_peaks.bed" % specific_suffix,
-            sample_prefix + "%s_divergent_peaks.bed" % specific_suffix,
-            sample_prefix + "%s_unidirectional_peaks.bed" % specific_suffix), data_structure._make(generated_files)
+                # as BedTool.from_dataframe(...).saveas(...) writes it
+                pri_merged_df.loc[:, ("chrom", "start", "end", "confidence", "tss_fwd", "tss_rev")].to_csv(
+                    sample_prefix + "%s_%s_peaks.bed" % (specific_suffix, directionality),
+                    sep="\t", header=False, index=False, na_rep=".")
+            else:  # BedTool.cat(pl, mn, postmerge=False).sort()
+                bed_ops.write_lines(bed_ops.sort_lines(bed_ops.cat_lines((exp_pl_file, exp_mn_file))),
+                                    sample_prefix + "%s_unidirectional_peaks.bed" % specific_suffix)
 
 
 def annotate_tre_with_epig_info(peak_file, epig_bigbed_file, only_annotated_records=False, placeholders={}):
@@ -1622,6 +2746,18 @@ def on_the_fly_qc(output_prefix, min_mu_percent, top_peak_threshold, significant
                 logger.warning(msg)
 
 
+def _add_coverage(pl_cov_target, mn_cov_target, rc_target, plc, mnc, rc, sample):
+    """Append one sample's coverage: registry keys for tracks, else the dump paths, which are deleted at the end."""
+    if COVERAGE_STORE:
+        plc, mnc = _register_coverage(plc, sample, "pl"), _register_coverage(mnc, sample, "mn")
+    else:
+        housekeeping_files.extend(plc.values())
+        housekeeping_files.extend(mnc.values())
+    pl_cov_target.append(plc)
+    mn_cov_target.append(mnc)
+    rc_target.append(rc)
+
+
 def parse_input_files(output_dir, output_prefix, filters, pl_cov_target, mn_cov_target, rc_target,
                       bam_files=None, bw_pl_files=None, bw_mn_files=None, merge_replicates=False, **kwargs):
     """
@@ -1679,20 +2815,15 @@ def parse_input_files(output_dir, output_prefix, filters, pl_cov_target, mn_cov_
         for i, bf in enumerate(bam_files):
             log_assert(os.path.exists(bf), "Cannot find input bam file %s" % bf, logger)
             logger.info("Loading {0}...".format(bf))
-            plc, mnc, rc = get_read_signal(input_bam=bf,
-                                           loc_prime=kwargs["bam_parser"],
-                                           chromosome_startswith=kwargs.pop("chromosome_startswith", ""),
-                                           reverse_complement=kwargs.get("seq_rc", False),
-                                           output_dir=output_dir,
-                                           output_prefix=output_prefix + "_%d" % i,
-                                           filters=filters,
-                                           **kwargs)
-
-            pl_cov_target.append(plc)
-            mn_cov_target.append(mnc)
-            rc_target.append(rc)
-            housekeeping_files.extend(plc.values())
-            housekeeping_files.extend(mnc.values())
+            plc, mnc, rc = _read_signal(input_bam=bf,
+                                        loc_prime=kwargs["bam_parser"],
+                                        chromosome_startswith=kwargs.pop("chromosome_startswith", ""),
+                                        reverse_complement=kwargs.get("seq_rc", False),
+                                        output_dir=output_dir,
+                                        output_prefix=output_prefix + "_%d" % i,
+                                        filters=filters, as_tracks=COVERAGE_STORE,
+                                        **kwargs)
+            _add_coverage(pl_cov_target, mn_cov_target, rc_target, plc, mnc, rc, output_prefix + "_%d" % i)
             logger.info("{0} loaded.".format(bf))
     elif bw_pl_files is not None and bw_mn_files is not None:
         log_assert(len(bw_pl_files) == len(bw_mn_files),
@@ -1702,21 +2833,32 @@ def parse_input_files(output_dir, output_prefix, filters, pl_cov_target, mn_cov_
             log_assert(os.path.exists(bw_pl), "Cannot find bigwig file %s" % bw_pl, logger)
             log_assert(os.path.exists(bw_mn_files[i]), "Cannot find bigwig file %s" % bw_mn_files[i], logger)
             logger.info("Loading {0} and {1}...".format(bw_pl, bw_mn_files[i]))
-            plc, mnc, rc = get_coverage_bw(bw_pl=bw_pl, bw_mn=bw_mn_files[i],
-                                           chromosome_startswith=kwargs.get("chromosome_startswith", ""),
-                                           output_dir=output_dir,
-                                           output_prefix=output_prefix + "_%d" % i)
-
-            pl_cov_target.append(plc)
-            mn_cov_target.append(mnc)
-            rc_target.append(rc)
-            housekeeping_files.extend(plc.values())
-            housekeeping_files.extend(mnc.values())
+            plc, mnc, rc = _coverage_bw(bw_pl=bw_pl, bw_mn=bw_mn_files[i],
+                                        chromosome_startswith=kwargs.get("chromosome_startswith", ""),
+                                        output_dir=output_dir,
+                                        output_prefix=output_prefix + "_%d" % i,
+                                        threads=kwargs.get("thread_n", 1), as_tracks=COVERAGE_STORE)
+            _add_coverage(pl_cov_target, mn_cov_target, rc_target, plc, mnc, rc, output_prefix + "_%d" % i)
             logger.info("{0} and {1} loaded.".format(bw_pl, bw_mn_files[i]))
 
-    if merge_replicates and len(pl_cov_target) > 1:
+    if merge_replicates and len(pl_cov_target) > 1 and COVERAGE_STORE:
+        pl_covs, mn_covs, pl_rc, mn_rc = merge_replicate_tracks(
+            [{c: lookup_track(k) for c, k in d.items()} for d in pl_cov_target],
+            [{c: lookup_track(k) for c, k in d.items()} for d in mn_cov_target])
+        pl_covs = _register_coverage(pl_covs, output_prefix + "_merged", "pl")
+        mn_covs = _register_coverage(mn_covs, output_prefix + "_merged", "mn")
+        release_coverage_files(pl_cov_target + mn_cov_target, (pl_covs, mn_covs))
+        pl_cov_target[:] = [pl_covs]
+        mn_cov_target[:] = [mn_covs]
+        rc_target[:] = [pl_rc + mn_rc, ]
+        logger.info("Replicates merged")
+    elif merge_replicates and len(pl_cov_target) > 1:
         pl_covs, mn_covs, pl_rc, mn_rc = merge_replicates_bw(pl_cov_target, mn_cov_target, output_dir,
-                                                             output_prefix + "_merged")
+                                                             output_prefix + "_merged",
+                                                             threads=kwargs.get("thread_n", 1))
+        # the per-replicate dumps are not read again once merged
+        release_coverage_files(pl_cov_target + mn_cov_target, (pl_covs, mn_covs),
+                               defer=kwargs.get("thread_n", 1) > 1)
         pl_cov_target[:] = pl_cov_target[:1]
         mn_cov_target[:] = mn_cov_target[:1]
         rc_target[:] = [pl_rc + mn_rc, ]
@@ -1749,6 +2891,7 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
     global stat_tester
     global iqr_obj
     global __STRICT_QC__
+    _phase(None)  # start the phase clock
     log_assert(os.path.exists(output_dir) and os.path.isdir(output_dir), "Cannot write to {0}".format(output_dir),
                logger)
 
@@ -1759,13 +2902,18 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
     show_parameter_info(input_bam, **kwargs)
 
     prefix = os.path.join(output_dir, output_prefix)
-    pybdt_tmp = os.path.join(output_dir,
-                             "pybdt_" + datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S") + "_" + str(os.getpid()))
-    if not os.path.exists(pybdt_tmp):
-        os.mkdir(pybdt_tmp)
-    pybedtools.set_tempdir(pybdt_tmp)
 
     log_assert(model in ("Poisson", "ZIP"), "Unsupported model", logger)
+    if kwargs.get("output_diagnostics", False):
+        try:
+            import matplotlib  # noqa: F401
+        except ImportError:
+            log_assert(False, "--debug saves diagnostic plots, which need matplotlib: pip install 'pyPINTS[plots]'",
+                       logger)
+    # options of the statistical tests (stats_engine.register_option); set before any worker process exists
+    from .stats_engine import configure_options
+    for message in configure_options(kwargs):
+        logger.warning(message)
     if model == "ZIP":
         stat_tester = ZIP()
     elif model == "Poisson":
@@ -1821,78 +2969,206 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
                                                           save_to=prefix + "_alpha.pdf")
             logger.info("Override the default for --donor-tolerance with {0}".format(kwargs["donor_tolerance"]))
 
+    thread_n = kwargs.get("thread_n", 1)
+    pool = None
+
+    def control_and_normalise():
+        """Parse the control and normalise the samples against it; returns the un-normalised sample dicts."""
+        pre_norm = chromosome_coverage_pl + chromosome_coverage_mn
+        parse_input_files(output_dir=output_dir, output_prefix="ct_" + output_prefix, filters=filters,
+                          pl_cov_target=input_coverage_pl, mn_cov_target=input_coverage_mn,
+                          rc_target=ircs, bam_files=kwargs.get("ct_bam", None),
+                          bw_pl_files=kwargs.get("ct_bw_pl", None), bw_mn_files=kwargs.get("ct_bw_mn", None),
+                          **kwargs)
+
+        if len(ircs) > 0:
+            if len(ircs) == 1 and len(rcs) > 1:
+                logger.info("Only one input sample is provided, it will be shared among all treatment libraries")
+                for _ in range(len(rcs) - len(ircs)):
+                    ircs.append(ircs[0])
+                    input_coverage_pl.append(input_coverage_pl[0])
+                    input_coverage_mn.append(input_coverage_mn[0])
+            for i, (rc, irc), in enumerate(zip(rcs, ircs)):
+                scale_factor = rc / irc
+                logger.info("Adjusting signals based-on input/control (scale factor: %.4f)" % scale_factor)
+                if COVERAGE_STORE:
+                    plc, mnc = normalize_tracks_using_input(
+                        *[{c: lookup_track(k) for c, k in d.items()} for d in (
+                            chromosome_coverage_pl[i], chromosome_coverage_mn[i], input_coverage_pl[i],
+                            input_coverage_mn[i])], scale_factor=scale_factor, logger=logger)
+                    plc = _register_coverage(plc, output_prefix + "_inputnorm_%d" % i, "pl")
+                    mnc = _register_coverage(mnc, output_prefix + "_inputnorm_%d" % i, "mn")
+                else:
+                    plc, mnc = normalize_using_input(chromosome_coverage_pl[i],
+                                                     chromosome_coverage_mn[i],
+                                                     input_coverage_pl[i],
+                                                     input_coverage_mn[i],
+                                                     scale_factor=scale_factor,
+                                                     output_dir=output_dir,
+                                                     output_prefix=output_prefix + "_inputnorm_%d" % i,
+                                                     logger=logger, threads=thread_n)
+                    housekeeping_files.extend(plc.values())
+                    housekeeping_files.extend(mnc.values())
+                chromosome_coverage_pl[i] = plc
+                chromosome_coverage_mn[i] = mnc
+                logger.info("Signals adjusted.")
+        return pre_norm
+
+    # element definition reads the un-normalised sample coverage
+    ued_coverage_pl, ued_coverage_mn = list(chromosome_coverage_pl), list(chromosome_coverage_mn)
+    # The control and the normalised coverage are built before the pool forks: pool workers reach tracks only
+    # through the registry they inherit then, and control parsing and normalisation start pools of their own,
+    # which should not fork from a process whose persistent pool already runs threads.
+    _phase("input parsing")
+    pre_norm = control_and_normalise()
+    if COVERAGE_STORE:
+        release_coverage_files(input_coverage_pl + input_coverage_mn,
+                               chromosome_coverage_pl + chromosome_coverage_mn + pre_norm)
+    _phase("control parsing+normalisation")
+
+    # one persistent worker pool for all parallel stages (None -> everything runs inline, as before)
+    pool = _make_pool(thread_n) if thread_n > 1 else None
+
+    ued_keys, ued_tasks, ued_costs = [], [], []
     for chromosome in chromosomes:
         for target_dict, chrom_coverage, sign, strand_short in zip((subpeak_pl_beds, subpeak_mn_beds),
-                                                                   (chromosome_coverage_pl, chromosome_coverage_mn),
+                                                                   (ued_coverage_pl, ued_coverage_mn),
                                                                    ("+", "-"), ("pl", "mn")):
-            target_dict[chromosome] = unified_element_definition(chrom_coverage, chromosome, sign,
-                                                                 prefix + "_{0}.bed".format(strand_short),
-                                                                 ce_donor=kwargs.get("donor_tolerance", 0.3),
-                                                                 join_distance=kwargs.get("peak_distance", 1),
-                                                                 ce_trigger=kwargs.get("ce_trigger", 3),
-                                                                 peak_width=kwargs.get("peak_width", None))
+            ued_keys.append((target_dict, chromosome))
+            # each task gets only its chromosome's entries: pickling every sample's whole dict into each of
+            # (contigs x 2) tasks cost seconds on references with thousands of contigs (registry keys pickle slowly)
+            task_coverage = [{chromosome: cd[chromosome]} if chromosome in cd else {} for cd in chrom_coverage]
+            ued_tasks.append((task_coverage, chromosome, sign, prefix + "_{0}.bed".format(strand_short),
+                              kwargs.get("donor_tolerance", 0.3), kwargs.get("peak_distance", 1),
+                              kwargs.get("ce_trigger", 3), kwargs.get("peak_width", None)))
+            ued_costs.append(_coverage_cost(chrom_coverage, chromosome))
+    ued_res = _run_tasks(pool, _element_definition_task, ued_tasks, costs=ued_costs)
+    _phase("element definition")
+    # results are consumed in the original (chromosome, strand) order
+    for (target_dict, chromosome), res in zip(ued_keys, ued_res):
+        target_dict[chromosome] = res
+        if res is not None:
+            housekeeping_files.append(res)
+            housekeeping_files.append(res + ".csi")
 
-            if target_dict[chromosome] is not None:
-                housekeeping_files.append(target_dict[chromosome])
-                housekeeping_files.append(target_dict[chromosome] + ".csi")
-
-    parse_input_files(output_dir=output_dir, output_prefix="ct_" + output_prefix, filters=filters,
-                      pl_cov_target=input_coverage_pl, mn_cov_target=input_coverage_mn,
-                      rc_target=ircs, bam_files=kwargs.get("ct_bam", None),
-                      bw_pl_files=kwargs.get("ct_bw_pl", None), bw_mn_files=kwargs.get("ct_bw_mn", None), **kwargs)
-
-    if len(ircs) > 0:
-        if len(ircs) == 1 and len(rcs) > 1:
-            logger.info("Only one input sample is provided, it will be shared among all treatment libraries")
-            for _ in range(len(rcs) - len(ircs)):
-                ircs.append(ircs[0])
-                input_coverage_pl.append(input_coverage_pl[0])
-                input_coverage_mn.append(input_coverage_mn[0])
-        for i, (rc, irc), in enumerate(zip(rcs, ircs)):
-            scale_factor = rc / irc
-            logger.info("Adjusting signals based-on input/control (scale factor: %.4f)" % scale_factor)
-            plc, mnc = normalize_using_input(chromosome_coverage_pl[i],
-                                             chromosome_coverage_mn[i],
-                                             input_coverage_pl[i],
-                                             input_coverage_mn[i],
-                                             scale_factor=scale_factor,
-                                             output_dir=output_dir,
-                                             output_prefix=output_prefix + "_inputnorm_%d" % i,
-                                             logger=logger)
-            chromosome_coverage_pl[i] = plc
-            chromosome_coverage_mn[i] = mnc
-            logger.info("Signals adjusted.")
-
-            housekeeping_files.extend(plc.values())
-            housekeeping_files.extend(mnc.values())
-
+    _phase("subpeak bookkeeping")
+    if COVERAGE_STORE:
+        release_coverage_files(ued_coverage_pl + ued_coverage_mn, chromosome_coverage_pl + chromosome_coverage_mn)
+    elif len(ircs) > 0:
+        # element definition has read the un-normalised experiment dumps; neither they nor the control's are
+        # read again
+        release_coverage_files(pre_norm + input_coverage_pl + input_coverage_mn,
+                               chromosome_coverage_pl + chromosome_coverage_mn, defer=pool is not None)
     fdr_target = kwargs.pop("fdr_target", 0.1)
+    # window evaluation for every sample x strand at once (shared pool, longest tasks first)
+    precomputed = {}
+    if pool is not None:
+        eval_jobs, eval_keys = [], []
+        for rep, pl_cov_dict in enumerate(chromosome_coverage_pl):
+            sample_prefix = prefix + "_%d" % (rep + 1)
+            for cov_dict, label, spb, strand_sign in zip(
+                    (pl_cov_dict, chromosome_coverage_mn[rep]),
+                    ("pl", "mn"), (subpeak_pl_beds, subpeak_mn_beds), ("+", "-")):
+                if spb is None:
+                    continue
+                eval_jobs.append((cov_dict, sample_prefix + "_{0}.bed".format(label), spb, strand_sign))
+                eval_keys.append((rep, label))
+        for key, res in zip(eval_keys, evaluate_strand_jobs(eval_jobs, fdr_target, pool=pool, **kwargs)):
+            precomputed[key] = res
+    _phase("input normalisation/eval")
+    # stratified filtering (BH/independent filtering, sort, bgzip/tabix) of every sample x strand runs on the
+    # pool; the per-sample pairing below consumes the results in the original order
+    deferred_filtering = {}
+    if pool is not None:
+        for rep, pl_cov_dict in enumerate(chromosome_coverage_pl):
+            sample_prefix = prefix + "_%d" % (rep + 1)
+            for cov_dict, label, spb, strand_sign in zip(
+                    (pl_cov_dict, chromosome_coverage_mn[rep]),
+                    ("pl", "mn"), (subpeak_pl_beds, subpeak_mn_beds), ("+", "-")):
+                if spb is None:
+                    continue
+                out_file = sample_prefix + "_{0}.bed".format(label)
+                tmp_df = peaks_single_strand(per_base_cov=cov_dict, output_file=out_file,
+                                             shared_peak_definitions=spb, strand_sign=strand_sign,
+                                             fdr_target=fdr_target, precomputed=precomputed.get((rep, label)),
+                                             defer_filtering=True, **kwargs)
+                if tmp_df is not None:
+                    deferred_filtering[(rep, label)] = _ParallelIndexedBed(pool, tmp_df, out_file, fdr_target,
+                                                                           kwargs, n_chunks=thread_n)
+                    precomputed.pop((rep, label), None)
+    # pairing of every sample on the pool (only for the plain path: no epigenomic annotation / diagnostics,
+    # which re-use df_dict afterwards); results are consumed below in sample order
+    deferred_pairing = {}
+    epig_requested = kwargs.get("epig_annotation", "") not in (None, "")
+    all_deferred = all((rep, label) in deferred_filtering
+                       for rep in range(len(chromosome_coverage_pl)) for label in ("pl", "mn"))
+    if pool is not None and all_deferred:
+        # every strand is evaluated and its filtering dispatched: nothing reads the coverage dumps again
+        start_deferred_releases()
+        release_coverage_files(chromosome_coverage_pl + chromosome_coverage_mn)
+    if pool is not None and len(chromosome_coverage_pl) > 1 and all_deferred and not epig_requested \
+            and not kwargs.get("output_diagnostics", False):
+        for rep, pl_cov_dict in enumerate(chromosome_coverage_pl):
+            sample_prefix = prefix + "_%d" % (rep + 1)
+            df_dict = {}
+            n_significant = 0
+            for label in ("pl", "mn"):
+                peaks_bed = deferred_filtering.pop((rep, label)).get()
+                peak_df = pd.read_csv(peaks_bed, sep="\t", header=None, names=COMMON_HEADER)
+                peak_df = peak_df.loc[peak_df["end"] - peak_df["start"] < kwargs.get("window_size_threshold", 2000),
+                                      :]
+                n_significant += np.sum(peak_df["padj"] < fdr_target)
+                df_dict[label] = peak_df
+            deferred_pairing[rep] = (n_significant, pool.apply_async(
+                _pair_task, (sample_prefix, df_dict, fdr_target, _stringent_only(kwargs), kwargs)))
     # peak calling (IQR)
     for rep, pl_cov_dict in enumerate(chromosome_coverage_pl):
         logger.info("Working on sample %d" % (rep + 1))
         sample_prefix = prefix + "_%d" % (rep + 1)
         df_dict = {}
         n_significant = 0
+        if rep in deferred_pairing:
+            n_significant, pair_res = deferred_pairing.pop(rep)
+            logger.info("Pairing peaks")
+            (bid, div, unid), gc = pair_res.get()
+            logger.info("Pairing finished on sample %d" % (rep + 1))
+            for g in gc:
+                housekeeping_files.append(g)
+            if not disable_qc:
+                on_the_fly_qc(
+                    sample_prefix,
+                    kwargs.get("min_mu_percent", 0.1),
+                    kwargs.get("top_peak_threshold", 0.75),
+                    n_significant,
+                    is_strict_mode=__STRICT_QC__)
+            continue
+        peak_tables = []
         for cov_dict, label, spb, strand_sign in zip(
                 (pl_cov_dict, chromosome_coverage_mn[rep]),
                 ("pl", "mn"), (subpeak_pl_beds, subpeak_mn_beds), ("+", "-")):
             if spb is None:
                 continue
-            peaks_bed = peaks_single_strand(per_base_cov=cov_dict,
-                                            output_file=sample_prefix + "_{0}.bed".format(label),
-                                            shared_peak_definitions=spb,
-                                            strand_sign=strand_sign,
-                                            fdr_target=fdr_target,
-                                            **kwargs)
-
-            peak_df = pd.read_csv(peaks_bed, sep="\t", header=None, names=COMMON_HEADER)
-            peak_df = peak_df.loc[peak_df["end"] - peak_df["start"] < kwargs.get("window_size_threshold", 2000), :]
+            if (rep, label) in deferred_filtering:
+                peaks_bed = deferred_filtering.pop((rep, label)).get()
+            else:
+                peaks_bed = peaks_single_strand(per_base_cov=cov_dict,
+                                                output_file=sample_prefix + "_{0}.bed".format(label),
+                                                shared_peak_definitions=spb,
+                                                strand_sign=strand_sign,
+                                                fdr_target=fdr_target,
+                                                precomputed=precomputed.get((rep, label)),
+                                                **kwargs)
+            read_args = (peaks_bed, kwargs.get("window_size_threshold", 2000))
+            # the strands' tables are read in parallel on the pool (a pickled frame is an exact copy)
+            peak_tables.append((label, read_args if pool is None else pool.apply_async(_read_peak_table, read_args)))
+        for label, table in peak_tables:
+            peak_df = _read_peak_table(*table) if pool is None else table.get()
             n_significant += np.sum(peak_df["padj"] < fdr_target)
             df_dict[label] = peak_df
 
         logger.info("Pairing peaks")
         (bid, div, unid), gc = pair(sample_prefix, df_dict=df_dict, fdr_target=fdr_target,
-                                    stringent_only=_stringent_only(kwargs), **kwargs)
+                                    stringent_only=_stringent_only(kwargs), pool=pool, **kwargs)
         # reformat unidirectional output
         unid_df = pd.read_csv(unid, sep="\t", names=COMMON_HEADER)
         unid_df[["chromosome", "start", "end", "name", "padj", "strand",
@@ -1927,14 +3203,11 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
                                         placeholders={3: "Marginal"})
             annotate_tre_with_epig_info(r_unid, epig_annotation, only_annotated_records=True)
 
-            # merge results
-            BedTool.cat(*[BedTool(bid), BedTool(r_bid).intersect(bid, v=True).saveas()], postmerge=False).sort().saveas(
-                bid)
-            BedTool.cat(*[BedTool(div), BedTool(r_div).intersect(div, v=True).saveas()], postmerge=False).sort().saveas(
-                div)
-            BedTool.cat(*[BedTool(unid), BedTool(r_unid).intersect(unid, v=True).saveas()],
-                        postmerge=False).sort().saveas(
-                unid)
+            # merge results: BedTool.cat(final, BedTool(relaxed).intersect(final, v=True), postmerge=False).sort()
+            for final, relaxed in ((bid, r_bid), (div, r_div), (unid, r_unid)):
+                final_lines = bed_ops.read_lines(final)
+                extra = bed_ops.intersect_lines(bed_ops.read_lines(relaxed), final_lines, "v")
+                bed_ops.write_lines(bed_ops.sort_lines(bed_ops.cat_parts([final_lines, extra])), final)
             for g in r_gc:
                 housekeeping_files.append(g)
             housekeeping_files.append(r_bid)
@@ -1970,4 +3243,8 @@ def peak_calling(input_bam, output_dir=".", output_prefix="pints", **kwargs):
     if is_borrow_info_from_reps and len(chromosome_coverage_pl) > 1:
         logger.info("Enhanced support for biological replicates is enabled.")
         inferring_elements_from_other_reps(prefix=prefix, n_samples=len(chromosome_coverage_pl))
-    housekeeping(pybdt_tmp)
+    _phase("filtering+pairing+qc")
+    if pool is not None:
+        pool.close()
+        pool.join()
+    housekeeping()

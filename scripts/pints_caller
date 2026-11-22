@@ -208,7 +208,8 @@ if __name__ == "__main__":
                             "otherwise, PINTS prints warning messages.")
     group.add_argument("--debug", action="store_true", dest="output_diagnostics",
                        required=False, default=False,
-                       help="Save diagnostics (independent filtering and pval dist) to local folder")
+                       help="Save diagnostics (independent filtering and pval dist) to local folder. "
+                            "The plots need matplotlib: pip install 'pyPINTS[plots]'")
     group.add_argument("--dont-borrow-info-reps", action="store_false", dest="borrow_info_reps",
                        required=False, default=True,
                        help="Don't borrow information from reps to refine calling of divergent elements")
